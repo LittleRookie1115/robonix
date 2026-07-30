@@ -5,6 +5,9 @@ deploy, boot, inspect, codegen, and chat operations into one binary so a
 user / integrator never has to remember which Rust crate or Python service
 owns which subcommand.
 
+`rbnx boot` starts manifest-declared built-in processes for Atlas, Executor,
+Soma, Pilot, Vitals, and Liaison before package-backed system services.
+
 ## Install
 
 From the repo root:

@@ -112,24 +112,23 @@ async fn main() -> Result<()> {
     // single source to publish the URDF-defined ROS TF tree.
     let svc = Arc::new(SomaService::new(Arc::clone(&body)));
     let runtime_state = svc.runtime();
-    let snapshot_service = Arc::clone(&svc);
-    let snapshot_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
-        let mut seq = 0_u64;
-        loop {
-            tick.tick().await;
-            seq += 1;
-            snapshot_service.publish_runtime_snapshot(seq).await;
-        }
-    });
     let (body_shutdown_tx, body_shutdown_rx) = tokio::sync::oneshot::channel();
+    let body_svc = Arc::clone(&svc);
     let mut body_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(RobonixSystemSomaGetYamlServer::from_arc(Arc::clone(&svc)))
-            .add_service(RobonixSystemSomaGetUrdfServer::from_arc(Arc::clone(&svc)))
-            .add_service(RobonixSystemSomaFootprintServer::from_arc(Arc::clone(&svc)))
-            .add_service(RobonixSystemSomaGetHealthServer::from_arc(Arc::clone(&svc)))
-            .add_service(RobonixSystemSomaHealthServer::from_arc(svc))
+            .add_service(RobonixSystemSomaGetYamlServer::from_arc(Arc::clone(
+                &body_svc,
+            )))
+            .add_service(RobonixSystemSomaGetUrdfServer::from_arc(Arc::clone(
+                &body_svc,
+            )))
+            .add_service(RobonixSystemSomaFootprintServer::from_arc(Arc::clone(
+                &body_svc,
+            )))
+            .add_service(RobonixSystemSomaGetHealthServer::from_arc(Arc::clone(
+                &body_svc,
+            )))
+            .add_service(RobonixSystemSomaHealthServer::from_arc(body_svc))
             .serve_with_shutdown(listen_addr, async {
                 let _ = body_shutdown_rx.await;
             })
@@ -249,6 +248,35 @@ async fn main() -> Result<()> {
         )
         .await
         .context("set Soma lifecycle ACTIVE")?;
+    let health_collector_active = match robonix_soma::health::start_health_collector(
+        atlas.clone(),
+        body.robot_id.clone(),
+        "agilex_piper".to_string(),
+        Arc::clone(&svc),
+    )
+    .await
+    {
+        Ok(active) => active,
+        Err(error) => {
+            warn!("[soma-health] collector unavailable: {error:#}; using runtime fallback");
+            false
+        }
+    };
+    let snapshot_task = if health_collector_active {
+        info!("[soma-health] using primitive health streams as snapshot source");
+        None
+    } else {
+        let snapshot_service = Arc::clone(&svc);
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            let mut seq = 0_u64;
+            loop {
+                tick.tick().await;
+                seq += 1;
+                snapshot_service.publish_runtime_snapshot(seq).await;
+            }
+        }))
+    };
     let runtime_dir = log_dir.join("soma-runtime");
     let runtime_monitor = match robonix_soma::runtime_monitor::start(
         &mut atlas,
@@ -340,7 +368,9 @@ async fn main() -> Result<()> {
     // so its pipe read doesn't come back and try to reuse a torn-down
     // launcher.
     stage2_task.abort();
-    snapshot_task.abort();
+    if let Some(snapshot_task) = snapshot_task {
+        snapshot_task.abort();
+    }
     if let Some(runtime_monitor) = runtime_monitor {
         runtime_monitor.shutdown(&mut atlas).await;
     }

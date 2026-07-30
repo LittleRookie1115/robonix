@@ -44,6 +44,16 @@ The VLM-facing RTDL envelope rules (grammar, example, constraints) live in `rtdl
 
 Pilot's standing system prompt is built in `src/planner.rs`; it includes the runtime operating principles, including the rule that failed required capability calls stop autonomous physical task progress until the user confirms the next step.
 
+Pilot also reads Soma YAML and URDF text for body context. Its URDF request
+sets `include_assets=false` because model binaries are only needed by rendering
+clients and must not be transferred into the VLM planning path.
+
+Live health snapshots are not injected into every planning prompt. Deployments
+should expose on-demand read-only status capabilities when the model needs
+current joint temperatures, current, voltage, enable state, communication
+state, or fault codes. Soma and Vitals continue to consume the dedicated health
+stream independently of Pilot.
+
 ## RTDL Planning Flow
 
 Pilot no longer sends OpenAI `tools` / function schemas as the primary planning path. Instead, it writes the RTDL grammar and available capability list into the prompt. The model must return a single JSON object:

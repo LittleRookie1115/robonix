@@ -4,6 +4,11 @@ Monitors robot onboard health (CPU/GPU/NVMe temperature, voltage) and body (join
 
 Vitals consumes the unified health stream (`SomaHealthSnapshot`) from Soma (real or mock). Without Soma, Vitals exits with an error.
 
+Vitals always reports actuator torque readiness as a healthy signal:
+`torque_enabled=0` is idle and `torque_enabled=1` is ready. Neither state is a
+health incident. Communication failures, thermal thresholds, and
+vendor/controller error codes still produce warnings or errors.
+
 ## Architecture
 
 Two parallel data paths coexist:
@@ -132,6 +137,7 @@ robonix-vitals --log info \
 | `--mock-soma-piper-script` | `ROBONIX_VITALS_MOCK_SOMA_PIPER_SCRIPT` | `<crate>/scripts/piper_bridge.py` |
 | `--mock-soma-koch-script` | `ROBONIX_VITALS_MOCK_SOMA_KOCH_SCRIPT` | `<crate>/scripts/koch_bridge.py` |
 | `--config` | `ROBONIX_CONFIG_PATH` | — |
+| `--config-json` | internal `rbnx boot` argument | — |
 | `--log` | `RUST_LOG` | `robonix_vitals=info` |
 
 ## Threshold format

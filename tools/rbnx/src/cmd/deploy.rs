@@ -233,6 +233,37 @@ stop: "true"
 
         assert_eq!(manifest_arg, Some(selected.to_string_lossy().as_ref()));
     }
+
+    #[test]
+    fn vitals_manifest_is_translated_to_builtin_args() {
+        let cfg: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+listen: 127.0.0.1:50093
+id: local-vitals
+thresholds_path: /tmp/vitals-thresholds.yaml
+soma_endpoint: 127.0.0.1:50091
+log: debug
+"#,
+        )
+        .expect("parse Vitals manifest block");
+
+        let args = system_cli_args("vitals", Some(&cfg), Some("127.0.0.1:50051"));
+        let value_for = |flag: &str| {
+            args.windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].as_str())
+        };
+
+        assert_eq!(value_for("--listen"), Some("127.0.0.1:50093"));
+        assert_eq!(value_for("--atlas"), Some("127.0.0.1:50051"));
+        assert_eq!(value_for("--id"), Some("local-vitals"));
+        assert_eq!(
+            value_for("--thresholds-path"),
+            Some("/tmp/vitals-thresholds.yaml")
+        );
+        assert_eq!(value_for("--soma-endpoint"), Some("127.0.0.1:50091"));
+        assert_eq!(value_for("--log"), Some("debug"));
+    }
 }
 
 /// Boot-time prerequisites check:
@@ -300,7 +331,7 @@ fn check_prerequisites(
     // otherwise `rbnx start` performs the build after spawn and the provider
     // registration timeout can kill a legitimate first build (Scene model
     // downloads are a common example).
-    const SYSTEM_BUILTINS: &[&str] = &["atlas", "executor", "pilot", "liaison", "soma"];
+    const SYSTEM_BUILTINS: &[&str] = &["atlas", "executor", "pilot", "vitals", "liaison", "soma"];
     if let Some(source_root) = robonix_source_path {
         for name in deploy.system.keys() {
             if SYSTEM_BUILTINS.contains(&name.as_str()) {
@@ -1110,6 +1141,7 @@ pub async fn execute(
                 ("executor", "robonix-executor"),
                 ("soma", "robonix-soma"),
                 ("pilot", "robonix-pilot"),
+                ("vitals", "robonix-vitals"),
                 ("liaison", "robonix-liaison"),
             ];
             for (name, bin) in bin_map {
@@ -1178,6 +1210,19 @@ pub async fn execute(
                     &children,
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                if let Some(status) = children
+                    .last_mut()
+                    .expect("system child pushed above")
+                    .child
+                    .try_wait()
+                    .with_context(|| format!("check system/{name} process status"))?
+                {
+                    output::boot_fail(name, &format!("process exited during startup ({status})"));
+                    anyhow::bail!(
+                        "system/{name} exited during startup with {status}; see {}",
+                        log_path(&log_dir, name).display()
+                    );
+                }
                 if *name == "soma" {
                     if !deploy.primitive.is_empty() {
                         output::boot_section("primitive");
@@ -1277,7 +1322,8 @@ pub async fn execute(
         let mut failures: Vec<(String, String, String)> = Vec::new(); // (component, name, err)
 
         if !skip_system {
-            let builtin_names: &[&str] = &["atlas", "executor", "pilot", "liaison", "soma"];
+            let builtin_names: &[&str] =
+                &["atlas", "executor", "pilot", "vitals", "liaison", "soma"];
             for (key, value) in &deploy.system {
                 if builtin_names.contains(&key.as_str()) {
                     continue;
@@ -1639,7 +1685,12 @@ fn system_listen(name: &str, cfg: Option<&serde_yaml::Value>) -> Option<String> 
         .get(serde_yaml::Value::String("listen".into()))?
         .as_str()?;
     let trimmed = s.trim();
-    if trimmed.is_empty() || !matches!(name, "atlas" | "executor" | "pilot" | "liaison" | "soma") {
+    if trimmed.is_empty()
+        || !matches!(
+            name,
+            "atlas" | "executor" | "pilot" | "vitals" | "liaison" | "soma"
+        )
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -1775,6 +1826,18 @@ fn system_cli_args(
             push_pair(&mut out, "--robot-yaml", s("robot_yaml"));
             push_pair(&mut out, "--deployment-manifest", s("deployment_manifest"));
             push_pair(&mut out, "--config", s("config"));
+            push_pair(&mut out, "--log", s("log"));
+        }
+        "vitals" => {
+            push_pair(&mut out, "--listen", s("listen"));
+            push_pair(
+                &mut out,
+                "--atlas",
+                s("atlas").or_else(|| atlas_listen.map(str::to_string)),
+            );
+            push_pair(&mut out, "--id", s("id"));
+            push_pair(&mut out, "--thresholds-path", s("thresholds_path"));
+            push_pair(&mut out, "--soma-endpoint", s("soma_endpoint"));
             push_pair(&mut out, "--log", s("log"));
         }
         _ => {}

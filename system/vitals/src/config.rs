@@ -194,6 +194,12 @@ pub struct Args {
     #[arg(long, env = "ROBONIX_CONFIG_PATH")]
     pub config: Option<PathBuf>,
 
+    /// The complete `system.vitals` manifest block passed by `rbnx boot`.
+    /// Typed flags above remain authoritative; accepting this common builtin
+    /// argument keeps Vitals compatible with the system launcher.
+    #[arg(long)]
+    pub config_json: Option<String>,
+
     /// Log filter (env_logger syntax; e.g. `info`, `robonix_vitals=debug`).
     /// Default: `robonix_vitals=info`. Falls back to `RUST_LOG` if unset.
     #[arg(long)]
@@ -407,6 +413,18 @@ mod tests {
         assert!(args.atlas.is_none());
         assert!(args.listen.is_none());
         assert!(args.soma_endpoint.is_none());
+    }
+
+    #[test]
+    fn args_accept_rbnx_manifest_json() {
+        let args = Args::try_parse_from([
+            "robonix-vitals",
+            "--config-json",
+            r#"{"listen":"127.0.0.1:50093","log":"info"}"#,
+        ])
+        .expect("parse rbnx builtin args");
+
+        assert!(args.config_json.is_some());
     }
 
     #[test]

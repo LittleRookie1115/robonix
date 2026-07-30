@@ -318,15 +318,17 @@ pub fn snapshot_to_vitals(
                 threshold: 0.0,
             });
         }
-        if !actuator.torque_enabled {
-            components.push(ComponentHealth {
-                name: format!("{}/torque_enabled", actuator.component_id),
-                health: HEALTH_WARN,
-                detail: format!("{} torque is disabled", actuator.component_id),
-                value: 0.0,
-                threshold: 1.0,
-            });
-        }
+        components.push(ComponentHealth {
+            name: format!("{}/torque_enabled", actuator.component_id),
+            health: HEALTH_OK,
+            detail: if actuator.torque_enabled {
+                format!("{} torque is enabled (ready)", actuator.component_id)
+            } else {
+                format!("{} torque is disabled (idle)", actuator.component_id)
+            },
+            value: if actuator.torque_enabled { 1.0 } else { 0.0 },
+            threshold: 1.0,
+        });
     }
 
     for power in &snapshot.power_sources {
@@ -949,6 +951,49 @@ mod tests {
             .expect("battery_main health");
         assert_eq!(battery.model, "mock_bms");
         assert!(battery.components.is_empty());
+    }
+
+    #[test]
+    /// Both readiness values stay observable and do not become health incidents.
+    fn actuator_enable_state_is_always_reported_as_healthy_readiness() {
+        let mut snapshot = generate_snapshot(MockScenario::Normal, 1, None);
+        for actuator in &mut snapshot.actuators {
+            actuator.torque_enabled = true;
+        }
+
+        let enabled_vitals = snapshot_to_vitals(&snapshot, &default_thresholds(), 123);
+        let enabled: Vec<_> = enabled_vitals
+            .components
+            .iter()
+            .filter(|component| component.name.ends_with("/torque_enabled"))
+            .collect();
+
+        assert_eq!(enabled.len(), snapshot.actuators.len());
+        assert!(enabled.iter().all(|component| {
+            component.health == HEALTH_OK
+                && component.value == 1.0
+                && component.threshold == 1.0
+                && component.detail.ends_with("torque is enabled (ready)")
+        }));
+
+        for actuator in &mut snapshot.actuators {
+            actuator.torque_enabled = false;
+        }
+
+        let vitals = snapshot_to_vitals(&snapshot, &default_thresholds(), 123);
+        let disabled: Vec<_> = vitals
+            .components
+            .iter()
+            .filter(|component| component.name.ends_with("/torque_enabled"))
+            .collect();
+
+        assert_eq!(disabled.len(), snapshot.actuators.len());
+        assert!(disabled.iter().all(|component| {
+            component.health == HEALTH_OK
+                && component.value == 0.0
+                && component.threshold == 1.0
+                && component.detail.ends_with("torque is disabled (idle)")
+        }));
     }
 
     #[test]

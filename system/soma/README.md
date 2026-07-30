@@ -75,14 +75,20 @@ string robot_id
 string yaml_text
 ```
 
-`robonix/system/soma/get_urdf` returns the loaded raw URDF XML:
+`robonix/system/soma/get_urdf` returns the loaded raw URDF XML and, on request,
+the files referenced by URDF-local relative mesh or texture paths:
 
 ```srv
 string robot_id  # empty = default robot
+bool include_assets
 ---
 string robot_id
 string urdf_xml
+UrdfAsset[] assets
 ```
+
+Absolute browser URLs and `package://` references are not attached. Relative
+resources must resolve below the directory containing the URDF.
 
 An empty request `robot_id` selects `default_robot`. If no `default_robot` is
 configured and exactly one robot is loaded, Soma selects that only robot.
@@ -150,6 +156,35 @@ description:
 | `model_name` | string | no | Human-readable or simulator-facing model name. |
 
 Soma preserves the original URDF XML. `get_urdf()` returns that raw XML text.
+
+For portable Soma-to-Client rendering, mesh and texture paths must be local to
+the URDF directory, for example:
+
+```xml
+<mesh filename="meshes/dae/arm/link_1.dae"/>
+<texture filename="textures/body.png"/>
+```
+
+Paths use `/`, are case-sensitive, and must remain below the URDF directory.
+Parent traversal and symlinks that escape that directory are rejected.
+Absolute paths plus `package://`, `file://`, `http://`, `https://`, and `data:`
+references are not attached to the response.
+
+Keep large binary model files outside the Robonix source repository. A robot
+deployment should retain its relative-path URDF, official source repository,
+exact revision, license, generation command, and a checksum manifest. Soma
+loads and validates those resources at startup, attaches each unique resource
+to `get_urdf(include_assets=true)`, and the Client serves them from its
+same-origin URDF asset endpoint.
+
+### Health collection
+
+After stage-1 primitive bring-up, Soma discovers every active
+`robonix/primitive/health/stream` gRPC provider and merges their latest frames
+into the body-level `robonix/system/soma/health` stream consumed by Vitals.
+Providers are reconnected after stream failures. When no primitive health
+provider exists, Soma falls back to its ROS runtime-state snapshot source;
+the two sources are never interleaved.
 
 ### Robot
 

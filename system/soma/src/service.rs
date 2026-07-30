@@ -11,7 +11,7 @@ use crate::pb::geometry_msgs::Point;
 use crate::pb::soma::{
     ActuatorState, ComponentStatus, GetFootprintRequest, GetFootprintResponse, GetHealthRequest,
     GetHealthResponse, GetUrdfRequest, GetUrdfResponse, GetYamlRequest, GetYamlResponse, Metric,
-    Scalar, SomaHealthSnapshot, StreamHealthRequest,
+    Scalar, SomaHealthSnapshot, StreamHealthRequest, UrdfAsset,
 };
 use crate::runtime_state::RuntimeStateStore;
 use crate::store::{SomaBody, StoreError};
@@ -46,6 +46,14 @@ impl SomaService {
 
     pub async fn publish_runtime_snapshot(&self, seq: u64) {
         let snapshot = self.to_health_snapshot(seq).await;
+        self.publish_snapshot(snapshot).await;
+    }
+
+    /// Cache and broadcast a health snapshot produced by an external
+    /// primitive collector. GetHealth and StreamHealth then observe the same
+    /// latest frame, regardless of whether it came from ROS runtime state or
+    /// a device-specific health capability.
+    pub async fn publish_snapshot(&self, snapshot: SomaHealthSnapshot) {
         *self.latest_snapshot.write().await = Some(snapshot.clone());
         let _ = self.snapshot_tx.send(snapshot);
     }
@@ -341,9 +349,21 @@ impl RobonixSystemSomaGetUrdf for SomaService {
             .body
             .resolve(&req.robot_id)
             .map_err(Self::map_lookup_error)?;
+        let assets = if req.include_assets {
+            body.urdf_assets
+                .iter()
+                .map(|asset| UrdfAsset {
+                    path: asset.path.clone(),
+                    data: asset.data.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(GetUrdfResponse {
             robot_id: body.robot_id.clone(),
             urdf_xml: body.urdf_xml.clone(),
+            assets,
         }))
     }
 }
@@ -413,12 +433,14 @@ mod tests {
         let response = service
             .get_urdf(Request::new(GetUrdfRequest {
                 robot_id: "".into(),
+                include_assets: false,
             }))
             .await
             .expect("get urdf")
             .into_inner();
         assert_eq!(response.robot_id, "test_ci_robot");
         assert!(response.urdf_xml.contains("<robot name=\"test_ci_robot\">"));
+        assert!(response.assets.is_empty());
     }
 
     #[tokio::test]
@@ -503,6 +525,7 @@ mod tests {
         let urdf = urdf_client
             .get_urdf(GetUrdfRequest {
                 robot_id: "test_ci_robot".into(),
+                include_assets: false,
             })
             .await
             .expect("get urdf")

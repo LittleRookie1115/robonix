@@ -1187,8 +1187,6 @@ pub async fn run_turn(
             .await
             .map_err(|e| anyhow::anyhow!("atlas capability discovery failed: {e}"))?;
 
-        let embodiment_block =
-            crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
         let environment_block = state_context::collect(executor, atlas, &cap_list).await;
 
         let display_caps = build_display_capabilities(&cap_list);
@@ -1219,7 +1217,7 @@ pub async fn run_turn(
         let mut correction: Option<String> = None;
         let (assistant_content, rtdl_description, graph, meta_op, plan_id, task_update, recovered) = loop {
             let mut messages = vec![Message::system(&format!(
-                "{system_prompt}\n\n{rtdl_prompt}{task_block}{forest_block}{executor_active_block}{embodiment_block}{environment_block}"
+                "{system_prompt}\n\n{rtdl_prompt}{task_block}{forest_block}{executor_active_block}{environment_block}"
             ))];
             messages.extend(history::sanitize_for_vlm(history));
             if let Some(ref correction) = correction {

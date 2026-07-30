@@ -11,6 +11,8 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -21,8 +23,15 @@ pub struct SomaBody {
     pub yaml_text: String,
     pub urdf_path: PathBuf,
     pub urdf_xml: String,
+    pub urdf_assets: Vec<SomaUrdfAsset>,
     pub footprint: Option<Footprint>,
     pub grippers: Vec<GripperConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SomaUrdfAsset {
+    pub path: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +112,7 @@ impl SomaBody {
         };
         let urdf_xml = std::fs::read_to_string(&urdf_path)
             .with_context(|| format!("read URDF '{}'", urdf_path.display()))?;
+        let urdf_assets = load_urdf_assets(&urdf_path, &urdf_xml)?;
         let footprint = doc.robot.footprint.map(Footprint::from_doc).transpose()?;
         let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
             .with_context(|| format!("parse runtime state config in '{}'", yaml_path.display()))?;
@@ -114,6 +124,7 @@ impl SomaBody {
             yaml_text,
             urdf_path,
             urdf_xml,
+            urdf_assets,
             footprint,
             grippers,
         })
@@ -137,6 +148,92 @@ impl SomaBody {
             .as_ref()
             .ok_or_else(|| StoreError::MissingFootprint(self.robot_id.clone()))
     }
+}
+
+/// Load files referenced through URDF-local relative mesh and texture paths.
+fn load_urdf_assets(urdf_path: &Path, urdf_xml: &str) -> Result<Vec<SomaUrdfAsset>> {
+    let document = roxmltree::Document::parse(urdf_xml)
+        .with_context(|| format!("parse URDF '{}'", urdf_path.display()))?;
+    let urdf_dir = urdf_path
+        .parent()
+        .with_context(|| format!("URDF '{}' has no parent directory", urdf_path.display()))?;
+    let canonical_dir = urdf_dir
+        .canonicalize()
+        .with_context(|| format!("resolve URDF directory '{}'", urdf_dir.display()))?;
+    let mut paths = BTreeSet::new();
+
+    for node in document.descendants().filter(|node| {
+        node.is_element() && (node.has_tag_name("mesh") || node.has_tag_name("texture"))
+    }) {
+        let Some(filename) = node.attribute("filename") else {
+            continue;
+        };
+        if let Some(path) = local_asset_path(filename)? {
+            paths.insert(path);
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|relative_path| {
+            let asset_path = urdf_dir.join(&relative_path);
+            let canonical_path = asset_path
+                .canonicalize()
+                .with_context(|| format!("resolve URDF asset '{}'", asset_path.display()))?;
+            if !canonical_path.starts_with(&canonical_dir) {
+                bail!(
+                    "URDF asset '{}' resolves outside '{}'",
+                    relative_path.display(),
+                    urdf_dir.display()
+                );
+            }
+            let data = std::fs::read(&canonical_path)
+                .with_context(|| format!("read URDF asset '{}'", canonical_path.display()))?;
+            Ok(SomaUrdfAsset {
+                path: path_for_wire(&relative_path),
+                data,
+            })
+        })
+        .collect()
+}
+
+/// Return a normalized URDF-local path, or None for externally resolved URIs.
+fn local_asset_path(filename: &str) -> Result<Option<PathBuf>> {
+    let filename = filename.trim();
+    if filename.is_empty()
+        || filename.starts_with('/')
+        || filename.contains("://")
+        || filename.starts_with("data:")
+    {
+        return Ok(None);
+    }
+    let path = Path::new(filename);
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        bail!("URDF asset path must stay below the URDF directory: '{filename}'");
+    }
+    Ok(Some(
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value),
+                Component::CurDir => None,
+                _ => unreachable!("path components were validated above"),
+            })
+            .collect(),
+    ))
+}
+
+/// Encode a validated native relative path as a browser-facing POSIX path.
+fn path_for_wire(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn collect_grippers(
@@ -302,6 +399,7 @@ mod tests {
         assert_eq!(body.robot_id, "test_ci_robot");
         assert!(body.yaml_text.contains("robot:"));
         assert!(body.urdf_xml.contains("<robot name=\"test_ci_robot\">"));
+        assert!(body.urdf_assets.is_empty());
         let footprint = body.footprint().expect("fixture footprint");
         assert_eq!(footprint.base_frame, "base_link");
         assert_eq!(footprint.points.len(), 4);
@@ -346,5 +444,39 @@ robot:
         assert_eq!(grippers[0].provider_id, "piper_ctl");
         assert_eq!(grippers[0].joint_name, "gripper");
         assert!((grippers[0].open_position_m - 0.06937).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loads_unique_relative_visual_assets() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let mesh_dir = temp.path().join("meshes");
+        std::fs::create_dir(&mesh_dir).expect("create mesh directory");
+        std::fs::write(mesh_dir.join("arm.dae"), b"mesh-bytes").expect("write mesh");
+        let urdf_path = temp.path().join("robot.urdf");
+        let urdf_xml = r#"<robot name="fixture">
+          <link name="base"><visual><geometry><mesh filename="meshes/arm.dae"/></geometry></visual></link>
+          <link name="copy"><visual><geometry><mesh filename="./meshes/arm.dae"/></geometry></visual></link>
+        </robot>"#;
+        std::fs::write(&urdf_path, urdf_xml).expect("write URDF");
+
+        let assets = load_urdf_assets(&urdf_path, urdf_xml).expect("load assets");
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].path, "meshes/arm.dae");
+        assert_eq!(assets[0].data, b"mesh-bytes");
+    }
+
+    #[test]
+    fn rejects_parent_directory_asset_reference() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let urdf_path = temp.path().join("robot.urdf");
+        let urdf_xml = r#"<robot name="bad"><link name="base"><visual><geometry>
+            <mesh filename="../outside.stl"/>
+        </geometry></visual></link></robot>"#;
+        std::fs::write(&urdf_path, urdf_xml).expect("write URDF");
+
+        let error = load_urdf_assets(&urdf_path, urdf_xml).expect_err("reject traversal");
+
+        assert!(error.to_string().contains("must stay below"));
     }
 }
