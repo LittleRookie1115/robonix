@@ -111,7 +111,8 @@ primitive:
   - name: audio_driver
     url: https://github.com/syswonder/primitive-audio-driver-rbnx
     branch: main
-    config: {}
+    config:
+      speaker_device: "null"
   # Reverse bridge for a robonix-client audio route. It advertises its
   # endpoint through Atlas and waits for the client to connect, so neither
   # this manifest nor Liaison stores a client IP.
@@ -171,8 +172,7 @@ service:
     branch: main
     config:
       use_sim_time: true
-      # 2-D lidar scan matching; RTAB-Map's walls drift over a long session.
-      algo: slam_toolbox
+      algo: rtabmap
       sensor_providers:
         lidar2d: tiago_lidar
         odom: tiago_chassis
