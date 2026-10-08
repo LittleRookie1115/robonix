@@ -45,6 +45,17 @@ report an explicit `online=false`, communication
 failure, or fault for Vitals to detect an individual device that stops producing
 data while its health stream remains alive.
 
+`StreamVitals` sends the initial snapshot and subsequent health transitions.
+Pilot consumes that stream, reads the cached snapshot before planning, and
+immediately steers active sessions on health changes. `ERROR` or `STALE`
+causes Pilot to replan with the active RTDL steps and instructions to cancel
+only affected plans and preserve unrelated work. The configured VLM selects
+the targets; verify Executor's plan state rather than assuming that the
+instructions guarantee correct cancellation. Vitals does not call Executor's
+global `cancel_all` operation for a component alert. `WARN` triggers replanning
+without requesting cancellation. If no Pilot session is active, the latest
+snapshot is still cached for the next planning request.
+
 ### Mock SOMA path (no SOMA needed)
 
 The `--mock-soma` flag starts an embedded gRPC server inside the Vitals process that
