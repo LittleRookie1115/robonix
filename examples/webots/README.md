@@ -18,7 +18,7 @@ examples/webots/
 │   ├── tiago_chassis/         /amcl_pose + /cmd_vel  → chassis/{state, move}
 │   ├── tiago_camera/          /head_front_camera/*   → camera/{snapshot, depth_snapshot}
 │   ├── tiago_lidar/           /scanner               → lidar/snapshot
-│   ├── tiago_health/          nominal simulated battery/wheel/sensor health
+│   ├── tiago_health/          simulated health and demo fault injection
 │   └── audio_driver/          (separate, mic/spkr — old schema, not deployed yet)
 ├── services/
 │   └── tiago_nav2/            Nav2 launch + ActionClient wrapper
@@ -122,14 +122,21 @@ the LLM agent can call.
 ## Simulated hardware health
 
 `rbnx boot` starts `tiago_health` during Soma stage 1. The primitive publishes
-nominal battery, wheel, camera, lidar, and audio readings every 500 ms; Soma
-maps those readings onto the component tree in `soma.yaml`. With the `full`
+simulated battery, wheel, and audio readings plus camera and lidar sample
+availability every 500 ms. Soma maps them onto the component tree in `soma.yaml`.
+With the `full`
 variant it also publishes all seven arm joints and the gripper against
 `soma.full.yaml`.
 
 The deployment manifest declares Vitals as a built-in system component, so
 `rbnx boot` starts it automatically after Soma and Pilot. Soma uses `50091`
 and voiceprint uses `50092` in this deployment, so Vitals listens on `50093`.
+If a cached package reports that its generated lifecycle Driver is missing or
+outdated, refresh the manifest's generated artifacts before boot:
+
+```bash
+rbnx build -f examples/webots/robonix_manifest.yaml --no-update-check
+```
 
 Confirm that Atlas sees it as active:
 
@@ -153,9 +160,35 @@ grpcurl -plaintext \
 
 Expected power values are approximately `82%` and `24.8 V`; both wheels are
 online with enabled torque and temperatures below the default thresholds.
-The primitive's manifest config includes `scenario: normal`. This is the
-reserved entry point for future fault profiles; unsupported values currently
-fail initialization instead of returning misleading healthy data.
+
+### Demonstrate a hardware fault and recovery
+
+Keep the Webots and `rbnx boot` terminals running. Start a long-running
+exploration task that uses lidar, then inject a lidar fault from a third
+terminal:
+
+```bash
+bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh lidar
+```
+
+The helper updates the local fault file inside the simulator container without
+restarting Webots or any Robonix component. The next health frame reports
+`body/hokuyo_lidar` offline; Soma maps it to `ERROR`, Vitals publishes the
+change, and Pilot interrupts an active planning round with the alert. Pilot
+should cancel only the in-flight plan that depends on lidar, preserving
+unrelated plans. Inspect the Vitals snapshot with the `grpcurl` command above
+and Pilot logs for `[pilot/health]`.
+
+Restore the sensor and verify the health transition:
+
+```bash
+bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh normal
+```
+
+Use `camera` instead of `lidar` to inject a camera fault. The helper accepts
+only these two monitored components. Pilot's choice of affected plan is made
+by the configured VLM from the active-plan details; verify the log and active
+plan state rather than treating the prompt alone as proof of cancellation.
 
 To tear everything down: Ctrl-C the `rbnx boot` terminal, OR from
 any other shell:
