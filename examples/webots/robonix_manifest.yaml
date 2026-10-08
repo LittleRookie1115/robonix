@@ -111,8 +111,7 @@ primitive:
   - name: audio_driver
     url: https://github.com/syswonder/primitive-audio-driver-rbnx
     branch: main
-    config:
-      speaker_device: "null"
+    config: {}
   # Reverse bridge for a robonix-client audio route. It advertises its
   # endpoint through Atlas and waits for the client to connect, so neither
   # this manifest nor Liaison stores a client IP.
