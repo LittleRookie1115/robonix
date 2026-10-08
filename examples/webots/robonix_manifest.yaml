@@ -91,9 +91,7 @@ primitive:
       update_rate: 10
       frame_id: lidar
       sentinel_timeout_s: 150
-  # Deterministic simulated hardware telemetry consumed by Soma and Vitals.
-  # Keep scenario=normal for the current demo; the field is reserved as the
-  # stable entry point for future fault-injection profiles.
+  # Simulated hardware telemetry consumed by Soma and Vitals.
   - name: tiago_health
     path: ./primitives/tiago_health
     config:
@@ -101,6 +99,10 @@ primitive:
       variant: ${ROBONIX_TIAGO_VARIANT}
       scenario: normal
       interval_s: 0.5
+      sensor_timeout_s: 2.0
+      fault_file: /tmp/robonix-tiago-health-faults.json
+      camera_rgb_topic: /head_front_camera/rgb/image_raw
+      lidar_scan_topic: /scanner_normalized
       battery_percent: 82.0
       voltage: 24.8
       remaining_s: 10800

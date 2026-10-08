@@ -30,4 +30,8 @@ exec docker exec \
   -e ROBONIX_PKG_HOST_DIR="$(cd "$(dirname "$0")/.." && pwd)" \
   -e PYTHONPATH="/robonix_pkgs/pylib/robonix-api:/robonix_pkgs/primitives/tiago_health/rbnx-build/codegen/proto_gen" \
   "$SIM_CT" \
-  bash -lc 'cd /robonix_pkgs/primitives/tiago_health && exec python3 -m tiago_health.driver'
+  bash -lc 'set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash >/dev/null
+            cd /robonix_pkgs/primitives/tiago_health
+            exec python3 -m tiago_health.driver'
