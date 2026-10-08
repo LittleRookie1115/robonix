@@ -137,9 +137,11 @@ pub struct ExecutorServiceImpl {
     provider_id: String,
     runtime: PlanRuntime,
     verification: Arc<VerificationPolicy>,
+    shutting_down: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl ExecutorServiceImpl {
+    /// Create shared plan state with admission initially open.
     pub fn new(
         atlas: AtlasClient,
         provider_id: String,
@@ -150,7 +152,17 @@ impl ExecutorServiceImpl {
             provider_id,
             runtime: PlanRuntime::default(),
             verification,
+            shutting_down: Arc::new(tokio::sync::Mutex::new(false)),
         }
+    }
+
+    /// Close admission before cancelling the tracked plans and waiting for them.
+    pub async fn shutdown(&self) -> bool {
+        *self.shutting_down.lock().await = true;
+        let mut atlas = self.atlas.clone();
+        self.runtime
+            .cancel_all_plans(&self.provider_id, &mut atlas)
+            .await
     }
 }
 
@@ -158,12 +170,19 @@ impl ExecutorServiceImpl {
 impl RobonixSystemExecutorExecute for ExecutorServiceImpl {
     type ExecuteStream = ReceiverStream<Result<RtdlEvent, Status>>;
 
+    /// Register accepted work before dispatch and reject new work during shutdown.
     async fn execute(
         &self,
         request: Request<Plan>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         let plan = request.into_inner();
         validate_plan(&plan).map_err(Status::invalid_argument)?;
+        let shutting_down = self.shutting_down.lock().await;
+        if *shutting_down {
+            return Err(Status::unavailable("Executor is shutting down"));
+        }
+        self.runtime.register_plan(&plan.plan_id).await;
+        drop(shutting_down);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let atlas = self.atlas.clone();
         let provider_id = self.provider_id.clone();
@@ -173,7 +192,6 @@ impl RobonixSystemExecutorExecute for ExecutorServiceImpl {
         tokio::spawn(async move {
             let plan_id = plan.plan_id.clone();
             let plan = Arc::new(plan);
-            runtime.register_plan(&plan_id).await;
             runtime.record_plan_ops(&plan).await;
             let _ = tx.send(Ok(rtdl_wire::plan_started(plan_id.clone()))).await;
             let execution = execute_node(
@@ -959,6 +977,105 @@ mod tests {
     fn reserve_address() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         listener.local_addr().expect("reserved address")
+    }
+
+    #[tokio::test]
+    /// Accepted requests are tracked before dispatch and drained at shutdown.
+    async fn shutdown_tracks_accepted_plans_before_dispatch_and_rejects_new_work() {
+        let atlas_addr = reserve_address();
+        let atlas_server =
+            tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), atlas_addr));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{atlas_addr}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        let service = ExecutorServiceImpl::new(
+            atlas,
+            "executor".into(),
+            Arc::new(VerificationPolicy::new(false, Vec::new())),
+        );
+        let request = plan(
+            vec![node_with_identity(
+                "root",
+                "empty plan",
+                RTDL_SEQUENCE,
+                vec![],
+                None,
+            )],
+            0,
+        );
+        let mut stream = service
+            .execute(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let active: serde_json::Value =
+            serde_json::from_str(&service.runtime.active_plans_json().await).unwrap();
+        assert_eq!(active["count"], 1);
+        assert!(service.shutdown().await);
+        let rejected = service.execute(Request::new(request)).await;
+        assert_eq!(rejected.err().unwrap().code(), tonic::Code::Unavailable);
+        let mut cancelled = false;
+        while let Some(event) = stream.next().await {
+            if let Some(complete) = event.unwrap().plan_complete {
+                cancelled = complete.any_failed;
+            }
+        }
+        assert!(cancelled);
+        let active: serde_json::Value =
+            serde_json::from_str(&service.runtime.active_plans_json().await).unwrap();
+        assert_eq!(active["count"], 0);
+        atlas_server.abort();
+    }
+
+    #[tokio::test]
+    /// Admission closure wins over an Execute request queued behind shutdown.
+    async fn shutdown_closes_admission_before_a_concurrent_execute() {
+        let atlas_addr = reserve_address();
+        let atlas_server =
+            tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), atlas_addr));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{atlas_addr}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        let service = ExecutorServiceImpl::new(
+            atlas,
+            "executor".into(),
+            Arc::new(VerificationPolicy::new(false, Vec::new())),
+        );
+        let guard = service.shutting_down.lock().await;
+        let shutting_down = service.clone();
+        let shutdown = tokio::spawn(async move { shutting_down.shutdown().await });
+        tokio::task::yield_now().await;
+        let executing = service.clone();
+        let execute = tokio::spawn(async move {
+            executing
+                .execute(Request::new(plan(
+                    vec![node_with_identity(
+                        "root",
+                        "empty plan",
+                        RTDL_SEQUENCE,
+                        vec![],
+                        None,
+                    )],
+                    0,
+                )))
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(guard);
+        assert!(shutdown.await.unwrap());
+        assert_eq!(
+            execute.await.unwrap().err().unwrap().code(),
+            tonic::Code::Unavailable
+        );
+        atlas_server.abort();
     }
 
     #[test]

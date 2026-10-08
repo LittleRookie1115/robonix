@@ -30,6 +30,14 @@ Important configuration:
 - `--id` / `ROBONIX_EXECUTOR_PROVIDER_ID`: provider id registered with Atlas. Defaults to `executor`.
 - `log`: Scribe log-file level (`debug`/`info`/`warn`/`error`), read from the `log` key of `--config-json`, which `rbnx` fills from the manifest. Falls back to `SCRIBE_FILE_LEVEL`, then `info`. A standalone `--log` flag is accepted but not applied.
 
+Executor declares `robonix/lifecycle/driver` at its gRPC endpoint. Startup
+calls the shared Driver with `CMD_INIT` and `CMD_ACTIVATE` before reporting
+readiness, so Atlas exposes the provider as `ACTIVE`. Unknown commands and
+rejected transitions return `ok=false`. `CMD_SHUTDOWN` stops accepting new
+plans, cancels accepted plans, publishes `TERMINATED`, and shuts down the gRPC
+server. If cancellation does not complete, shutdown returns `ok=false` and
+can be retried; new plans remain rejected.
+
 Result verification rules live in the deployment manifest's `system.executor`
 block. A rule is optional; calls with no matching rule keep their original
 result. For example:
