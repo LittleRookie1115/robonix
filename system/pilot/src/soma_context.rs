@@ -11,12 +11,18 @@
 // contradict soma.yaml with. Soma still serves get_urdf for consumers that
 // need the kinematics; it just does not belong in a prompt.
 
+use crate::health_dependencies::HealthDependencies;
 use crate::pb::contracts::robonix_system_soma_get_yaml_client::RobonixSystemSomaGetYamlClient;
 use crate::pb::soma::GetYamlRequest;
 use crate::pb::vitals::VitalsSnapshot;
 use anyhow::{Context, Result};
-use robonix_atlas::client::{self as atlas_client, AtlasClient};
+use robonix_atlas::client::AtlasClient;
+use robonix_atlas::pb::Transport;
 use robonix_scribe::warn;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tonic::transport::Endpoint;
 
 const GET_YAML_CONTRACT: &str = "robonix/system/soma/get_yaml";
 
@@ -169,6 +175,7 @@ pub fn vitals_alert_key(snapshot: &VitalsSnapshot) -> Option<String> {
 pub async fn fetch_system_prompt_block(
     atlas: &mut AtlasClient,
     consumer_id: &str,
+    dependencies: &Arc<RwLock<HealthDependencies>>,
 ) -> Result<Option<String>> {
     let yaml = match fetch_yaml(atlas, consumer_id).await {
         Ok(text) => text,
@@ -177,6 +184,9 @@ pub async fn fetch_system_prompt_block(
             return Ok(None);
         }
     };
+    if let Err(error) = dependencies.write().await.update_topology(&yaml) {
+        warn!("[pilot/dependencies] Soma export bindings unavailable: {error:#}");
+    }
     let mut block = String::from(
         "\n\n## Robot Body Context (from Soma)\n\n\
          This is the robot's self-description, refreshed automatically before planning. \
@@ -321,12 +331,49 @@ fn is_absent(value: &serde_yaml::Value) -> bool {
     }
 }
 
-async fn fetch_yaml(atlas: &mut AtlasClient, consumer_id: &str) -> Result<String> {
-    let (channel_id, _provider_id, channel) =
-        atlas_client::connect_to_capability(atlas, consumer_id, GET_YAML_CONTRACT)
+/// Retain the binding before dialing so connection and lookup failures release it.
+pub(crate) async fn fetch_yaml(atlas: &mut AtlasClient, consumer_id: &str) -> Result<String> {
+    let timeout = Duration::from_secs(2);
+    let capabilities = tokio::time::timeout(
+        timeout,
+        atlas.flatten_capabilities(GET_YAML_CONTRACT, "", Transport::Grpc),
+    )
+    .await
+    .context("Soma body discovery timed out")?
+    .context("discover Soma get_yaml")?;
+    let capability = capabilities
+        .first()
+        .context("no provider offers Soma get_yaml over gRPC")?;
+    if capabilities.len() > 1 {
+        warn!(
+            "[pilot/soma] multiple get_yaml providers; picking first ('{}')",
+            capability.provider_id
+        );
+    }
+    let (channel_id, endpoint, _) = tokio::time::timeout(
+        timeout,
+        atlas.connect_capability(
+            consumer_id,
+            &capability.provider_id,
+            GET_YAML_CONTRACT,
+            Transport::Grpc,
+        ),
+    )
+    .await
+    .context("Soma body binding timed out")?
+    .context("bind Soma get_yaml")?;
+    let result = tokio::time::timeout(timeout, async {
+        let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint
+        } else {
+            format!("http://{endpoint}")
+        };
+        let channel = Endpoint::new(endpoint)
+            .context("invalid Soma body endpoint")?
+            .connect_timeout(timeout)
+            .connect()
             .await
-            .context("connect to Soma get_yaml")?;
-    let result = async {
+            .context("connect Soma body endpoint")?;
         let mut client = RobonixSystemSomaGetYamlClient::new(channel);
         let response = client
             .get_yaml(GetYamlRequest {
@@ -336,16 +383,163 @@ async fn fetch_yaml(atlas: &mut AtlasClient, consumer_id: &str) -> Result<String
             .context("call Soma get_yaml")?
             .into_inner();
         Ok::<_, anyhow::Error>(response.yaml_text)
+    })
+    .await
+    .context("Soma body lookup timed out")
+    .and_then(|result| result);
+    match tokio::time::timeout(timeout, atlas.disconnect_capability(&channel_id)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("[pilot/soma] body channel cleanup failed: {error:#}"),
+        Err(error) => warn!("[pilot/soma] body channel cleanup timed out: {error}"),
     }
-    .await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
     result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_yaml, drop_absent, format_vitals_prompt_block, vitals_alert};
+    use super::{
+        GET_YAML_CONTRACT, compact_yaml, drop_absent, fetch_yaml, format_vitals_prompt_block,
+        vitals_alert,
+    };
+    use crate::pb::contracts::robonix_system_soma_get_yaml_server::{
+        RobonixSystemSomaGetYaml, RobonixSystemSomaGetYamlServer,
+    };
+    use crate::pb::soma::{GetYamlRequest, GetYamlResponse};
     use crate::pb::vitals::{ComponentHealth, PowerState, VitalsSnapshot};
+    use robonix_atlas::client::{AtlasClient, grpc_params};
+    use robonix_atlas::pb::{InspectAtlasRequest, Transport, atlas_server::AtlasServer};
+    use robonix_atlas::service::{AtlasRegistry, AtlasService};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpSocket, TcpStream};
+    use tonic::{Request, Response, Status};
+
+    struct AtlasFixture {
+        client: AtlasClient,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    struct HangingSoma {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl RobonixSystemSomaGetYaml for HangingSoma {
+        /// Reach the actual RPC handler before simulating an unresponsive lookup.
+        async fn get_yaml(
+            &self,
+            _request: Request<GetYamlRequest>,
+        ) -> Result<Response<GetYamlResponse>, Status> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::pending().await
+        }
+    }
+
+    /// Keep fixture ports bound without requiring extra tokio-stream features.
+    fn incoming(
+        listener: TcpListener,
+    ) -> impl futures_util::Stream<Item = std::io::Result<TcpStream>> {
+        futures_util::stream::unfold(listener, |listener| async move {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        })
+    }
+
+    /// Register Soma on a real Atlas endpoint without starting heartbeat eviction.
+    async fn atlas_fixture(soma_endpoint: &str) -> AtlasFixture {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(AtlasServer::new(AtlasService::new(Arc::new(
+                    AtlasRegistry::default(),
+                ))))
+                .serve_with_incoming(incoming(listener)),
+        );
+        let mut client = AtlasClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        client
+            .register_service("soma", "robonix/system/soma", "")
+            .await
+            .unwrap();
+        client
+            .declare_capability(
+                "soma",
+                GET_YAML_CONTRACT,
+                Transport::Grpc,
+                soma_endpoint,
+                grpc_params(
+                    "capabilities/system/soma/get_yaml.v1.toml",
+                    "robonix.contracts.RobonixSystemSomaGetYaml",
+                    "/robonix.contracts.RobonixSystemSomaGetYaml/GetYaml",
+                ),
+            )
+            .await
+            .unwrap();
+        AtlasFixture { client, server }
+    }
+
+    /// Inspect actual Atlas bookkeeping after each failed lookup, not source text.
+    async fn assert_no_channels(atlas: &AtlasClient) {
+        let inspection = atlas
+            .inner()
+            .inspect_atlas(InspectAtlasRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&inspection.json).unwrap();
+        assert!(value["channels"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    /// A registered endpoint that refuses connections must not accumulate bindings.
+    async fn soma_lookup_undialable_endpoint_releases_channels() {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut fixture = atlas_fixture(&socket.local_addr().unwrap().to_string()).await;
+        for _ in 0..3 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                fetch_yaml(&mut fixture.client, "pilot"),
+            )
+            .await
+            .expect("failed dial must respect the lookup deadline");
+            assert!(result.is_err());
+            assert_no_channels(&fixture.client).await;
+        }
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    /// A connected but hanging GetYaml RPC must release each timed-out binding.
+    async fn soma_lookup_hanging_rpc_releases_channels() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(RobonixSystemSomaGetYamlServer::new(HangingSoma {
+                    calls: Arc::clone(&calls),
+                }))
+                .serve_with_incoming(incoming(listener)),
+        );
+        let mut fixture = atlas_fixture(&endpoint).await;
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                fetch_yaml(&mut fixture.client, "pilot"),
+            )
+            .await
+            .expect("hung RPC must respect the lookup deadline");
+            let error = result.expect_err("GetYaml should time out");
+            assert!(error.to_string().contains("Soma body lookup timed out"));
+            assert_no_channels(&fixture.client).await;
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        fixture.server.abort();
+        server.abort();
+    }
 
     #[test]
     fn representative_soma_context_is_smaller_without_dropping_body_facts() {

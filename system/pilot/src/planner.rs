@@ -2,6 +2,7 @@
 // Author: wheatfox <wheatfox17@icloud.com>
 //
 use crate::discovery::{self, llm_name};
+use crate::health_dependencies::HealthDependencies;
 use crate::history;
 use crate::memory;
 use crate::pb::contracts::robonix_system_executor_control_plan_client::RobonixSystemExecutorControlPlanClient;
@@ -705,32 +706,34 @@ fn build_executor_active_block(plans_json: Option<&str>) -> String {
     )
 }
 
-async fn fetch_executor_active_block(executor: &mut ExecutorConn) -> String {
+/// Reuse one authoritative query for both plan context and dependency matching.
+async fn fetch_executor_active_block(executor: &mut ExecutorConn) -> (String, Option<String>) {
     let request = executor
         .active
         .list_active_plans(Request::new(ListActivePlansRequest::default()));
-    match tokio::time::timeout(Duration::from_secs(2), request).await {
+    let plans = match tokio::time::timeout(Duration::from_secs(2), request).await {
         Ok(Ok(response)) => {
             let response = response.into_inner();
             if response.success {
-                build_executor_active_block(Some(&response.plans_json))
+                Some(response.plans_json)
             } else {
                 warn!(
                     "[pilot/state] Executor active-plan query rejected: {}",
                     response.error
                 );
-                build_executor_active_block(None)
+                None
             }
         }
         Ok(Err(error)) => {
             warn!("[pilot/state] Executor active-plan query failed: {error}");
-            build_executor_active_block(None)
+            None
         }
         Err(_) => {
             warn!("[pilot/state] Executor active-plan query timed out");
-            build_executor_active_block(None)
+            None
         }
-    }
+    };
+    (build_executor_active_block(plans.as_deref()), plans)
 }
 
 /// Pull every queued mid-task steer into the LLM history as fresh user input.
@@ -1054,6 +1057,7 @@ pub async fn run_turn(
     atlas: &mut AtlasClient,
     consumer_id: &str,
     vitals_snapshot: Arc<tokio::sync::RwLock<Option<VitalsSnapshot>>>,
+    health_dependencies: Arc<tokio::sync::RwLock<HealthDependencies>>,
     tx: &mpsc::Sender<Result<PilotEvent, tonic::Status>>,
     mut cancel_rx: watch::Receiver<bool>,
     mut steer_rx: service::TurnSteers,
@@ -1376,7 +1380,7 @@ pub async fn run_turn(
         let embodiment_block =
             crate::soma_context::format_vitals_prompt_block(current_vitals.as_ref());
         let environment_block = state_context::collect(executor, atlas, &cap_list).await;
-        let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
+        let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id, &health_dependencies)
             .await
             .ok()
             .flatten()
@@ -1397,7 +1401,11 @@ pub async fn run_turn(
         // made the second provider request cold.
         let protocol_prompt = rtdl_protocol(false);
         let forest_block = build_forest_block(&forest, &cancel_requested);
-        let executor_active_block = fetch_executor_active_block(executor).await;
+        let (executor_active_block, active_plans) = fetch_executor_active_block(executor).await;
+        let dependency_impact = health_dependencies
+            .read()
+            .await
+            .prompt(current_vitals.as_ref(), active_plans.as_deref());
         // Only instructions that never change sit before history.
         let sections = [
             ("standing_system", standing_prompt.as_str()),
@@ -1416,6 +1424,7 @@ pub async fn run_turn(
             executor_active_block.as_str(),
             embodiment_block.as_str(),
             environment_block.as_str(),
+            dependency_impact.as_str(),
         ]
         .iter()
         .map(|content| content.len().div_ceil(4))
@@ -1458,6 +1467,7 @@ pub async fn run_turn(
             ("executor_state", executor_active_block.as_str()),
             ("embodiment_live", embodiment_block.as_str()),
             ("environment_live", environment_block.as_str()),
+            ("hardware_dependencies", dependency_impact.as_str()),
         ];
         let runtime_context = render_context_sections(&live_sections);
         let _ = tx

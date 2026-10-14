@@ -21,6 +21,7 @@
 
 mod config;
 mod discovery;
+mod health_dependencies;
 mod history;
 mod memory;
 mod pb;

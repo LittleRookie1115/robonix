@@ -97,9 +97,30 @@ the same Vitals provider with `GetVitals` every two seconds using a two-second
 RPC deadline. Failed verification invalidates cached health and notifies active
 turns. Health notifications use a coalesced channel separate from ordered user
 input, so a full user queue cannot block health monitoring or other sessions.
-Only health-state or affected-component changes interrupt inference; changing
+Health-state, component, or recorded-dependency changes interrupt inference; changing
 values in an existing alarm still refresh context without restarting sampling.
 Failed verification invalidates health before deadline-bounded Atlas cleanup.
+
+Pilot polls Atlas's existing channel inspection and typed provider discovery
+every two seconds. It joins those consumer-to-provider records with the exact
+component `exports` in Soma's YAML, follows dependent services and skills, and
+matches their provider/contract bindings against Executor's active steps. Each
+fault-time planning request includes the causal input contracts and candidate
+plan ids; healthy requests carry only a compact summary. Provider ids must name
+the deployed instances, not package aliases. A child without its own exports
+uses the nearest parent that declares them. Lifecycle control channels and
+unregistered CLI consumers are excluded from functional input dependencies.
+
+When a provider unregisters or becomes `TERMINATED`, Pilot keeps the last
+observed dependencies, marked as cached evidence. Unrelated lost records expire
+after five minutes; ongoing reported faults pin their evidence until recovery.
+Explicitly closed channels between live providers are removed. Failed queries,
+unmapped components, malformed plan data, and output truncation are reported
+as incomplete coverage. A channel establishes a service input dependency, not
+the internal requirements of each exported service capability; matched plans
+are cancellation candidates, not proof that every downstream operation failed.
+The graph cache accepts at most 2,048 providers/channels, and the impact block
+is limited to 24 KiB. No new Atlas RPC or unconditional cancellation is added.
 
 The Soma body description is projected onto what a planner acts on. The `urdf` file reference — a path in the provider's own filesystem namespace, pointing at the kinematics this crate already declines to inject — the `footprint` collision polygon that navigation rather than the planner consumes, and the description of each exported capability, which the capability catalog in the same prompt already carries verbatim, are omitted; the component-to-capability mapping stays, since the catalog does not say which part of the body offers a capability. The Vitals block contains only non-OK component health, or a compact all-reported-healthy summary, to avoid repeating empty telemetry. `dimensions`, sensor `placement`, `can_do` / `cannot_do`, and the deployment notes are body facts and remain.
 

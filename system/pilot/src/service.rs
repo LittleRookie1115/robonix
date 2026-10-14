@@ -3,6 +3,7 @@
 //
 // `RobonixSystemPilot` gRPC handler (contract `robonix/system/pilot`).
 
+use crate::health_dependencies::{self, HealthDependencies};
 use crate::pb::contracts::{
     robonix_system_executor_control_plan_client::RobonixSystemExecutorControlPlanClient,
     robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient,
@@ -29,7 +30,7 @@ use robonix_scribe::{debug, error, info};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -243,6 +244,7 @@ pub struct PilotServiceImpl {
     /// so ids must be unique across sessions as well as turns.
     plan_seq: Arc<AtomicU64>,
     latest_vitals: Arc<RwLock<Option<VitalsSnapshot>>>,
+    health_dependencies: Arc<RwLock<HealthDependencies>>,
 }
 
 impl PilotServiceImpl {
@@ -265,6 +267,7 @@ impl PilotServiceImpl {
             seen_task_ids: Arc::new(Mutex::new(HashMap::new())),
             plan_seq: Arc::new(AtomicU64::new(0)),
             latest_vitals: Arc::new(RwLock::new(None)),
+            health_dependencies: Arc::new(RwLock::new(HealthDependencies::default())),
         }
     }
 
@@ -274,6 +277,40 @@ impl PilotServiceImpl {
         let consumer_id = self.provider_id.clone();
         let latest_vitals = Arc::clone(&self.latest_vitals);
         let steers = Arc::clone(&self.steers);
+        let health_dependencies = Arc::clone(&self.health_dependencies);
+        let mut dependency_atlas = self.atlas.clone();
+        let dependency_consumer = consumer_id.clone();
+        let dependency_cache = Arc::clone(&health_dependencies);
+        tokio::spawn(async move {
+            let mut next_body_refresh = Instant::now();
+            loop {
+                if let Err(error) =
+                    health_dependencies::refresh_graph(&dependency_atlas, &dependency_cache).await
+                {
+                    debug!("[pilot/dependencies] Atlas dependency data unverified: {error:#}");
+                }
+                if Instant::now() >= next_body_refresh {
+                    let body =
+                        soma_context::fetch_yaml(&mut dependency_atlas, &dependency_consumer).await;
+                    let outcome = match body {
+                        Ok(yaml) => dependency_cache.write().await.update_topology(&yaml),
+                        Err(error) => {
+                            dependency_cache.write().await.invalidate_topology();
+                            Err(error)
+                        }
+                    };
+                    let delay = match outcome {
+                        Ok(()) => Duration::from_secs(60),
+                        Err(error) => {
+                            debug!("[pilot/dependencies] Soma bindings unverified: {error:#}");
+                            VITALS_PROBE_INTERVAL
+                        }
+                    };
+                    next_body_refresh = Instant::now() + delay;
+                }
+                tokio::time::sleep(VITALS_PROBE_INTERVAL).await;
+            }
+        });
 
         tokio::spawn(async move {
             let mut previous_alert: Option<String> = None;
@@ -328,6 +365,7 @@ impl PilotServiceImpl {
                             &latest_vitals,
                             &steers,
                             &mut previous_alert,
+                            &health_dependencies,
                         )
                         .await
                     }
@@ -483,6 +521,7 @@ async fn consume_vitals_stream(
     latest: &Arc<RwLock<Option<VitalsSnapshot>>>,
     steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
     previous_alert: &mut Option<String>,
+    dependencies: &Arc<RwLock<HealthDependencies>>,
 ) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(VITALS_PROBE_INTERVAL);
     loop {
@@ -492,7 +531,7 @@ async fn consume_vitals_stream(
             }
             _ = tick.tick() => probe_vitals(probe).await?,
         };
-        update_vitals_context(snapshot, latest, steers, previous_alert).await;
+        update_vitals_context(snapshot, latest, steers, previous_alert, dependencies).await;
     }
 }
 
@@ -502,12 +541,19 @@ async fn update_vitals_context(
     latest: &Arc<RwLock<Option<VitalsSnapshot>>>,
     steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
     previous_alert: &mut Option<String>,
+    dependencies: &Arc<RwLock<HealthDependencies>>,
 ) {
     *latest.write().await = Some(snapshot.clone());
     let alert = soma_context::vitals_alert(&snapshot);
-    let next_alert = soma_context::vitals_alert_key(&snapshot);
+    let mut scope = dependencies.write().await;
+    scope.observe_health(&snapshot);
+    let next_alert = soma_context::vitals_alert_key(&snapshot)
+        .map(|key| format!("{key};{}", scope.alert_key(&snapshot)));
+    let dependency_report = scope.report(Some(&snapshot), None);
+    drop(scope);
     if &next_alert != previous_alert {
         if let Some((detail, stop_active_plans)) = alert {
+            let detail = format!("{detail}\nDependency evidence: {dependency_report}");
             let message = vitals_event_message(&detail, stop_active_plans);
             let notified = notify_active_turns(steers, &message).await;
             info!("[pilot/vitals] health alert received; active_turns_notified={notified}");
@@ -556,7 +602,9 @@ fn vitals_event_message(detail: &str, requires_targeted_stop: bool) -> String {
              Reassess active plans immediately. Identify only plans whose listed steps depend \
              on the affected component, then stop those plans with a root cancel_plan using \
              each exact plan_id. Never use cancel_all for this component alert; preserve \
-             unrelated plans. Do not dispatch dependent actions while the component is \
+             unrelated plans. Use the computed hardware dependency impact and current \
+             Executor candidate plan ids rather than guessing from capability names. \
+             Do not dispatch dependent actions while the component is \
              ERROR or STALE. If dependency is unclear, report that uncertainty instead of \
              claiming the affected work was stopped."
         )
@@ -793,6 +841,7 @@ impl RobonixSystemPilot for PilotServiceImpl {
         let history_budget = self.history_budget.clone();
         let session_id = task.session_id.clone();
         let vitals_snapshot = Arc::clone(&self.latest_vitals);
+        let health_dependencies = Arc::clone(&self.health_dependencies);
         let cancels = Arc::clone(&self.cancels);
         let steers = Arc::clone(&self.steers);
 
@@ -841,6 +890,7 @@ impl RobonixSystemPilot for PilotServiceImpl {
                 &mut atlas_for_turn,
                 &provider_id,
                 vitals_snapshot,
+                health_dependencies,
                 &tx,
                 cancel_rx,
                 TurnSteers::new(steer_rx, health_rx),
@@ -943,6 +993,7 @@ mod tests {
         strict_expected_turn, subscribe_turn_events, task_is_abort_turn, task_is_steer,
         vitals_event_message,
     };
+    use crate::health_dependencies::HealthDependencies;
     use crate::pb::contracts::{
         robonix_system_vitals_get_client::RobonixSystemVitalsGetClient,
         robonix_system_vitals_get_server::{RobonixSystemVitalsGet, RobonixSystemVitalsGetServer},
@@ -1015,19 +1066,35 @@ mod tests {
         let mut receiver = TurnSteers::new(task_rx, health_rx);
         let mut previous = None;
         let mut snapshot = healthy_vitals(1);
+        let dependencies = Arc::new(RwLock::new(HealthDependencies::default()));
         snapshot.components[0].health = 2;
         snapshot.components[0].detail = "temperature 90".into();
-        super::update_vitals_context(snapshot.clone(), &latest, &steers, &mut previous).await;
+        super::update_vitals_context(
+            snapshot.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
         assert!(receiver.try_recv().is_ok());
         snapshot.components[0].detail = "temperature 91".into();
-        super::update_vitals_context(snapshot.clone(), &latest, &steers, &mut previous).await;
+        super::update_vitals_context(
+            snapshot.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             latest.read().await.as_ref().unwrap().components[0].detail,
             "temperature 91"
         );
         snapshot.components[0].health = 3;
-        super::update_vitals_context(snapshot, &latest, &steers, &mut previous).await;
+        super::update_vitals_context(snapshot, &latest, &steers, &mut previous, &dependencies)
+            .await;
         assert!(receiver.try_recv().is_ok());
     }
 
@@ -1125,6 +1192,7 @@ mod tests {
                 &latest,
                 &steers,
                 &mut previous_alert,
+                &Arc::new(RwLock::new(HealthDependencies::default())),
             ),
         )
         .await;
@@ -1149,6 +1217,7 @@ mod tests {
                 &latest,
                 &steers,
                 &mut previous_alert,
+                &Arc::new(RwLock::new(HealthDependencies::default())),
             ),
         )
         .await
