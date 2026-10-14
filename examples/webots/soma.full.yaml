@@ -25,12 +25,12 @@ robot:
       capabilities:
         - { path: robonix/primitive/health/state, description: "Read the current simulated TIAGo hardware health state." }
         - { path: robonix/primitive/health/stream, description: "Stream simulated TIAGo hardware health into Soma." }
-    - provider_id: tiago_webots_nav2
+    - provider_id: nav2
       capabilities:
         - { path: robonix/service/navigation/navigate, description: "Navigate to a 2D goal in the mapped scene." }
         - { path: robonix/service/navigation/navigate/status, description: "Report the current navigation goal status." }
         - { path: robonix/service/navigation/navigate/cancel, description: "Cancel the active navigation goal." }
-    - provider_id: skill_explore_room
+    - provider_id: explore
       capabilities:
         - { path: robonix/skill/explore/explore, description: "Run autonomous frontier exploration when the explore skill package is available." }
         - { path: robonix/skill/explore/explore/status, description: "Report the current frontier-exploration task status." }
@@ -40,7 +40,7 @@ robot:
       type: mobile_base
       urdf_link: base_link
       exports:
-        - provider_id: tiago_webots_chassis
+        - provider_id: tiago_chassis
           capabilities:
             - { path: robonix/primitive/chassis/move, description: "Command chassis motion through Webots ROS2 velocity control." }
             - { path: robonix/primitive/chassis/odom, description: "Read odometry from the simulated differential drive base." }
@@ -82,24 +82,26 @@ robot:
       type: rgbd_camera
       urdf_link: head_front_camera_rgb_optical_frame
       exports:
-        - provider_id: tiago_webots_camera
+        - provider_id: tiago_camera
           capabilities:
             - { path: robonix/primitive/camera/snapshot, description: "Capture an RGB image from the Webots head camera." }
             - { path: robonix/primitive/camera/depth_snapshot, description: "Capture a registered depth image from the Webots head camera." }
             - { path: robonix/primitive/camera/rgb, description: "Expose the RGB image stream for consumers such as mapping." }
             - { path: robonix/primitive/camera/depth, description: "Expose the depth image stream for consumers such as mapping." }
             - { path: robonix/primitive/camera/extrinsics, description: "Provide the camera transform relative to the robot base." }
+            - { path: robonix/primitive/camera/intrinsics, description: "Provide camera calibration for projection and 3D reconstruction." }
     - id: hokuyo_lidar
       type: lidar_2d
       urdf_link: base_laser_link
       exports:
-        - provider_id: tiago_webots_lidar
+        - provider_id: tiago_lidar
           capabilities:
+            - { path: robonix/primitive/lidar/lidar, description: "Expose the planar laser scan stream for mapping and navigation." }
             - { path: robonix/primitive/lidar/snapshot, description: "Capture a planar laser scan from the simulated Hokuyo lidar." }
     - id: audio
       type: audio_io
       exports:
-        - provider_id: tiago_webots_audio
+        - provider_id: audio_driver
           capabilities:
             - { path: robonix/primitive/audio/mic, description: "Stream microphone audio from the selected host ALSA input device." }
             - { path: robonix/primitive/audio/speaker, description: "Play streamed audio through the selected host ALSA output device." }
