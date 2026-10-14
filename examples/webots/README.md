@@ -190,6 +190,32 @@ only these two monitored components. Pilot's choice of affected plan is made
 by the configured VLM from the active-plan details; verify the log and active
 plan state rather than treating the prompt alone as proof of cancellation.
 
+Pilot also receives a computed dependency impact block. Soma's `exports` must
+use the instance names from this deployment (`tiago_lidar`, `mapping`, `nav2`,
+and `explore`), and consumers must retain their Atlas channels while using an
+input. The impact block lists recorded input contracts, dependent services and
+skills, and matching active plan ids instead of requiring the VLM to infer
+dependencies from tool names.
+
+To verify the complete dependency path with deterministic model responses,
+stop the Robonix stack but keep the Lite simulator running, build the current
+Rust programs and Webots packages, and run:
+
+```bash
+python3 testing/demo_health_dependencies.py
+```
+
+The script needs `grpcio`, `protobuf`, and `PyYAML` in its Python environment
+and uses the generated Mapping bindings. It starts an isolated test manifest
+on the normal Atlas/Executor/Pilot/Vitals ports and a local fake VLM on `51090`;
+it refuses occupied ports and does not use private VLM credentials. It starts
+real Mapping, Navigation, and Explore packages plus unrelated software work,
+marks the lidar provider terminated so Atlas removes its channels, and injects
+a lidar health fault. The assertions check that cached dependency evidence
+reaches Pilot, only the exploration plan is cancelled, unrelated work stays
+running, and health recovers. Test processes are shut down afterward; Webots
+stays running. This is a simulated health fault, not a physical sensor failure.
+
 To tear everything down: Ctrl-C the `rbnx boot` terminal, OR from
 any other shell:
 
