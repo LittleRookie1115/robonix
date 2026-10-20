@@ -94,7 +94,15 @@ A plan names a capability by the exact catalog entry `<provider_id>.<llm_name>`.
 
 A planning request is split so that its prefix is cacheable. The system message carries only what never changes, Pilot rules and the RTDL contract, before the ordered conversation history. Everything that can change lives in history. Memory and an explicit response mode are appended once for each submitted task; every task records either voice or text mode, so a later text request supersedes voice-only constraints without rewriting history. The callable capability catalog, the Soma body data, and the provider-doc index are re-read before every planning round. The first round of each task, and the first round after history compaction, appends each of them in full; later rounds append only what changed, and for the catalog that is a list of the capabilities added, changed, or removed. A snapshot counts as shown only once its round is written to history, so a round dropped for a steer or a stale plan does not leave the model without it. A provider registering or leaving therefore never invalidates the cached prefix. The current hardware-health block comes from Vitals; in-flight trees, Executor state, and environment state are appended on every round, followed by the assistant reply and any task-state/result records. The next request therefore extends rather than reorders the prior message sequence. Prompt logs include both the cacheable-prefix byte length and fingerprint, making accidental prefix churn observable.
 
-Pilot also subscribes to Vitals' existing `StreamVitals` capability. It caches the latest snapshot for the next planning round and injects a health event into active sessions immediately when component health changes, interrupting an in-progress VLM response so Pilot replans with the new state. For `ERROR` or `STALE`, the model is instructed to inspect active-plan steps and cancel only plans that depend on the affected component, using the exact plan id; it must preserve unrelated plans and must not use global `cancel_all` solely because of a component alert. The Vitals monitor itself does not cancel plans. A missing or disconnected Vitals stream is presented as unknown health, not as an all-clear.
+Pilot also subscribes to Vitals' existing `StreamVitals` capability. It caches the latest snapshot for the next planning round and injects a health event into active sessions immediately when component health changes, interrupting an in-progress VLM response so Pilot replans with the new state. Vitals independently requests targeted Executor cancellation for `ERROR` or `STALE`, without waiting for model analysis or requiring an active Pilot session. The model sees the dependency evidence and current Executor state, verifies pending stops, and preserves unrelated plans. A missing or disconnected Vitals stream is presented as unknown health, not as an all-clear.
+
+After each model response, Pilot checks generated capability calls against the latest severe hardware faults using the same resolver as Vitals. A matching call is rejected before dispatch and the model gets one corrective retry; a second unsafe response ends that interaction with an explicit blocked-action message. This does not cancel unrelated in-flight plans. `WARN` and startup `UNKNOWN` do not trigger this automatic rejection, and health recovery does not automatically restart canceled plans. Software cancellation cannot replace a device's physical safety mechanism.
+
+Known severe component faults continue to block admission after Vitals disconnects
+or a later snapshot omits the component. Only a verified `OK` or `WARN` report for
+that same component clears its retained fault; `UNKNOWN` and empty snapshots do
+not. Pilot retains at most 2,048 severe components and reports incomplete admission
+coverage if this limit is reached.
 
 Because the stream sends transitions rather than heartbeats, Pilot verifies
 the same Vitals provider with `GetVitals` every two seconds using a two-second
@@ -112,13 +120,14 @@ matches their provider/contract bindings against Executor's active steps. Each
 fault-time planning request includes the causal input contracts and candidate
 plan ids; healthy requests carry only a compact summary. Provider ids must name
 the deployed instances, not package aliases. A child without its own exports
-uses the nearest parent that declares them. Lifecycle control channels and
+uses the nearest parent that declares them. System monitoring/control channels, lifecycle control channels and
 unregistered CLI consumers are excluded from functional input dependencies.
 
 When a provider unregisters or becomes `TERMINATED`, Pilot keeps the last
 observed dependencies, marked as cached evidence. Unrelated lost records expire
 after five minutes; ongoing reported faults pin their evidence until recovery.
-Explicitly closed channels between live providers are removed. Failed queries,
+Explicitly closed channels between live providers are removed after any ongoing
+fault has recovered, so closing a broken input cannot erase its stop scope. Failed queries,
 unmapped components, malformed plan data, and output truncation are reported
 as incomplete coverage. A channel establishes a service input dependency, not
 the internal requirements of each exported service capability; matched plans

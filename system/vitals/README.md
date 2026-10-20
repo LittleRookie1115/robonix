@@ -47,14 +47,41 @@ data while its health stream remains alive.
 
 `StreamVitals` sends the initial snapshot and subsequent health transitions.
 Pilot consumes that stream, reads the cached snapshot before planning, and
-immediately steers active sessions on health changes. `ERROR` or `STALE`
-causes Pilot to replan with the active RTDL steps and instructions to cancel
-only affected plans and preserve unrelated work. The configured VLM selects
-the targets; verify Executor's plan state rather than assuming that the
-instructions guarantee correct cancellation. Vitals does not call Executor's
-global `cancel_all` operation for a component alert. `WARN` triggers replanning
-without requesting cancellation. If no Pilot session is active, the latest
-snapshot is still cached for the next planning request.
+immediately steers active sessions on health changes.
+
+Vitals also runs an independent control loop. For component `ERROR` or `STALE`,
+it joins Soma's component `exports` with Atlas's recorded consumer dependencies
+and Executor's active steps, then calls the existing `ControlPlan(cancel)` for
+each matching plan. This works without a Pilot session and while Pilot or its
+model is stalled. Dependency data refreshes every two seconds; cached health
+changes wake the control loop immediately, with a 250 ms fallback poll. These
+intervals are not a real-time or physical stopping guarantee.
+
+Each cancellation stops the affected plan, including its other branches.
+Unrelated plans continue. `WARN` and startup `UNKNOWN` do not automatically
+cancel plans. Control requests have a two-second deadline, up to eight can run
+concurrently, and pending requests retry at one-second intervals. Recovery
+does not restart canceled work. Failed control or remote cancellation is
+logged as `stop unconfirmed`, never as a confirmed physical stop.
+
+Vitals and Pilot share the same dependency resolver. Monitoring and lifecycle
+control channels do not count as functional input dependencies. Lost-provider
+edges remain available as cached evidence, pinned while the fault persists.
+Closing a fault-relevant input also retains that evidence until recovery.
+Missing component bindings, unavailable graph/Executor data, and bounded
+table overflow are reported as incomplete coverage. Only confirmed matches
+are canceled; no component alert invokes global `cancel_all`. The active
+table and cancellation capability must come from the same, uniquely discovered
+Executor. The Soma body lookup must also resolve to one provider. A deployment
+with multiple Somas or Executors needs an explicit routing policy before this
+control loop can select them.
+
+This is software cancellation, not a hardware emergency stop. A driver or
+service must implement cancellation that actually stops its remote action;
+closing a synchronous request alone cannot guarantee that a device stopped.
+Deployments requiring a physical interlock must provide it independently.
+The mock Soma server has no component-to-provider YAML bindings, so a mock
+health alert alone cannot identify task dependencies for automatic control.
 
 ### Mock SOMA path (no SOMA needed)
 

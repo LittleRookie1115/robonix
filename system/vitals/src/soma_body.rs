@@ -2,65 +2,52 @@
 
 use crate::pb::contracts::robonix_system_soma_get_yaml_client::RobonixSystemSomaGetYamlClient;
 use crate::pb::soma::GetYamlRequest;
-use anyhow::{Context, Result};
-use log::warn;
-use robonix_atlas::client::AtlasClient;
-use robonix_atlas::pb::Transport;
+use anyhow::{Context, Result, ensure};
+use robonix_atlas::{client::AtlasClient, pb::Transport};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
-const GET_YAML_CONTRACT: &str = "robonix/system/soma/get_yaml";
-
-/// Retain the binding before dialing so connection and lookup failures release it.
+/// Retain the Atlas binding before dialing and release it on every RPC outcome.
 pub async fn fetch_yaml(atlas: &mut AtlasClient, consumer_id: &str) -> Result<String> {
     let timeout = Duration::from_secs(2);
     let capabilities = tokio::time::timeout(
         timeout,
-        atlas.flatten_capabilities(GET_YAML_CONTRACT, "", Transport::Grpc),
+        atlas.flatten_capabilities("robonix/system/soma/get_yaml", "", Transport::Grpc),
     )
     .await
-    .context("Soma body discovery timed out")?
-    .context("discover Soma get_yaml")?;
-    let capability = capabilities
-        .first()
-        .context("no provider offers Soma get_yaml over gRPC")?;
-    if capabilities.len() > 1 {
-        warn!(
-            "[pilot/soma] multiple get_yaml providers; picking first ('{}')",
-            capability.provider_id
-        );
-    }
+    .context("Soma body discovery timed out")??;
+    ensure!(
+        capabilities.len() == 1,
+        "expected one Soma body provider, found {}",
+        capabilities.len()
+    );
+    let capability = &capabilities[0];
     let (channel_id, endpoint, _) = tokio::time::timeout(
         timeout,
         atlas.connect_capability(
             consumer_id,
             &capability.provider_id,
-            GET_YAML_CONTRACT,
+            "robonix/system/soma/get_yaml",
             Transport::Grpc,
         ),
     )
     .await
-    .context("Soma body binding timed out")?
-    .context("bind Soma get_yaml")?;
+    .context("Soma body binding timed out")??;
     let result = tokio::time::timeout(timeout, async {
         let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint
         } else {
             format!("http://{endpoint}")
         };
-        let channel = Endpoint::new(endpoint)
-            .context("invalid Soma body endpoint")?
+        let channel = Endpoint::new(endpoint)?
             .connect_timeout(timeout)
             .connect()
-            .await
-            .context("connect Soma body endpoint")?;
-        let mut client = RobonixSystemSomaGetYamlClient::new(channel);
-        let response = client
+            .await?;
+        let response = RobonixSystemSomaGetYamlClient::new(channel)
             .get_yaml(GetYamlRequest {
                 robot_id: String::new(),
             })
-            .await
-            .context("call Soma get_yaml")?
+            .await?
             .into_inner();
         Ok::<_, anyhow::Error>(response.yaml_text)
     })
@@ -69,8 +56,8 @@ pub async fn fetch_yaml(atlas: &mut AtlasClient, consumer_id: &str) -> Result<St
     .and_then(|result| result);
     match tokio::time::timeout(timeout, atlas.disconnect_capability(&channel_id)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => warn!("[pilot/soma] body channel cleanup failed: {error:#}"),
-        Err(error) => warn!("[pilot/soma] body channel cleanup timed out: {error}"),
+        Ok(Err(error)) => log::warn!("Soma body channel cleanup failed: {error:#}"),
+        Err(error) => log::warn!("Soma body channel cleanup timed out: {error}"),
     }
     result
 }

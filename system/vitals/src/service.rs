@@ -62,6 +62,7 @@ struct VitalsState {
 pub struct VitalsServiceImpl {
     state: Arc<RwLock<VitalsState>>,
     module_health: Arc<RwLock<ModuleHealthStore>>,
+    snapshot_changed: Arc<tokio::sync::Notify>,
     #[allow(dead_code)] // Phase 3 will use for uptime in snapshot metadata
     start_time: Instant,
 }
@@ -93,6 +94,7 @@ impl VitalsServiceImpl {
                 first_body: true,
             })),
             module_health: Arc::new(RwLock::new(ModuleHealthStore::new())),
+            snapshot_changed: Arc::new(tokio::sync::Notify::new()),
             start_time: Instant::now(),
         }
     }
@@ -347,7 +349,12 @@ impl VitalsServiceImpl {
                 log::info!("[vitals] {} | {}", voltage_str, non_ok.join(" "));
             }
             let _ = state.broadcast_tx.send(snapshot);
+            self.snapshot_changed.notify_one();
         }
+    }
+
+    pub fn snapshot_changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.snapshot_changed)
     }
 
     /// Return the latest cached snapshot.

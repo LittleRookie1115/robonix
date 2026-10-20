@@ -210,6 +210,13 @@ fn subscribe_turn_events(
 }
 
 const SEEN_TASK_IDS_PER_SESSION: usize = 256;
+const MAX_SEVERE_COMPONENTS: usize = 2048;
+
+#[derive(Default)]
+pub(crate) struct VitalsContext {
+    pub(crate) snapshot: Option<VitalsSnapshot>,
+    pub(crate) faults: VitalsSnapshot,
+}
 
 #[derive(Clone)]
 pub struct PilotServiceImpl {
@@ -243,7 +250,7 @@ pub struct PilotServiceImpl {
     /// Process-global RTDL plan-id counter. Executor's active table is global,
     /// so ids must be unique across sessions as well as turns.
     plan_seq: Arc<AtomicU64>,
-    latest_vitals: Arc<RwLock<Option<VitalsSnapshot>>>,
+    latest_vitals: Arc<RwLock<VitalsContext>>,
     health_dependencies: Arc<RwLock<HealthDependencies>>,
 }
 
@@ -266,7 +273,7 @@ impl PilotServiceImpl {
             steers: Arc::new(Mutex::new(HashMap::new())),
             seen_task_ids: Arc::new(Mutex::new(HashMap::new())),
             plan_seq: Arc::new(AtomicU64::new(0)),
-            latest_vitals: Arc::new(RwLock::new(None)),
+            latest_vitals: Arc::new(RwLock::new(VitalsContext::default())),
             health_dependencies: Arc::new(RwLock::new(HealthDependencies::default())),
         }
     }
@@ -518,7 +525,7 @@ async fn probe_vitals(
 async fn consume_vitals_stream(
     mut stream: tonic::Streaming<VitalsSnapshot>,
     probe: &mut RobonixSystemVitalsGetClient<tonic::transport::Channel>,
-    latest: &Arc<RwLock<Option<VitalsSnapshot>>>,
+    latest: &Arc<RwLock<VitalsContext>>,
     steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
     previous_alert: &mut Option<String>,
     dependencies: &Arc<RwLock<HealthDependencies>>,
@@ -538,12 +545,57 @@ async fn consume_vitals_stream(
 /// Cache verified health and notify active turns only when the alert changes.
 async fn update_vitals_context(
     snapshot: VitalsSnapshot,
-    latest: &Arc<RwLock<Option<VitalsSnapshot>>>,
+    latest: &Arc<RwLock<VitalsContext>>,
     steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
     previous_alert: &mut Option<String>,
     dependencies: &Arc<RwLock<HealthDependencies>>,
 ) {
-    *latest.write().await = Some(snapshot.clone());
+    let snapshot = {
+        let mut context = latest.write().await;
+        context.faults.components.retain(|fault| {
+            !snapshot
+                .components
+                .iter()
+                .any(|component| component.name == fault.name && matches!(component.health, 0 | 1))
+        });
+        for component in snapshot
+            .components
+            .iter()
+            .filter(|component| matches!(component.health, 2 | 3))
+        {
+            if let Some(fault) = context
+                .faults
+                .components
+                .iter_mut()
+                .find(|fault| fault.name == component.name)
+            {
+                fault.clone_from(component);
+            } else if context.faults.components.len() < MAX_SEVERE_COMPONENTS {
+                context.faults.components.push(component.clone());
+            } else {
+                error!(
+                    "[pilot/vitals] severe-component retention limit reached; admission coverage is incomplete"
+                );
+            }
+        }
+        let mut effective = snapshot.clone();
+        effective.components = context.faults.components.clone();
+        effective.components.extend(
+            snapshot
+                .components
+                .iter()
+                .filter(|component| {
+                    !context
+                        .faults
+                        .components
+                        .iter()
+                        .any(|fault| fault.name == component.name)
+                })
+                .cloned(),
+        );
+        context.snapshot = Some(snapshot);
+        effective
+    };
     let alert = soma_context::vitals_alert(&snapshot);
     let mut scope = dependencies.write().await;
     scope.observe_health(&snapshot);
@@ -581,11 +633,11 @@ async fn update_vitals_context(
 
 /// Invalidate cached health and steer active turns once after verification fails.
 async fn invalidate_vitals_context(
-    latest: &Arc<RwLock<Option<VitalsSnapshot>>>,
+    latest: &Arc<RwLock<VitalsContext>>,
     steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
     previous_alert: &mut Option<String>,
 ) {
-    if latest.write().await.take().is_none() {
+    if latest.write().await.snapshot.take().is_none() {
         return;
     }
     let message = "Vitals health connection is unverified. Reassess active plans immediately, use targeted cancellation for plans that require unverified hardware, and preserve unrelated work.".to_string();
@@ -599,9 +651,10 @@ fn vitals_event_message(detail: &str, requires_targeted_stop: bool) -> String {
     if requires_targeted_stop {
         format!(
             "URGENT Vitals hardware alert: {detail}\n\
-             Reassess active plans immediately. Identify only plans whose listed steps depend \
-             on the affected component, then stop those plans with a root cancel_plan using \
-             each exact plan_id. Never use cancel_all for this component alert; preserve \
+             Vitals independently requests cancellation of affected Executor plans without \
+             waiting for model analysis. Reassess the current Executor snapshot: already canceled plans \
+             need no repeated cancel. If an affected plan remains active, use its exact plan_id \
+             for targeted control and verify the result. Never use cancel_all for this component alert; preserve \
              unrelated plans. Use the computed hardware dependency impact and current \
              Executor candidate plan ids rather than guessing from capability names. \
              Do not dispatch dependent actions while the component is \
@@ -988,10 +1041,10 @@ async fn build_executor_conn(
 mod tests {
     use super::{
         ActiveTurnInput, EVT_FINAL_TEXT, EVT_STATUS, MODULE_HEALTH_OK,
-        MODULE_HEALTH_SCHEMA_VERSION, MODULE_HEALTH_TTL_MS, TurnSteers, consume_vitals_stream,
-        expected_turn_id, invalidate_vitals_context, notify_active_turns, pilot_health_report,
-        strict_expected_turn, subscribe_turn_events, task_is_abort_turn, task_is_steer,
-        vitals_event_message,
+        MODULE_HEALTH_SCHEMA_VERSION, MODULE_HEALTH_TTL_MS, TurnSteers, VitalsContext,
+        consume_vitals_stream, expected_turn_id, invalidate_vitals_context, notify_active_turns,
+        pilot_health_report, strict_expected_turn, subscribe_turn_events, task_is_abort_turn,
+        task_is_steer, vitals_event_message,
     };
     use crate::health_dependencies::HealthDependencies;
     use crate::pb::contracts::{
@@ -1048,7 +1101,7 @@ mod tests {
     #[tokio::test]
     /// Same-severity value updates refresh context without restarting inference.
     async fn changing_alert_details_do_not_starve_plan_cancellation() {
-        let latest = Arc::new(RwLock::new(None));
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
         let steers = Arc::new(Mutex::new(HashMap::new()));
         let (task_tx, task_rx) = mpsc::channel(1);
         let (health_tx, health_rx) = watch::channel(None);
@@ -1089,13 +1142,100 @@ mod tests {
         .await;
         assert!(receiver.try_recv().is_err());
         assert_eq!(
-            latest.read().await.as_ref().unwrap().components[0].detail,
+            latest.read().await.snapshot.as_ref().unwrap().components[0].detail,
             "temperature 91"
         );
         snapshot.components[0].health = 3;
         super::update_vitals_context(snapshot, &latest, &steers, &mut previous, &dependencies)
             .await;
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn severe_admission_survives_invalidation_until_each_component_recovers() {
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let dependencies = Arc::new(RwLock::new(HealthDependencies::default()));
+        dependencies
+            .write()
+            .await
+            .update_topology(
+                "robot:
+  components:
+    - id: camera
+      exports:
+        - provider_id: camera
+          capabilities: [{path: robonix/primitive/camera/rgb}]
+    - id: laser
+      exports:
+        - provider_id: laser
+          capabilities: [{path: robonix/primitive/lidar/lidar}]
+",
+            )
+            .unwrap();
+        let mut previous = None;
+        let mut unknown = healthy_vitals(1);
+        unknown.components[0].health = 4;
+        super::update_vitals_context(
+            unknown.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
+        assert!(latest.read().await.faults.components.is_empty());
+        let mut failed = healthy_vitals(2);
+        failed.components[0].health = 2;
+        failed.components.push(ComponentHealth {
+            name: "body/laser".into(),
+            health: 3,
+            ..Default::default()
+        });
+        super::update_vitals_context(failed, &latest, &steers, &mut previous, &dependencies).await;
+        invalidate_vitals_context(&latest, &steers, &mut previous).await;
+        assert!(latest.read().await.snapshot.is_none());
+
+        let mut unrelated = healthy_vitals(3);
+        unrelated.components[0].name = "body/other".into();
+        for snapshot in [
+            VitalsSnapshot::default(),
+            VitalsSnapshot {
+                bodies: vec![Default::default()],
+                ..Default::default()
+            },
+            unknown,
+            unrelated,
+        ] {
+            super::update_vitals_context(snapshot, &latest, &steers, &mut previous, &dependencies)
+                .await;
+            invalidate_vitals_context(&latest, &steers, &mut previous).await;
+            let context = latest.read().await;
+            let scope = dependencies.read().await;
+            assert_eq!(context.faults.components.len(), 2);
+            assert!(scope.blocks_call(&context.faults, "camera", "robonix/primitive/camera/rgb",));
+            assert!(scope.blocks_call(&context.faults, "laser", "robonix/primitive/lidar/lidar",));
+            assert!(
+                !scope.blocks_call(&context.faults, "memory", "robonix/service/memory/search",)
+            );
+        }
+
+        let mut recovered = healthy_vitals(4);
+        recovered.components[0].health = 1;
+        super::update_vitals_context(recovered, &latest, &steers, &mut previous, &dependencies)
+            .await;
+        assert_eq!(latest.read().await.faults.components.len(), 1);
+        {
+            let context = latest.read().await;
+            let scope = dependencies.read().await;
+            assert!(!scope.blocks_call(&context.faults, "camera", "robonix/primitive/camera/rgb",));
+            assert!(scope.blocks_call(&context.faults, "laser", "robonix/primitive/lidar/lidar",));
+        }
+        let mut recovered = healthy_vitals(5);
+        recovered.components[0].name = "body/laser".into();
+        super::update_vitals_context(recovered, &latest, &steers, &mut previous, &dependencies)
+            .await;
+        assert!(latest.read().await.faults.components.is_empty());
     }
 
     #[tonic::async_trait]
@@ -1181,7 +1321,7 @@ mod tests {
     /// A silent transition stream remains healthy when unary verification succeeds.
     async fn silent_vitals_stream_is_verified_by_unary_probes() {
         let mut fixture = vitals_fixture(false).await;
-        let latest = Arc::new(RwLock::new(None));
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
         let steers = Arc::new(Mutex::new(HashMap::new()));
         let mut previous_alert = None;
         let result = tokio::time::timeout(
@@ -1197,7 +1337,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "healthy monitor should remain connected");
-        assert!(latest.read().await.as_ref().unwrap().ts_ns >= 2);
+        assert!(latest.read().await.snapshot.as_ref().unwrap().ts_ns >= 2);
         assert!(previous_alert.is_none());
         fixture.server.abort();
     }
@@ -1206,7 +1346,10 @@ mod tests {
     /// A hung unary probe invalidates health despite an open transition stream.
     async fn stalled_vitals_probe_invalidates_cached_health() {
         let mut fixture = vitals_fixture(true).await;
-        let latest = Arc::new(RwLock::new(Some(healthy_vitals(1))));
+        let latest = Arc::new(RwLock::new(VitalsContext {
+            snapshot: Some(healthy_vitals(1)),
+            ..Default::default()
+        }));
         let steers = Arc::new(Mutex::new(HashMap::new()));
         let mut previous_alert = None;
         let result = tokio::time::timeout(
@@ -1224,7 +1367,7 @@ mod tests {
         .expect("probe deadline must bound the monitor");
         assert!(result.is_err());
         invalidate_vitals_context(&latest, &steers, &mut previous_alert).await;
-        assert!(latest.read().await.is_none());
+        assert!(latest.read().await.snapshot.is_none());
         assert!(previous_alert.unwrap().contains("unverified"));
         fixture.server.abort();
     }

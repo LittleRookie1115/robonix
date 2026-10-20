@@ -15,7 +15,6 @@ use crate::pb::pilot::{
     BatchResult, CapabilityCall, CapabilityCallResult, PilotEvent, Plan, RtdlNode, RtdlNodeState,
     SessionStatusEvent, Task, TaskStateEvent,
 };
-use crate::pb::vitals::VitalsSnapshot;
 use crate::prompt::{
     CatalogView, UsageTotals, assemble_planning_messages, capability_entries,
     render_capability_docs, render_context_sections, render_full_catalog,
@@ -298,8 +297,39 @@ async fn drive_plan(
     mut client: RobonixSystemExecutorExecuteClient<Channel>,
     events_tx: mpsc::Sender<ForestEvent>,
     forest_revision: Arc<AtomicU64>,
+    latest: Arc<tokio::sync::RwLock<service::VitalsContext>>,
+    dependencies: Arc<tokio::sync::RwLock<HealthDependencies>>,
 ) {
     let plan_id = plan.plan_id.clone();
+    let blocked = {
+        let scope = dependencies.read().await;
+        let snapshot = latest.read().await;
+        blocked_call(&plan, &snapshot, &scope).map(blocked_message)
+    };
+    if let Some(message) = blocked {
+        warn!("[pilot/forest] plan_id={plan_id} blocked before Execute: {message}");
+        let node = &plan.nodes[plan.root_index as usize];
+        let result = RtdlNodeState {
+            plan_id: plan_id.clone(),
+            node_index: plan.root_index,
+            node_kind: node.node_kind,
+            state: RtdlNodeStateEnum::Failed as u32,
+            operator_detail: message,
+            op_id: node.op_id.clone(),
+            description: node.description.clone(),
+            ..Default::default()
+        };
+        forest_revision.fetch_add(1, Ordering::Release);
+        let _ = events_tx
+            .send(ForestEvent::PlanDone {
+                plan_id,
+                results: vec![result],
+                any_failed: true,
+                canceled: false,
+            })
+            .await;
+        return;
+    }
     let mut stream = match client.execute(Request::new(plan)).await {
         Ok(resp) => resp.into_inner(),
         Err(e) => {
@@ -375,6 +405,28 @@ async fn drive_plan(
             canceled,
         })
         .await;
+}
+
+/// Apply the same health scope during model admission and immediately before Execute.
+fn blocked_call<'a>(
+    plan: &'a Plan,
+    context: &service::VitalsContext,
+    dependencies: &HealthDependencies,
+) -> Option<&'a CapabilityCall> {
+    plan.nodes
+        .iter()
+        .filter_map(|node| node.call.as_ref())
+        .find(|call| {
+            dependencies.blocks_call(&context.faults, &call.provider_id, &call.contract_id)
+        })
+}
+
+fn blocked_message(call: &CapabilityCall) -> String {
+    format!(
+        "Vitals blocked this plan: {} on {} depends on hardware reported ERROR or STALE \
+         without verified recovery. Do not dispatch it while the fault persists. Preserve unrelated work and explain the blocked action.",
+        call.contract_id, call.provider_id,
+    )
 }
 
 /// Keep one latest terminal state per RTDL node so verification can correct it.
@@ -1069,7 +1121,7 @@ pub async fn run_turn(
     executor: &mut ExecutorConn,
     atlas: &mut AtlasClient,
     consumer_id: &str,
-    vitals_snapshot: Arc<tokio::sync::RwLock<Option<VitalsSnapshot>>>,
+    vitals_snapshot: Arc<tokio::sync::RwLock<service::VitalsContext>>,
     health_dependencies: Arc<tokio::sync::RwLock<HealthDependencies>>,
     tx: &mpsc::Sender<Result<PilotEvent, tonic::Status>>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -1393,7 +1445,7 @@ pub async fn run_turn(
             .await
             .map_err(|e| anyhow::anyhow!("atlas capability discovery failed: {e}"))?;
 
-        let current_vitals = vitals_snapshot.read().await.clone();
+        let current_vitals = vitals_snapshot.read().await.snapshot.clone();
         let embodiment_block =
             crate::soma_context::format_vitals_prompt_block(current_vitals.as_ref());
         let environment_block = state_context::collect(executor, atlas, &cap_list).await;
@@ -1804,6 +1856,17 @@ pub async fn run_turn(
                         );
                         break end_turn_after_rejection(assistant_content, &session_id, round);
                     }
+                    let latest = vitals_snapshot.read().await;
+                    let scope = health_dependencies.read().await;
+                    let blocked = blocked_call(&graph, &latest, &scope);
+                    if let Some(call) = blocked {
+                        let message = blocked_message(call);
+                        if correction.is_none() {
+                            correction = Some(message);
+                            continue;
+                        }
+                        break end_turn_after_rejection(message, &session_id, round);
+                    }
                     // Carry `task_update` out so it is applied ONLY after a tree
                     // expands — never on a recovery path, where it could falsely
                     // mark the turn done for a plan that never ran.
@@ -2104,6 +2167,8 @@ pub async fn run_turn(
             executor.graph.clone(),
             forest_tx.clone(),
             Arc::clone(&forest_revision),
+            Arc::clone(&vitals_snapshot),
+            Arc::clone(&health_dependencies),
         ));
         info!(
             "[pilot/forest] plan_id={plan_id} dispatched forest_size={}",
@@ -3259,12 +3324,76 @@ mod tests {
     use crate::pb::pilot::{
         CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState, Task,
     };
+    use crate::pb::vitals::{ComponentHealth, VitalsSnapshot};
     use crate::prompt::{MAX_INLINE_DESCRIPTION_CHARS, summarize_description};
+    use crate::service::VitalsContext;
     use crate::vlm::{Message, VlmUsage};
     use robonix_atlas::pb as atlas_pb;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
+
+    #[test]
+    fn admission_blocks_retained_faults_without_a_current_snapshot() {
+        let mut dependencies = crate::health_dependencies::HealthDependencies::default();
+        dependencies
+            .update_topology(
+                "robot:
+  components:
+    - id: base
+      exports:
+        - provider_id: drive
+          capabilities: [{path: robonix/primitive/chassis/move}]
+",
+            )
+            .unwrap();
+        let plan = Plan {
+            nodes: vec![RtdlNode {
+                node_kind: RTDL_DO,
+                call: Some(CapabilityCall {
+                    provider_id: "drive".into(),
+                    contract_id: "robonix/primitive/chassis/move".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut context = VitalsContext::default();
+        assert!(super::blocked_call(&plan, &context, &dependencies).is_none());
+        for health in [0, 1, 4] {
+            context.snapshot = Some(VitalsSnapshot {
+                components: vec![ComponentHealth {
+                    name: "body/base".into(),
+                    health,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert!(super::blocked_call(&plan, &context, &dependencies).is_none());
+        }
+        for health in [2, 3] {
+            context.faults.components = vec![ComponentHealth {
+                name: "body/base".into(),
+                health,
+                ..Default::default()
+            }];
+            for snapshot in [None, Some(VitalsSnapshot::default())] {
+                context.snapshot = snapshot;
+                assert_eq!(
+                    super::blocked_call(&plan, &context, &dependencies)
+                        .unwrap()
+                        .provider_id,
+                    "drive",
+                );
+            }
+        }
+        let mut unrelated = plan.clone();
+        unrelated.nodes[0].call.as_mut().unwrap().provider_id = "memory".into();
+        assert!(super::blocked_call(&unrelated, &context, &dependencies).is_none());
+        context.faults.components.clear();
+        assert!(super::blocked_call(&plan, &context, &dependencies).is_none());
+    }
 
     #[test]
     fn compaction_always_frees_a_quarter_of_the_room() {

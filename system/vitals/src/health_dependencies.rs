@@ -25,6 +25,11 @@ pub trait HealthSnapshot {
     fn body_alert(&self) -> bool;
 }
 
+pub struct StopTargets {
+    pub plan_ids: Vec<String>,
+    pub incomplete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Hash)]
 struct Dependency {
     consumer_id: String,
@@ -41,6 +46,7 @@ struct Inspection {
 struct Provider {
     kind: i32,
     state: i32,
+    namespace: String,
     last_seen: Instant,
 }
 
@@ -130,17 +136,25 @@ impl HealthDependencies {
             .filter(|provider| provider.state != atlas_pb::LifecycleState::StateTerminated as i32)
             .map(|provider| provider.id.clone())
             .collect();
-        let known_consumers: BTreeSet<_> = providers
+        let known_consumers: BTreeMap<_, _> = self
+            .providers
             .iter()
-            .map(|provider| provider.id.as_str())
-            .chain(self.providers.keys().map(String::as_str))
+            .map(|(id, provider)| (id.as_str(), provider.namespace.as_str()))
+            .chain(
+                providers
+                    .iter()
+                    .map(|provider| (provider.id.as_str(), provider.namespace.as_str())),
+            )
             .collect();
         let channels: Vec<_> = inspection
             .channels
             .into_values()
             .filter(|edge| {
                 edge.contract_id != "robonix/lifecycle/driver"
-                    && known_consumers.contains(edge.consumer_id.as_str())
+                    && !is_control_path(&edge.contract_id)
+                    && known_consumers
+                        .get(edge.consumer_id.as_str())
+                        .is_some_and(|namespace| !is_control_path(namespace))
             })
             .collect();
         let mut current = BTreeSet::new();
@@ -156,12 +170,12 @@ impl HealthDependencies {
         let mut retained_channels = self.channels.clone();
         let mut known_providers = self.providers.clone();
         retained_channels.retain(|key, (edge, last_seen)| {
-            (now.duration_since(*last_seen) <= RETENTION
-                || self.pinned_providers.contains(&edge.provider_id)
-                || self.pinned_providers.contains(&edge.consumer_id))
-                && (current.contains(key)
-                    || !present.contains(&edge.provider_id)
-                    || !present.contains(&edge.consumer_id))
+            self.pinned_providers.contains(&edge.provider_id)
+                || self.pinned_providers.contains(&edge.consumer_id)
+                || (now.duration_since(*last_seen) <= RETENTION
+                    && (current.contains(key)
+                        || !present.contains(&edge.provider_id)
+                        || !present.contains(&edge.consumer_id)))
         });
         for edge in channels {
             retained_channels.insert(edge_key(&edge), (edge, now));
@@ -176,6 +190,7 @@ impl HealthDependencies {
                 Provider {
                     kind: provider.kind,
                     state: provider.state,
+                    namespace: provider.namespace,
                     last_seen: now,
                 },
             );
@@ -214,6 +229,16 @@ impl HealthDependencies {
         snapshot: &impl HealthSnapshot,
         now: Instant,
     ) -> (BTreeMap<String, Evidence>, Vec<String>) {
+        self.trace(snapshot, now, false)
+    }
+
+    /// Share dependency traversal while excluding warnings from automatic stops.
+    fn trace(
+        &self,
+        snapshot: &impl HealthSnapshot,
+        now: Instant,
+        severe_only: bool,
+    ) -> (BTreeMap<String, Evidence>, Vec<String>) {
         let mut affected = BTreeMap::new();
         let mut unmapped = BTreeSet::new();
         let mut queue = VecDeque::new();
@@ -229,7 +254,13 @@ impl HealthDependencies {
         for (name, _) in snapshot
             .components()
             .take(MAX_ENTRIES)
-            .filter(|(_, health)| *health != 0)
+            .filter(|(_, health)| {
+                if severe_only {
+                    matches!(health, 2 | 3)
+                } else {
+                    *health != 0
+                }
+            })
         {
             let Some((component, exports)) = self.owners(name) else {
                 unmapped.insert(name.to_string());
@@ -313,6 +344,45 @@ impl HealthDependencies {
         format!("{:016x}", hasher.finish())
     }
 
+    /// Automatic control uses all bounded matches, independently of prompt clipping.
+    pub fn stop_targets(&self, snapshot: &impl HealthSnapshot, plans: &str) -> StopTargets {
+        let (affected, unmapped) = self.trace(snapshot, Instant::now(), true);
+        let (candidates, status, truncated) = match_plans(Some(plans), &affected, MAX_ENTRIES);
+        StopTargets {
+            plan_ids: candidates
+                .into_iter()
+                .filter_map(|candidate| candidate["plan_id"].as_str().map(str::to_owned))
+                .collect(),
+            incomplete: !self.graph_verified
+                || !self.topology_verified
+                || affected
+                    .keys()
+                    .any(|id| !self.present_providers.contains(id))
+                || !unmapped.is_empty()
+                || status != "verified"
+                || truncated
+                || snapshot.components().len() > MAX_ENTRIES,
+        }
+    }
+
+    /// Recheck generated calls against current faults after a slow model response.
+    pub fn blocks_call(
+        &self,
+        snapshot: &impl HealthSnapshot,
+        provider_id: &str,
+        contract_id: &str,
+    ) -> bool {
+        self.trace(snapshot, Instant::now(), true)
+            .0
+            .get(provider_id)
+            .is_some_and(|evidence| {
+                evidence
+                    .contracts
+                    .as_ref()
+                    .is_none_or(|contracts| contracts.contains_key(contract_id))
+            })
+    }
+
     /// Match active executable steps to known owner contracts and transitive consumers.
     pub fn report(&self, snapshot: Option<&impl HealthSnapshot>, plans: Option<&str>) -> Value {
         let Some(snapshot) = snapshot else {
@@ -363,7 +433,8 @@ impl HealthDependencies {
                 "component_contracts": evidence.contracts,
             }));
         }
-        let (candidate_plans, plan_status, plan_truncated) = match_plans(plans, &affected);
+        let (candidate_plans, plan_status, plan_truncated) =
+            match_plans(plans, &affected, MAX_RESULTS);
         let unscoped_body_alert = affected.is_empty() && snapshot.body_alert();
         bounded_report(json!({
             "status": if self.graph_verified && self.topology_verified && !cached_evidence
@@ -397,8 +468,10 @@ impl HealthDependencies {
                 plan ids are computed by code, not inferred from names. Paths show which input \
                 contracts consumers depend on. Downstream service capabilities may be degraded; \
                 channel data does not describe each output capability's internal requirements. \
-                For ERROR or STALE, use the candidate plan ids and the current Executor snapshot \
-                for targeted cancellation; preserve other plans. Never use cancel_all for a \
+                Vitals independently requests targeted cancellation for ERROR or STALE before \
+                model analysis. Read the current Executor snapshot to verify completion; a \
+                candidate list alone is not proof of a successful stop. Do not restart affected \
+                work while the fault persists. Preserve other plans. Never use cancel_all for a \
                 component alert. WARN alone requests replanning, not cancellation. Cached edges, \
                 unmapped components, missing Executor data, or truncation mean coverage is \
                 incomplete: do not infer that an unlisted action is safe or claim it was stopped.\n\
@@ -450,6 +523,17 @@ fn edge_key(edge: &Dependency) -> (String, String, String) {
         edge.provider_id.clone(),
         edge.contract_id.clone(),
     )
+}
+
+/// Orchestration observes business calls without making its own independent jobs depend on them.
+fn is_control_path(path: &str) -> bool {
+    ["atlas", "executor", "pilot", "vitals", "soma"]
+        .into_iter()
+        .any(|name| {
+            path.strip_prefix("robonix/system/")
+                .and_then(|suffix| suffix.strip_prefix(name))
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        })
 }
 
 /// Keep one predecessor per provider instead of cloning every complete path.
@@ -623,6 +707,7 @@ fn kind_label(kind: i32) -> &'static str {
 fn match_plans(
     plans: Option<&str>,
     affected: &BTreeMap<String, Evidence>,
+    result_limit: usize,
 ) -> (Vec<Value>, &'static str, bool) {
     let parsed = plans
         .filter(|raw| raw.len() <= 2 * 1024 * 1024)
@@ -701,8 +786,8 @@ fn match_plans(
         }
     }
     candidates.sort_by(|left, right| left["plan_id"].as_str().cmp(&right["plan_id"].as_str()));
-    truncated |= candidates.len() > MAX_RESULTS;
-    candidates.truncate(MAX_RESULTS);
+    truncated |= candidates.len() > result_limit;
+    candidates.truncate(result_limit);
     (
         candidates,
         if incomplete { "partial" } else { "verified" },
@@ -933,6 +1018,9 @@ robot:
         let report = state.report(Some(&snapshot()), Some(&plans()));
         assert_eq!(report["candidate_plans"][0]["plan_id"], "exploration");
         assert_eq!(report["status"], "last_known_or_incomplete");
+        let targets = state.stop_targets(&snapshot(), &plans());
+        assert_eq!(targets.plan_ids, ["exploration"]);
+        assert!(targets.incomplete);
     }
 
     #[test]
@@ -1037,6 +1125,31 @@ robot:
     }
 
     #[test]
+    /// A consumer disconnecting its broken input cannot erase an ongoing stop scope.
+    fn fault_scope_survives_closed_channels_until_recovery() {
+        let mut state = HealthDependencies::default();
+        state.update_topology(YAML).unwrap();
+        state
+            .update_graph(providers(), &channels().to_string(), Instant::now())
+            .unwrap();
+        state.observe_health(&snapshot());
+        state
+            .update_graph(providers(), r#"{"channels":{}}"#, Instant::now())
+            .unwrap();
+        assert_eq!(
+            state.stop_targets(&snapshot(), &plans()).plan_ids,
+            ["exploration"]
+        );
+        let mut healthy = snapshot();
+        healthy.components[0].health = 0;
+        state.observe_health(&healthy);
+        state
+            .update_graph(providers(), r#"{"channels":{}}"#, Instant::now())
+            .unwrap();
+        assert!(!state.blocks_call(&snapshot(), "explore", "robonix/skill/explore/explore"));
+    }
+
+    #[test]
     /// Descendant controls inherit a declared actuator owner without name heuristics.
     fn derived_joint_signal_inherits_the_parent_binding() {
         let mut state = HealthDependencies::default();
@@ -1100,6 +1213,8 @@ robot:
             "contract_id":"robonix/lifecycle/driver"});
         current["channels"]["cli"] = json!({"consumer_id":"rbnx-cli/deploy","provider_id":"mapping",
             "contract_id":MAP});
+        current["channels"]["monitor"] = json!({"consumer_id":"memory","provider_id":"explore",
+            "contract_id":"robonix/system/executor/list_active_plans"});
         state
             .update_graph(providers(), &current.to_string(), Instant::now())
             .unwrap();
@@ -1107,5 +1222,83 @@ robot:
         assert!(!affected.contains_key("memory"));
         assert!(!affected.contains_key("rbnx-cli/deploy"));
         assert!(affected.contains_key("explore"));
+    }
+
+    #[test]
+    /// Warnings and unknown startup samples do not request automatic stops.
+    fn automatic_stop_requires_error_or_stale() {
+        let mut state = HealthDependencies::default();
+        state.update_topology(YAML).unwrap();
+        state
+            .update_graph(providers(), &channels().to_string(), Instant::now())
+            .unwrap();
+        let mut health = snapshot();
+        for severity in [0, 1, 4] {
+            health.components[0].health = severity;
+            assert!(state.stop_targets(&health, &plans()).plan_ids.is_empty());
+        }
+        for severity in [2, 3] {
+            health.components[0].health = severity;
+            assert_eq!(
+                state.stop_targets(&health, &plans()).plan_ids,
+                ["exploration"]
+            );
+            assert!(state.blocks_call(&health, "explore", "robonix/skill/explore/explore"));
+            assert!(!state.blocks_call(&health, "memory", "robonix/service/memory/search"));
+        }
+    }
+
+    #[test]
+    /// Polling a failed job does not make unrelated Executor builtins dependent on it.
+    fn executor_monitoring_does_not_cancel_independent_builtins() {
+        let mut state = HealthDependencies::default();
+        state.update_topology(YAML).unwrap();
+        let mut registered = providers();
+        registered.push(atlas_pb::CapabilityProvider {
+            id: "executor-instance".into(),
+            namespace: "robonix/system/executor".into(),
+            ..Default::default()
+        });
+        let mut current = channels();
+        current["channels"]["poll"] = json!({"consumer_id":"executor-instance", "provider_id":"explore",
+            "contract_id":"robonix/skill/explore/explore/status"});
+        current["channels"]["scene"] = json!({"consumer_id":"memory", "provider_id":"mapping",
+            "contract_id":"robonix/system/scene/get_scene_graph"});
+        state
+            .update_graph(registered, &current.to_string(), Instant::now())
+            .unwrap();
+        let active = json!({"plans": [
+            {"plan_id":"builtin", "ops":[{"provider_id":"executor-instance",
+                "contract_id":"robonix/system/executor/builtin/read_file", "state":"running"}]},
+            {"plan_id":"scene-consumer", "ops":[{"provider_id":"memory",
+                "contract_id":"robonix/service/memory/search", "state":"running"}]}
+        ]})
+        .to_string();
+        assert_eq!(
+            state.stop_targets(&snapshot(), &active).plan_ids,
+            ["scene-consumer"]
+        );
+    }
+
+    #[test]
+    /// A prompt's row budget must not leave later affected plans running.
+    fn stop_selection_is_not_clipped_to_prompt_limit() {
+        let mut state = HealthDependencies::default();
+        state.update_topology(YAML).unwrap();
+        state
+            .update_graph(providers(), &channels().to_string(), Instant::now())
+            .unwrap();
+        let many = json!({"plans": (0..100).map(|index| json!({
+            "plan_id": format!("affected-{index}"),
+            "ops": [{"provider_id":"explore", "contract_id":"robonix/skill/explore/explore", "state":"running"}]
+        })).collect::<Vec<_>>()}).to_string();
+        assert_eq!(state.stop_targets(&snapshot(), &many).plan_ids.len(), 100);
+        assert_eq!(
+            state.report(Some(&snapshot()), Some(&many))["candidate_plans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_RESULTS
+        );
     }
 }
