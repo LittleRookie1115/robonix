@@ -198,7 +198,6 @@ service:
     branch: main
     config:
       params_file: config/nav2_params.yaml
-      bt_xml_file: config/navigate_preserve_obstacles.xml
       use_sim_time: true
       action_wait_s: 240.0
       # Keep startup behavior at the controller's existing 0.26 m/s ceiling;
@@ -219,8 +218,6 @@ service:
         # Head depth camera: obstacles above the lidar's plane, such as
         # table tops (__ROBONIX_DEPTH_CLOUD_TOPIC__ in config/nav2_params.yaml).
         depth: tiago_camera
-      depth_obstacles:
-        min_range_m: 0.6
 
 # after booted all the services, register the skills (but don't activate them now)
 skill:

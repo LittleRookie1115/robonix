@@ -36,7 +36,7 @@ SOFTWARE_PLAN = "dependency-demo-software-only"
 DIRECT_PLAN = "dependency-demo-pilot-stopped"
 STOP_TIMEOUT = 8
 MODEL_PORT = 51090
-PROTO_FILE = max(ROOT.glob("target/debug/build/*/out/vitals.proto"),
+PROTO_FILE = max(ROOT.glob("target/debug/build/robonix-vitals-*/out/vitals.proto"),
                  key=lambda path: path.stat().st_mtime, default=None)
 PROTO = PROTO_FILE.parent if PROTO_FILE else None
 
@@ -247,14 +247,12 @@ def manifest(directory, fault_file):
                         "sensor_providers": {"lidar2d": "tiago_lidar", "odom": "tiago_chassis"}}},
             {"name": "nav2", "path": str(ROOT / "examples/webots/rbnx-boot/cache/service-navigation-rbnx"),
              "config": {"params_file": "config/nav2_params.yaml",
-                        "bt_xml_file": "config/navigate_preserve_obstacles.xml",
                         "use_sim_time": True, "action_wait_s": 240,
                         "dynamic_speed": {"max_linear_speed_mps": 0.26, "default_percentage": 100,
                                           "step_percentage": 20, "min_percentage": 20},
                         "guard_terminal_xy_m": 0.20,
                         "provider_ids": {"map": "mapping", "odom": "tiago_chassis",
-                                         "scan": "tiago_lidar", "depth": "tiago_camera"},
-                        "depth_obstacles": {"min_range_m": 0.6}}}],
+                                         "scan": "tiago_lidar", "depth": "tiago_camera"}}}],
         "skill": [{"name": "explore", "path": str(ROOT / "examples/webots/rbnx-boot/cache/skill-explore-rbnx"), "config": {}}],
     }
     camera = next(entry for entry in fixture["primitive"] if entry["name"] == "tiago_camera")
@@ -262,8 +260,6 @@ def manifest(directory, fault_file):
     (directory / "config").mkdir()
     shutil.copy2(ROOT / "examples/webots/config/nav2_params.yaml", directory / "config/nav2_params.yaml")
     shutil.copy2(ROOT / "examples/webots/config/rtabmap_params.yaml", directory / "config/rtabmap_params.yaml")
-    shutil.copy2(ROOT / "examples/webots/config/navigate_preserve_obstacles.xml",
-                 directory / "config/navigate_preserve_obstacles.xml")
     path = directory / "robonix_manifest.yaml"
     path.write_text(yaml.safe_dump(fixture, sort_keys=False))
     return path

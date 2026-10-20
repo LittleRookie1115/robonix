@@ -119,40 +119,19 @@ Then a third terminal for `rbnx chat`. `rbnx caps` lists the
 capabilities atlas knows about; `rbnx tools` lists the MCP tools
 the LLM agent can call.
 
-## Navigation obstacles
+## Navigation sensor faults
 
-Mapping loads `config/rtabmap_params.yaml` to ray-trace observed free space
-and clear the TIAGo base's 0.272 metre radius under its recorded poses. Without
-that configuration, sparse free cells and an unknown cell under the robot can
-prevent a frontier explorer from finding connected targets.
-Laser scans use best-effort sensor QoS so mapping prioritizes current scans.
+The upstream Webots configuration provides depth obstacle layers and Nav2's
+collision monitor. Exploration uses its upstream strategies and navigation
+parameters.
 
-Navigation uses both the planar lidar and the head camera's registered depth.
-The existing navigation service converts depth and camera intrinsics discovered
-through Atlas into a point cloud. Both costmaps use a spatio-temporal voxel
-layer to retain obstacles with heights between -0.05 and 1.3 metres in the
-costmap frame, including window sills and table tops that the low lidar cannot
-see. The controller checks the Soma footprint with a 0.03 metre margin.
-Nav2's collision monitor also observes the lidar and depth point cloud.
-Nav2 checks that it can plan to a goal before dispatching motion. The simulator
-planner does not silently substitute a nearby goal for an obstructed frontier.
-
-The deployment's navigation behavior tree replans and retains spin, wait and
-backup recovery, but never automatically clears either costmap. Clearing near
-an overhang can erase its last observation after it enters the depth blind
-zone. If the depth point cloud stops advancing for one second, the navigation
-service's final velocity guard latches zero velocity output and requests
-cancellation of the current navigation UUID. A fresh goal and fresh depth
-data are required to resume. The timeout is
-configurable through `depth_obstacles.source_timeout_s`.
-This guard covers Nav2's velocity output, not direct chassis motion commands.
-
-The camera has a 0.6 metre minimum depth range. Avoidance must see an overhang
-before entering that blind zone; enabling depth is not a contact sensor or a
-guarantee that a robot already touching an obstacle can recover autonomously.
-Keep the camera TF and intrinsics consistent with the simulator. A blocked
-robot with healthy sensor streams is a navigation failure, not a disconnected
-camera or lidar.
+The navigation service's depth watchdog latches zero velocity output and
+requests cancellation of the current navigation UUID when depth samples stop
+advancing. A fresh goal and fresh samples are required to resume. Its timeout
+defaults to one second and is configured by `depth_obstacles.source_timeout_s`.
+Vitals separately identifies affected work and requests scoped Executor
+cancellation. The velocity watchdog covers Nav2 output, not direct chassis
+commands.
 
 ## Simulated hardware health
 
@@ -236,9 +215,38 @@ skills, and matching active plan ids instead of requiring the VLM to infer
 dependencies from tool names.
 
 To verify that stopping works independently of both model replies and Pilot,
-stop the Robonix stack but keep the Lite simulator running. Build the current
-Rust programs and generated Webots package artifacts, then run the demo from
-the repository root:
+stop the Robonix stack but keep the Lite simulator running. Until
+[Mapping #34](https://github.com/syswonder/service-map-rbnx/pull/34),
+[Navigation #23](https://github.com/syswonder/service-navigation-rbnx/pull/23)
+and [Explore #15](https://github.com/syswonder/skill-explore-rbnx/pull/15)
+merge, use their PR heads. From the Robonix root, prepare clean package
+checkouts in the deployment cache:
+
+```bash
+(
+  set -e
+  cache_root=examples/webots/rbnx-boot/cache
+  mkdir -p "$cache_root"
+  for entry in "service-map-rbnx 34" \
+               "service-navigation-rbnx 23" \
+               "skill-explore-rbnx 15"; do
+    read -r package pull_request <<< "$entry"
+    package_root="$cache_root/$package"
+    package_url="https://github.com/syswonder/$package"
+    if [ ! -e "$package_root/.git" ]; then
+      git clone "$package_url" "$package_root"
+    fi
+    git -C "$package_root" diff --quiet
+    git -C "$package_root" diff --cached --quiet
+    git -C "$package_root" fetch "$package_url" "pull/$pull_request/head"
+    git -C "$package_root" switch --detach FETCH_HEAD
+  done
+)
+```
+
+The clean-tree checks stop on local edits. After selecting the companion
+heads, build and run the regression. `--no-update-check` skips remote
+freshness checks for these intentionally selected PR checkouts:
 
 ```bash
 cargo build --workspace
