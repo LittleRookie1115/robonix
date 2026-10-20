@@ -222,6 +222,8 @@ impl RobonixSystemExecutorExecute for ExecutorServiceImpl {
 
 type ExecuteNodeFuture = Pin<Box<dyn Future<Output = NodeExecution> + Send + 'static>>;
 
+/// Check plan cancellation before each node so a canceled synchronous child
+/// cannot admit the next sequence child.
 fn execute_node(
     plan: Arc<Plan>,
     node_index: usize,
@@ -514,7 +516,8 @@ async fn trigger_stop_on_complete(
     }
 }
 
-/// Dispatch one RTDL `do` node and stream node_state events.
+/// Dispatch one RTDL `do` node and stream node_state events. The run_command
+/// builtin retains ownership of its existing process-group cancellation.
 async fn execute_call(
     call: &CapabilityCall,
     node: NodeEventContext,
@@ -549,10 +552,20 @@ async fn execute_call(
         )
         .await;
 
-    let async_group = if call.provider_id == provider_id {
-        Ok(None)
-    } else {
-        async_registry::resolve_async_group(&mut atlas, &call.provider_id, &call.contract_id).await
+    let async_group = tokio::select! {
+        biased;
+        _ = runtime.wait_for_cancellation(&node.plan_id) => {
+            Err("plan canceled locally; physical stop is unconfirmed".to_string())
+        }
+        group = async {
+            if call.provider_id == provider_id {
+                Ok(None)
+            } else {
+                async_registry::resolve_async_group(
+                    &mut atlas, &call.provider_id, &call.contract_id,
+                ).await
+            }
+        } => group,
     };
 
     let (mut result, mut state) = match async_group {
@@ -572,9 +585,20 @@ async fn execute_call(
                 .await
         }
         Ok(None) => {
-            let r =
-                crate::dispatch::dispatch(call, &provider_id, &mut atlas, &runtime, &node.plan_id)
-                    .await;
+            let owns_cancellation = call.provider_id == provider_id
+                && call.contract_id == "robonix/system/executor/builtin/run_command";
+            let r = tokio::select! {
+                biased;
+                _ = runtime.wait_for_cancellation(&node.plan_id), if !owns_cancellation => {
+                    crate::dispatch::error_result(
+                        call,
+                        "plan canceled locally; synchronous dispatch future dropped; physical stop is unconfirmed".into(),
+                    )
+                }
+                result = crate::dispatch::dispatch(
+                    call, &provider_id, &mut atlas, &runtime, &node.plan_id,
+                ) => result,
+            };
             let cancelled = runtime.is_cancelled(&node.plan_id).await;
             let state = leaf_terminal_state(r.success, cancelled);
             (r, state)
@@ -625,16 +649,24 @@ async fn execute_call(
     }
 
     if eligible_for_verification {
-        result = verification::verify_result(
-            verification.as_ref(),
-            call,
-            &node,
-            result,
-            &provider_id,
-            &mut atlas,
-            &runtime,
-        )
-        .await;
+        result = tokio::select! {
+            biased;
+            _ = runtime.wait_for_cancellation(&node.plan_id) => {
+                crate::dispatch::error_result(
+                    call,
+                    "plan canceled locally during verification; physical stop is unconfirmed".into(),
+                )
+            }
+            verified = verification::verify_result(
+                verification.as_ref(),
+                call,
+                &node,
+                result,
+                &provider_id,
+                &mut atlas,
+                &runtime,
+            ) => verified,
+        };
         if !result.success {
             state = RtdlNodeStateEnum::Failed as u32;
         }
@@ -744,6 +776,7 @@ impl RobonixSystemExecutorListActivePlans for ExecutorServiceImpl {
 
 #[tonic::async_trait]
 impl RobonixSystemExecutorControlPlan for ExecutorServiceImpl {
+    /// Report remote cancellation errors separately from local plan completion.
     async fn control_plan(
         &self,
         request: Request<crate::pb::executor::ControlPlanRequest>,
@@ -757,15 +790,15 @@ impl RobonixSystemExecutorControlPlan for ExecutorServiceImpl {
                 } else {
                     request.wait_ms
                 };
-                let (completed, message) = self
+                let outcome = self
                     .runtime
                     .cancel_plan_control(&request.plan_id, wait_ms, &self.provider_id, &mut atlas)
                     .await;
                 ControlPlanResponse {
-                    success: true,
-                    completed,
-                    message,
-                    error: String::new(),
+                    success: outcome.error.is_empty(),
+                    completed: outcome.completed,
+                    message: outcome.message,
+                    error: outcome.error,
                 }
             }
             "cancel_all" => {
@@ -774,17 +807,15 @@ impl RobonixSystemExecutorControlPlan for ExecutorServiceImpl {
                 } else {
                     request.wait_ms
                 };
-                let (target_count, completed) = self
+                let (_, outcome) = self
                     .runtime
                     .cancel_all_plans_except(&self.provider_id, &mut atlas, None, wait_ms)
                     .await;
                 ControlPlanResponse {
-                    success: true,
-                    completed,
-                    message: format!(
-                        "Cancellation requested for all RTDL plans; target_count={target_count}, completed={completed}."
-                    ),
-                    error: String::new(),
+                    success: outcome.error.is_empty(),
+                    completed: outcome.completed,
+                    message: outcome.message,
+                    error: outcome.error,
                 }
             }
             "stop_at" => match self
@@ -952,9 +983,12 @@ mod tests {
         send_operator_state, send_stop_on_enter, validate_plan, wait_for_verifiers,
     };
     use crate::config::VerificationRule;
+    use crate::pb::contracts::robonix_system_executor_control_plan_server::RobonixSystemExecutorControlPlan;
     use crate::pb::contracts::robonix_system_executor_execute_server::RobonixSystemExecutorExecute;
+    use crate::pb::executor::ControlPlanRequest;
     use crate::pb::executor::rtdl_event::RtdlEventEnum;
     use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode};
+    use crate::plan_runtime::RunningAsyncCall;
     use crate::rtdl_wire::NodeEventContext;
     use crate::verification::VerificationPolicy;
     use robonix_atlas::client::AtlasClient;
@@ -962,6 +996,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::{mpsc, oneshot};
     use tokio_stream::StreamExt;
     use tonic::Request;
 
@@ -977,6 +1013,699 @@ mod tests {
     fn reserve_address() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         listener.local_addr().expect("reserved address")
+    }
+
+    struct McpRequest {
+        params: serde_json::Value,
+        reply: oneshot::Sender<serde_json::Value>,
+    }
+
+    /// Run real HTTP MCP handshakes while each test controls whether capability
+    /// requests return, fail, or remain in progress.
+    async fn test_mcp() -> (
+        String,
+        mpsc::Receiver<McpRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (requests, receiver) = mpsc::channel::<McpRequest>(16);
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let requests = requests.clone();
+                connections.spawn(test_mcp_connection(stream, requests));
+            }
+        });
+        (endpoint, receiver, server)
+    }
+
+    /// Keep transport parsing in the fixture so the cancellation tests exercise
+    /// the production MCP client and its pending network futures.
+    async fn test_mcp_connection(
+        stream: tokio::net::TcpStream,
+        requests: mpsc::Sender<McpRequest>,
+    ) {
+        let mut stream = BufReader::new(stream);
+        let mut request_line = String::new();
+        stream.read_line(&mut request_line).await.unwrap();
+        let mut content_length = 0;
+        loop {
+            let mut header = String::new();
+            stream.read_line(&mut header).await.unwrap();
+            if header == "\r\n" || header.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let (status, body) = if request_line.starts_with("POST ") {
+            let mut body = vec![0; content_length];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if request["method"] == "notifications/initialized" {
+                ("202 Accepted", String::new())
+            } else {
+                let result = if request["method"] == "initialize" {
+                    serde_json::json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "cancellation-test", "version": "1" },
+                    })
+                } else {
+                    assert_eq!(request["method"], "tools/call");
+                    let (reply, response) = oneshot::channel();
+                    if requests
+                        .send(McpRequest {
+                            params: request["params"].clone(),
+                            reply,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(result) = response.await else {
+                        return;
+                    };
+                    result
+                };
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    })
+                    .to_string(),
+                )
+            }
+        } else {
+            ("405 Method Not Allowed", String::new())
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    /// Register actual Atlas contracts so async discovery follows the same path
+    /// as deployed providers, without introducing a dispatch test hook.
+    async fn cancellation_service(
+        endpoint: &str,
+        asynchronous: bool,
+    ) -> (
+        ExecutorServiceImpl,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let atlas_addr = reserve_address();
+        let server = tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), atlas_addr));
+        let mut atlas = AtlasClient::connect_with_retry(
+            format!("http://{atlas_addr}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        atlas
+            .register_service("provider", "robonix/test", "")
+            .await
+            .unwrap();
+        let contracts = if asynchronous {
+            vec!["work", "work/status", "work/cancel", "next"]
+        } else {
+            vec!["work", "next"]
+        };
+        for contract in contracts {
+            atlas
+                .declare_capability(
+                    "provider",
+                    &format!("robonix/test/{contract}"),
+                    robonix_atlas::pb::Transport::Mcp,
+                    endpoint,
+                    robonix_atlas::client::mcp_params("{}"),
+                )
+                .await
+                .unwrap();
+        }
+        (
+            ExecutorServiceImpl::new(
+                atlas,
+                "executor".into(),
+                Arc::new(VerificationPolicy::new(false, Vec::new())),
+            ),
+            server,
+        )
+    }
+
+    /// Give each call its plan identity so concurrent requests can be matched
+    /// through the real MCP transport.
+    fn cancellation_plan(plan_id: &str, contracts: &[&str]) -> Plan {
+        let mut nodes = vec![node_with_identity(
+            "root",
+            "ordered work",
+            RTDL_SEQUENCE,
+            (1..=contracts.len() as u32).collect(),
+            None,
+        )];
+        for (index, contract) in contracts.iter().enumerate() {
+            nodes.push(node_with_identity(
+                &format!("op_{index}"),
+                contract,
+                RTDL_DO,
+                vec![],
+                Some(CapabilityCall {
+                    call_id: format!("{plan_id}:{index}"),
+                    provider_id: "provider".into(),
+                    contract_id: format!("robonix/test/{contract}"),
+                    args_json: serde_json::json!({ "plan_id": plan_id }).to_string(),
+                }),
+            ));
+        }
+        Plan {
+            plan_id: plan_id.into(),
+            ..plan(nodes, 0)
+        }
+    }
+
+    /// Use actual MCP error responses so provider rejection reaches dispatch.
+    fn mcp_result(output: &str, is_error: bool) -> serde_json::Value {
+        serde_json::json!({
+            "content": [{ "type": "text", "text": output }], "isError": is_error,
+        })
+    }
+
+    /// Confirm the exact run separately from its queued cancellation response.
+    async fn reply_cancel_status(
+        requests: &mut mpsc::Receiver<McpRequest>,
+        run_id: &str,
+        state: &str,
+    ) {
+        let status = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.params["name"], "status");
+        assert_eq!(status.params["arguments"]["run_id"], run_id);
+        status
+            .reply
+            .send(mcp_result(
+                &serde_json::json!({"known": true, "state": state}).to_string(),
+                false,
+            ))
+            .unwrap();
+    }
+
+    /// Exercise the existing scoped action with the health worker's wait time.
+    fn cancel_request(plan_id: &str) -> Request<ControlPlanRequest> {
+        Request::new(ControlPlanRequest {
+            action: "cancel".into(),
+            plan_id: plan_id.into(),
+            wait_ms: 500,
+            ..Default::default()
+        })
+    }
+
+    /// Inspect real Atlas bindings rather than inferring cleanup from events.
+    async fn atlas_channel_count(service: &ExecutorServiceImpl) -> usize {
+        let response = service
+            .atlas
+            .inner()
+            .inspect_atlas(robonix_atlas::pb::InspectAtlasRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let snapshot: serde_json::Value = serde_json::from_str(&response.json).unwrap();
+        snapshot["channels"].as_object().unwrap().len()
+    }
+
+    /// Dropped dispatches release in the background, so observe the bounded
+    /// cleanup before asserting that no dependency binding was leaked.
+    async fn wait_for_atlas_channel_count(service: &ExecutorServiceImpl, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while atlas_channel_count(service).await != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Atlas channel count did not return to its baseline");
+    }
+
+    /// A pending remote synchronous call is dropped promptly, its successor
+    /// never starts, and another plan on the same provider can still succeed.
+    #[tokio::test]
+    async fn scoped_cancel_interrupts_hung_sync_dispatch_and_preserves_other_plan() {
+        let (endpoint, mut requests, mcp_server) = test_mcp().await;
+        let (service, atlas_server) = cancellation_service(&endpoint, false).await;
+        let baseline = atlas_channel_count(&service).await;
+        let target = service
+            .execute(Request::new(cancellation_plan("target", &["work", "next"])))
+            .await
+            .unwrap()
+            .into_inner();
+        let hung = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hung.params["arguments"]["plan_id"], "target");
+        let other = service
+            .execute(Request::new(cancellation_plan("other", &["work"])))
+            .await
+            .unwrap()
+            .into_inner();
+        let other_request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(atlas_channel_count(&service).await, baseline + 2);
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.control_plan(cancel_request("target")),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert!(response.completed);
+        assert!(response.message.contains("physical stop is unconfirmed"));
+        let events = tokio::time::timeout(Duration::from_millis(200), target.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        let states: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.as_ref().unwrap().node_state.as_ref())
+            .collect();
+        assert!(states.iter().any(|state| {
+            state.node_index == 1 && state.state == RtdlNodeStateEnum::Canceled as u32
+        }));
+        assert!(states.iter().all(|state| state.node_index != 2));
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .plan_complete
+                .as_ref()
+                .unwrap()
+                .any_failed
+        );
+        assert!(!service.runtime.is_cancelled("other").await);
+        assert!(requests.try_recv().is_err());
+        wait_for_atlas_channel_count(&service, baseline + 1).await;
+        other_request.reply.send(mcp_result("done", false)).unwrap();
+        let other_events = tokio::time::timeout(Duration::from_secs(1), other.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(
+            !other_events
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .plan_complete
+                .as_ref()
+                .unwrap()
+                .any_failed
+        );
+        wait_for_atlas_channel_count(&service, baseline).await;
+        drop(hung);
+        mcp_server.abort();
+        atlas_server.abort();
+    }
+
+    /// Cancel a provider while its status RPC hangs, publish CANCELED promptly,
+    /// and remove both status and cancel bindings from the real Atlas table.
+    #[tokio::test]
+    async fn scoped_cancel_interrupts_hung_async_status_and_releases_channels() {
+        let (endpoint, mut requests, mcp_server) = test_mcp().await;
+        let (service, atlas_server) = cancellation_service(&endpoint, true).await;
+        let baseline = atlas_channel_count(&service).await;
+        let stream = service
+            .execute(Request::new(cancellation_plan("target", &["work", "next"])))
+            .await
+            .unwrap()
+            .into_inner();
+        let initial = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        initial
+            .reply
+            .send(mcp_result(r#"{"run_id":"hung-status"}"#, false))
+            .unwrap();
+        let hung_status = tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hung_status.params["name"], "status");
+        assert_eq!(hung_status.params["arguments"]["run_id"], "hung-status");
+        assert_eq!(atlas_channel_count(&service).await, baseline + 1);
+        let controlling = service.clone();
+        let cancel =
+            tokio::spawn(async move { controlling.control_plan(cancel_request("target")).await });
+        let remote = tokio::time::timeout(Duration::from_millis(500), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.params["name"], "cancel");
+        assert_eq!(remote.params["arguments"]["run_id"], "hung-status");
+        remote
+            .reply
+            .send(mcp_result("cancel accepted", false))
+            .unwrap();
+        reply_cancel_status(&mut requests, "hung-status", "CANCELED").await;
+        let response = tokio::time::timeout(Duration::from_millis(500), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert!(response.completed);
+        let events = tokio::time::timeout(Duration::from_millis(200), stream.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event
+                .as_ref()
+                .unwrap()
+                .node_state
+                .as_ref()
+                .is_some_and(|state| {
+                    state.node_index == 1 && state.state == RtdlNodeStateEnum::Canceled as u32
+                })
+        }));
+        assert!(events.iter().all(|event| {
+            event
+                .as_ref()
+                .unwrap()
+                .node_state
+                .as_ref()
+                .is_none_or(|state| state.node_index != 2)
+        }));
+        wait_for_atlas_channel_count(&service, baseline).await;
+        assert!(requests.try_recv().is_err());
+        drop(hung_status);
+        mcp_server.abort();
+        atlas_server.abort();
+    }
+
+    /// Cancellation must await the initial async response, cancel its exact
+    /// run_id, and surface a rejection even when local execution finishes.
+    #[tokio::test]
+    async fn scoped_cancel_preserves_async_start_race_and_reports_remote_failure() {
+        for (output, is_error) in [
+            ("refused", true),
+            (r#"{"accepted":false,"detail":"refused"}"#, false),
+            (r#"{"ok":false,"message":"refused"}"#, false),
+            (r#"{"success":false,"detail":"refused"}"#, false),
+            (r#"{"accepted":true,"ok":false,"message":"refused"}"#, false),
+        ] {
+            assert_async_cancel_rejection_is_retried(output, is_error).await;
+        }
+    }
+
+    /// Exercise both MCP and payload rejections after late registration, keeping
+    /// the exact remote handle available after the plan leaves the active table.
+    async fn assert_async_cancel_rejection_is_retried(output: &str, is_error: bool) {
+        let (endpoint, mut requests, mcp_server) = test_mcp().await;
+        let (service, atlas_server) = cancellation_service(&endpoint, true).await;
+        let stream = service
+            .execute(Request::new(cancellation_plan("target", &["work", "next"])))
+            .await
+            .unwrap()
+            .into_inner();
+        let initial = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.params["name"], "work");
+        let controlling = service.clone();
+        let cancel =
+            tokio::spawn(async move { controlling.control_plan(cancel_request("target")).await });
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !service.runtime.is_cancelled("target").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!cancel.is_finished());
+        initial
+            .reply
+            .send(mcp_result(r#"{"run_id":"run-123"}"#, false))
+            .unwrap();
+        let remote = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.params["name"], "cancel");
+        assert_eq!(remote.params["arguments"]["run_id"], "run-123");
+        remote.reply.send(mcp_result(output, is_error)).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        assert!(!response.completed);
+        assert!(response.error.contains("refused"), "{}", response.error);
+        let events = tokio::time::timeout(Duration::from_secs(1), stream.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(events.iter().all(|event| {
+            event
+                .as_ref()
+                .unwrap()
+                .node_state
+                .as_ref()
+                .is_none_or(|state| state.node_index != 2)
+        }));
+        assert!(requests.try_recv().is_err());
+        let active: serde_json::Value =
+            serde_json::from_str(&service.runtime.active_plans_json().await).unwrap();
+        assert_eq!(active["count"], 0);
+        let retrying = service.clone();
+        let retry =
+            tokio::spawn(async move { retrying.control_plan(cancel_request("target")).await });
+        let remote = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.params["name"], "cancel");
+        assert_eq!(remote.params["arguments"]["run_id"], "run-123");
+        remote
+            .reply
+            .send(mcp_result(
+                r#"{"accepted":true,"detail":"cancel accepted"}"#,
+                false,
+            ))
+            .unwrap();
+        reply_cancel_status(&mut requests, "run-123", "CANCELED").await;
+        let response = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert!(response.completed);
+        assert!(response.error.is_empty());
+        mcp_server.abort();
+        atlas_server.abort();
+    }
+
+    /// Registered handles receive concurrent cancels; a hung handle is bounded,
+    /// leaves other requests responsive, and is the only handle retried.
+    #[tokio::test]
+    async fn scoped_cancel_bounds_hung_remote_rpc_and_allows_other_requests() {
+        let (endpoint, mut requests, mcp_server) = test_mcp().await;
+        let (service, atlas_server) = cancellation_service(&endpoint, true).await;
+        service.runtime.register_plan("target").await;
+        let mut atlas = service.atlas.clone();
+        for run_id in ["slow", "fast"] {
+            assert!(
+                service
+                    .runtime
+                    .register_or_cancel_async_call(
+                        "target",
+                        RunningAsyncCall {
+                            call_id: run_id.into(),
+                            provider_id: "provider".into(),
+                            cancel_contract: "robonix/test/work/cancel".into(),
+                            run_id: run_id.into(),
+                        },
+                        "executor",
+                        &mut atlas,
+                    )
+                    .await
+            );
+        }
+        let controlling = service.clone();
+        let cancel = tokio::spawn(async move {
+            let mut request = cancel_request("target");
+            request.get_mut().wait_ms = 5_000;
+            controlling.control_plan(request).await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(200), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (hung, fast) = if first.params["arguments"]["run_id"] == "slow" {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(hung.params["name"], "cancel");
+        assert_eq!(hung.params["arguments"]["run_id"], "slow");
+        assert_eq!(fast.params["arguments"]["run_id"], "fast");
+        fast.reply
+            .send(mcp_result("cancel accepted", false))
+            .unwrap();
+        reply_cancel_status(&mut requests, "fast", "CANCELED").await;
+        service.runtime.complete_plan("target").await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(200),
+            service.control_plan(cancel_request("other")),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner();
+        assert!(other.success);
+        assert!(other.completed);
+        let response = tokio::time::timeout(Duration::from_secs(3), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        assert!(!response.completed);
+        assert!(response.error.contains("timed out"), "{}", response.error);
+        assert!(response.error.contains("slow"), "{}", response.error);
+        assert!(!response.error.contains("fast"), "{}", response.error);
+        let retrying = service.clone();
+        let retry =
+            tokio::spawn(async move { retrying.control_plan(cancel_request("target")).await });
+        let remote = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.params["arguments"]["run_id"], "slow");
+        remote
+            .reply
+            .send(mcp_result("cancel accepted", false))
+            .unwrap();
+        reply_cancel_status(&mut requests, "slow", "CANCELED").await;
+        let response = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert!(response.completed);
+        assert!(requests.try_recv().is_err());
+        drop(hung);
+        mcp_server.abort();
+        atlas_server.abort();
+    }
+
+    /// An accepted cancel whose run stays active must remain retryable after local completion.
+    #[tokio::test]
+    async fn scoped_cancel_keeps_accepted_but_running_action_until_terminal_status() {
+        let (endpoint, mut requests, mcp_server) = test_mcp().await;
+        let (service, atlas_server) = cancellation_service(&endpoint, true).await;
+        service.runtime.register_plan("target").await;
+        let mut atlas = service.atlas.clone();
+        assert!(
+            service
+                .runtime
+                .register_or_cancel_async_call(
+                    "target",
+                    RunningAsyncCall {
+                        call_id: "queued".into(),
+                        provider_id: "provider".into(),
+                        cancel_contract: "robonix/test/work/cancel".into(),
+                        run_id: "still-running".into(),
+                    },
+                    "executor",
+                    &mut atlas,
+                )
+                .await
+        );
+        let controlling = service.clone();
+        let mut cancel =
+            tokio::spawn(async move { controlling.control_plan(cancel_request("target")).await });
+        let request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.params["name"], "cancel");
+        request
+            .reply
+            .send(mcp_result(r#"{"accepted":true}"#, false))
+            .unwrap();
+        let mut polls = 0;
+        let response = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    response = &mut cancel => break response.unwrap().unwrap().into_inner(),
+                    Some(status) = requests.recv() => {
+                        assert_eq!(status.params["name"], "status");
+                        assert_eq!(status.params["arguments"]["run_id"], "still-running");
+                        status.reply.send(mcp_result(
+                            r#"{"known":true,"state":"RUNNING","detail":"cancel rejected"}"#,
+                            false,
+                        )).unwrap();
+                        polls += 1;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(polls > 0);
+        assert!(!response.success);
+        assert!(!response.completed);
+        assert!(response.error.contains("status confirmation timed out"));
+        service.runtime.complete_plan("target").await;
+        let retrying = service.clone();
+        let retry =
+            tokio::spawn(async move { retrying.control_plan(cancel_request("target")).await });
+        let request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.params["name"], "cancel");
+        assert_eq!(request.params["arguments"]["run_id"], "still-running");
+        request
+            .reply
+            .send(mcp_result(r#"{"accepted":true}"#, false))
+            .unwrap();
+        reply_cancel_status(&mut requests, "still-running", "CANCELED").await;
+        let response = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert!(response.completed);
+        assert!(requests.try_recv().is_err());
+        mcp_server.abort();
+        atlas_server.abort();
     }
 
     #[tokio::test]

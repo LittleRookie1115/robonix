@@ -4,7 +4,7 @@
 use robonix_scribe::warn;
 use std::time::Duration;
 
-use crate::dispatch::{self, async_registry::AsyncGroup};
+use crate::dispatch::{self, CapabilityChannel, async_registry::AsyncGroup};
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::plan_runtime::{PlanRuntime, RunningAsyncCall};
@@ -17,6 +17,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Dispatch an async cap and poll status every 2s. The caller owns the single
 /// terminal event so successful work can be verified before it is published.
+/// Only polling is interruptible; initial dispatch must yield its run_id.
 pub async fn run_until_terminal(
     call: &CapabilityCall,
     group: &AsyncGroup,
@@ -53,23 +54,28 @@ pub async fn run_until_terminal(
     interval.tick().await;
 
     loop {
-        interval.tick().await;
-        if runtime.is_cancelled(&node.plan_id).await {
+        let status_out = tokio::select! {
+            biased;
+            _ = runtime.wait_for_cancellation(&node.plan_id) => None,
+            result = async {
+                interval.tick().await;
+                poll_status(
+                    self_provider_id,
+                    &call.provider_id,
+                    &group.status_contract,
+                    &run_id,
+                    atlas,
+                ).await
+            } => Some(result),
+        };
+        let Some(status_out) = status_out else {
             runtime
                 .cancel_async_call_for_plan(&node.plan_id, &call.call_id, self_provider_id, atlas)
                 .await;
-            let result = canceled_result(call, "plan was cancelled");
+            let result = canceled_result(call, "plan was cancelled; physical stop is unconfirmed");
             return (result, RtdlNodeStateEnum::Canceled as u32);
-        }
-        let status_out = match poll_status(
-            self_provider_id,
-            &call.provider_id,
-            &group.status_contract,
-            &run_id,
-            atlas,
-        )
-        .await
-        {
+        };
+        let status_out = match status_out {
             Ok(s) => s,
             Err(e) => {
                 let error = format!("status poll failed for {}: {e:#}", call.contract_id);
@@ -98,7 +104,8 @@ pub async fn run_until_terminal(
     }
 }
 
-async fn poll_status(
+/// Own the status binding through its RPC so dropping a hung poll releases it.
+pub(crate) async fn poll_status(
     consumer_id: &str,
     provider_id: &str,
     status_contract: &str,
@@ -124,8 +131,9 @@ async fn poll_status(
             atlas_pb::Transport::Mcp,
         )
         .await?;
+    let channel = CapabilityChannel::new(atlas, channel_id);
     let result = crate::dispatch::mcp::execute(&status_call, &endpoint).await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
+    channel.release().await;
     if result.success {
         Ok(result.output)
     } else {

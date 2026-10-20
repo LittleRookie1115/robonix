@@ -7,16 +7,21 @@ use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use robonix_scribe::warn;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 const DEFAULT_CANCEL_WAIT_MS: u64 = 5_000;
+const ASYNC_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_RETAINED_CANCELLATIONS: usize = 256;
+
+type RetainedCancellations = VecDeque<(String, watch::Sender<CancellationState>)>;
 
 #[derive(Clone, Default)]
 pub struct PlanRuntime {
     inner: Arc<Mutex<HashMap<String, PlanRun>>>,
+    retained_cancellations: Arc<Mutex<RetainedCancellations>>,
 }
 
 #[derive(Clone)]
@@ -28,7 +33,7 @@ pub struct RunningAsyncCall {
 }
 
 struct PlanRun {
-    cancelled: bool,
+    cancellation: watch::Sender<CancellationState>,
     running_async: HashMap<String, RunningAsyncCall>,
     /// op_id → when to cancel the whole plan once execution reaches that op.
     /// Set by the `stop_plan_at` builtin; read by the execution loop at each
@@ -43,6 +48,20 @@ struct PlanRun {
     /// op_id → latest RTDL node state observed during execution. Absent = the
     /// op has not started yet (reported as `pending`).
     op_state: HashMap<String, u32>,
+}
+
+#[derive(Clone, Default)]
+struct CancellationState {
+    cancelled: bool,
+    pending_async: usize,
+    errors: HashMap<String, (RunningAsyncCall, String)>,
+}
+
+/// Local completion and remote errors remain distinct from physical stop.
+pub struct CancelOutcome {
+    pub completed: bool,
+    pub message: String,
+    pub error: String,
 }
 
 /// One op's static identity, snapshotted from the plan arena at register time.
@@ -79,11 +98,7 @@ impl StopWhen {
 
 struct CancelSnapshot {
     async_calls: Vec<RunningAsyncCall>,
-}
-
-struct CancelAllSnapshot {
-    async_calls: Vec<RunningAsyncCall>,
-    plan_ids: Vec<String>,
+    cancellation: watch::Sender<CancellationState>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +126,7 @@ impl PlanRuntime {
         plans.insert(
             plan_id.to_string(),
             PlanRun {
-                cancelled: false,
+                cancellation: watch::channel(CancellationState::default()).0,
                 running_async: HashMap::new(),
                 stop_points: HashMap::new(),
                 description: String::new(),
@@ -218,7 +233,7 @@ impl PlanRuntime {
             serde_json::json!({
                 "plan_id": args.plan_id,
                 "running": true,
-                "cancelled": run.cancelled,
+                "cancelled": run.cancellation.borrow().cancelled,
                 "ops": ops,
             })
             .to_string(),
@@ -246,7 +261,7 @@ impl PlanRuntime {
                     "plan_id": id,
                     "description": run.description,
                     "op_count": run.ops.len(),
-                    "cancelled": run.cancelled,
+                    "cancelled": run.cancellation.borrow().cancelled,
                     "stop_points": run.stop_points.len(),
                     "ops": run.ops.iter().map(|op| serde_json::json!({
                         "op_id": op.op_id,
@@ -267,6 +282,7 @@ impl PlanRuntime {
     /// Mark a plan complete, remove it from the active table, and notify waiters.
     pub async fn complete_plan(&self, plan_id: &str) {
         self.inner.lock().await.remove(plan_id);
+        self.forget_completed_cancellations().await;
     }
 
     /// Return whether a registered plan has been cancelled.
@@ -275,7 +291,23 @@ impl PlanRuntime {
             .lock()
             .await
             .get(plan_id)
-            .is_some_and(|run| run.cancelled)
+            .is_some_and(|run| run.cancellation.borrow().cancelled)
+    }
+
+    /// Subscribe under the plan lock and inspect durable state so cancellation
+    /// cannot race ahead of a dispatch waiter.
+    pub async fn wait_for_cancellation(&self, plan_id: &str) {
+        let cancellation = self
+            .inner
+            .lock()
+            .await
+            .get(plan_id)
+            .map(|run| run.cancellation.subscribe());
+        let Some(mut cancellation) = cancellation else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let _ = cancellation.wait_for(|state| state.cancelled).await;
     }
 
     /// Add one async capability call to the plan's cancellation set, or cancel
@@ -295,16 +327,18 @@ impl PlanRuntime {
             let Some(run) = plans.get_mut(plan_id) else {
                 return true;
             };
-            if run.cancelled {
-                Some(call)
+            if run.cancellation.borrow().cancelled {
+                run.cancellation
+                    .send_modify(|state| state.pending_async += 1);
+                Some((call, run.cancellation.clone()))
             } else {
                 run.running_async.insert(call.call_id.clone(), call);
                 None
             }
         };
 
-        if let Some(call) = cancelled_call {
-            let _ = cancel_async_call(self_provider_id, &call, atlas).await;
+        if let Some((call, cancellation)) = cancelled_call {
+            record_async_cancel(self_provider_id, &call, atlas, &cancellation).await;
             false
         } else {
             true
@@ -330,16 +364,19 @@ impl PlanRuntime {
         let running = {
             let mut plans = self.inner.lock().await;
             plans.get_mut(plan_id).and_then(|run| {
-                if run.cancelled {
-                    run.running_async.remove(call_id)
+                if run.cancellation.borrow().cancelled {
+                    let call = run.running_async.remove(call_id)?;
+                    run.cancellation
+                        .send_modify(|state| state.pending_async += 1);
+                    Some((call, run.cancellation.clone()))
                 } else {
                     None
                 }
             })
         };
         // If running_async contains this call, cancel it.
-        if let Some(running) = running {
-            let _ = cancel_async_call(self_provider_id, &running, atlas).await;
+        if let Some((running, cancellation)) = running {
+            record_async_cancel(self_provider_id, &running, atlas, &cancellation).await;
         }
     }
 
@@ -347,8 +384,8 @@ impl PlanRuntime {
     ///
     /// Cancellation is best-effort: future sequence children are skipped by the
     /// executor loop, and currently running async capability calls receive their
-    /// required `<contract_id>/cancel` call. Synchronous calls already in
-    /// progress are allowed to return naturally.
+    /// required `<contract_id>/cancel` call. Synchronous dispatch futures are
+    /// dropped locally; this does not confirm a physical stop.
     pub async fn cancel_plan_builtin(
         &self,
         call: &CapabilityCall,
@@ -359,7 +396,7 @@ impl PlanRuntime {
             Ok(args) => args,
             Err(e) => return error_result(call, format!("invalid cancel_plan args: {e}")),
         };
-        let (_, output) = self
+        let outcome = self
             .cancel_plan_control(
                 &args.plan_id,
                 args.wait_ms.unwrap_or(DEFAULT_CANCEL_WAIT_MS),
@@ -371,49 +408,48 @@ impl PlanRuntime {
             call_id: call.call_id.clone(),
             provider_id: call.provider_id.clone(),
             contract_id: call.contract_id.clone(),
-            success: true,
-            output,
-            error: String::new(),
+            success: outcome.error.is_empty(),
+            output: outcome.message,
+            error: outcome.error,
         }
     }
 
     /// Out-of-band target cancellation used by Pilot meta ops and the legacy
-    /// builtin wrapper. Returns whether the plan reached terminal state before
-    /// the deadline plus a stable, idempotent message.
+    /// builtin wrapper. Provider failures survive plan removal and are reported
+    /// separately from local completion, which does not confirm physical stop.
     pub async fn cancel_plan_control(
         &self,
         plan_id: &str,
         wait_ms: u64,
         self_provider_id: &str,
         atlas: &mut AtlasClient,
-    ) -> (bool, String) {
+    ) -> CancelOutcome {
         let snapshot = match self.begin_cancel(plan_id).await {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                return (
-                    true,
-                    format!(
+                return CancelOutcome {
+                    completed: true,
+                    message: format!(
                         "RTDL plan '{plan_id}' is not running (already finished or cancelled); nothing to cancel."
                     ),
-                );
+                    error: String::new(),
+                };
             }
         };
-        let mut cancel_errors = Vec::new();
-        for running in &snapshot.async_calls {
-            if let Err(error) = cancel_async_call(self_provider_id, running, atlas).await {
-                cancel_errors.push(format!("{}: {error:#}", running.call_id));
-            }
+        let attempts = snapshot.async_calls.len();
+        cancel_snapshot(&snapshot, self_provider_id, atlas).await;
+        let plans = [(plan_id.to_string(), snapshot)];
+        let inactive = self.wait_until_all_inactive(&plans, wait_ms).await;
+        let (remote_finished, error) = cancellation_status(&plans);
+        let completed = inactive && remote_finished && error.is_empty();
+        self.forget_completed_cancellations().await;
+        CancelOutcome {
+            completed,
+            message: format!(
+                "Cancellation was requested for RTDL plan '{plan_id}'; cancelled=true, completed={completed}, async_cancel_attempts={attempts}. Completion describes local execution only; physical stop is unconfirmed."
+            ),
+            error,
         }
-        let completed = self.wait_until_inactive(plan_id, wait_ms).await;
-        let mut message = format!(
-            "Cancellation was requested for RTDL plan '{plan_id}'; cancelled=true, completed={completed}, async_cancel_attempts={}.",
-            snapshot.async_calls.len()
-        );
-        if !cancel_errors.is_empty() {
-            message.push_str(" Some async cancel requests failed: ");
-            message.push_str(&cancel_errors.join("; "));
-        }
-        (completed, message)
     }
 
     /// Arm a semantic stop boundary without creating a control RTDL tree.
@@ -520,22 +556,15 @@ impl PlanRuntime {
         let Ok(snapshot) = self.begin_cancel(plan_id).await else {
             return;
         };
-        for running in &snapshot.async_calls {
-            if let Err(e) = cancel_async_call(self_provider_id, running, atlas).await {
-                warn!(
-                    "[executor] stop-point async cancel failed for {}: {e:#}",
-                    running.call_id
-                );
-            }
-        }
+        cancel_snapshot(&snapshot, self_provider_id, atlas).await;
     }
 
     /// Cancel every active plan and make best-effort cancel calls for running async work.
     pub async fn cancel_all_plans(&self, self_provider_id: &str, atlas: &mut AtlasClient) -> bool {
-        let (_, completed) = self
+        let (_, outcome) = self
             .cancel_all_plans_except(self_provider_id, atlas, None, DEFAULT_CANCEL_WAIT_MS)
             .await;
-        completed
+        outcome.completed && outcome.error.is_empty()
     }
 
     /// Cancel every active plan except an optional control plan and wait for
@@ -546,21 +575,40 @@ impl PlanRuntime {
         atlas: &mut AtlasClient,
         except_plan_id: Option<&str>,
         wait_ms: u64,
-    ) -> (usize, bool) {
-        let snapshot = self.begin_cancel_all(except_plan_id).await;
-        let target_count = snapshot.plan_ids.len();
-        for running in &snapshot.async_calls {
-            if let Err(e) = cancel_async_call(self_provider_id, running, atlas).await {
-                warn!(
-                    "[executor] cancel_all_plans async cancel failed for {}: {e:#}",
-                    running.call_id
-                );
+    ) -> (usize, CancelOutcome) {
+        let plans = self.begin_cancel_all(except_plan_id).await;
+        let target_count = plans.len();
+        let mut cancels = tokio::task::JoinSet::new();
+        for (_, snapshot) in &plans {
+            let snapshot = CancelSnapshot {
+                async_calls: snapshot.async_calls.clone(),
+                cancellation: snapshot.cancellation.clone(),
+            };
+            let self_provider_id = self_provider_id.to_string();
+            let mut atlas = atlas.clone();
+            cancels.spawn(async move {
+                cancel_snapshot(&snapshot, &self_provider_id, &mut atlas).await;
+            });
+        }
+        while let Some(result) = cancels.join_next().await {
+            if let Err(error) = result {
+                warn!("[executor] plan cancellation task failed: {error}");
             }
         }
-        let completed = self
-            .wait_until_all_inactive(&snapshot.plan_ids, wait_ms)
-            .await;
-        (target_count, completed)
+        let inactive = self.wait_until_all_inactive(&plans, wait_ms).await;
+        let (remote_finished, error) = cancellation_status(&plans);
+        let completed = inactive && remote_finished && error.is_empty();
+        self.forget_completed_cancellations().await;
+        (
+            target_count,
+            CancelOutcome {
+                completed,
+                message: format!(
+                    "Cancellation requested for all RTDL plans; target_count={target_count}, completed={completed}. Completion describes local execution only; physical stop is unconfirmed."
+                ),
+                error,
+            },
+        )
     }
 
     /// Mark a plan cancelled and return the state needed by `cancel_plan`.
@@ -570,53 +618,90 @@ impl PlanRuntime {
     /// atlas server.
     async fn begin_cancel(&self, plan_id: &str) -> Result<CancelSnapshot, String> {
         let mut plans = self.inner.lock().await;
-        let Some(run) = plans.get_mut(plan_id) else {
-            return Err(format!("unknown plan_id '{plan_id}'"));
+        let mut retained = self.retained_cancellations.lock().await;
+        let (mut async_calls, cancellation) = if let Some(run) = plans.get_mut(plan_id) {
+            (
+                run.running_async
+                    .drain()
+                    .map(|(_, running)| running)
+                    .collect::<Vec<_>>(),
+                run.cancellation.clone(),
+            )
+        } else {
+            let Some((_, cancellation)) = retained.iter().find(|(id, _)| id == plan_id) else {
+                return Err(format!("unknown plan_id '{plan_id}'"));
+            };
+            (Vec::new(), cancellation.clone())
         };
-        run.cancelled = true;
+        cancellation.send_modify(|state| {
+            state.cancelled = true;
+            async_calls.extend(state.errors.drain().map(|(_, (call, _))| call));
+            state.pending_async += async_calls.len();
+        });
+        retain_cancellation(&mut retained, plan_id, &cancellation);
         Ok(CancelSnapshot {
-            async_calls: run
-                .running_async
-                .drain()
-                .map(|(_, running)| running)
-                .collect(),
+            async_calls,
+            cancellation,
         })
     }
 
     /// Mark every active plan cancelled and drain their async cancel sets into
     /// one snapshot. Provider cancel calls happen after the runtime lock is
     /// released by `cancel_all_plans`.
-    async fn begin_cancel_all(&self, except_plan_id: Option<&str>) -> CancelAllSnapshot {
-        let mut plans = self.inner.lock().await;
-        let mut async_calls = Vec::new();
-        let mut plan_ids = Vec::new();
-        for (plan_id, run) in plans.iter_mut() {
+    async fn begin_cancel_all(
+        &self,
+        except_plan_id: Option<&str>,
+    ) -> Vec<(String, CancelSnapshot)> {
+        let plans = self.inner.lock().await;
+        let mut plan_ids: Vec<_> = plans.keys().cloned().collect();
+        let retained = self.retained_cancellations.lock().await;
+        for (plan_id, _) in retained.iter() {
+            if !plan_ids.contains(plan_id) {
+                plan_ids.push(plan_id.clone());
+            }
+        }
+        drop(retained);
+        drop(plans);
+        let mut snapshots = Vec::new();
+        for plan_id in plan_ids {
             if except_plan_id == Some(plan_id.as_str()) {
                 continue;
             }
-            run.cancelled = true;
-            plan_ids.push(plan_id.clone());
-            async_calls.extend(run.running_async.drain().map(|(_, running)| running));
+            if let Ok(snapshot) = self.begin_cancel(&plan_id).await {
+                snapshots.push((plan_id, snapshot));
+            }
         }
-        CancelAllSnapshot {
-            async_calls,
-            plan_ids,
-        }
+        snapshots
     }
 
-    async fn wait_until_inactive(&self, plan_id: &str, wait_ms: u64) -> bool {
-        self.wait_until_all_inactive(&[plan_id.to_string()], wait_ms)
+    /// Successful remote cancellation needs no tombstone after local execution
+    /// completes; failed and pending cancels retain their handles for retries.
+    async fn forget_completed_cancellations(&self) {
+        let plans = self.inner.lock().await;
+        self.retained_cancellations
+            .lock()
             .await
+            .retain(|(id, cancellation)| {
+                let state = cancellation.borrow();
+                plans.contains_key(id) || state.pending_async > 0 || !state.errors.is_empty()
+            });
     }
 
     /// Poll durable active-table state instead of awaiting `Notify`, whose
     /// notification can race ahead of waiter registration.
-    async fn wait_until_all_inactive(&self, plan_ids: &[String], wait_ms: u64) -> bool {
+    async fn wait_until_all_inactive(
+        &self,
+        targets: &[(String, CancelSnapshot)],
+        wait_ms: u64,
+    ) -> bool {
         let wait = async {
             loop {
                 let all_inactive = {
                     let plans = self.inner.lock().await;
-                    plan_ids.iter().all(|plan_id| !plans.contains_key(plan_id))
+                    targets.iter().all(|(plan_id, snapshot)| {
+                        !plans.contains_key(plan_id)
+                            && snapshot.cancellation.borrow().pending_async == 0
+                    })
                 };
                 if all_inactive {
                     return;
@@ -630,10 +715,99 @@ impl PlanRuntime {
     }
 }
 
+/// Retain failed handles without yielding between marking cancellation and
+/// launching its RPCs, so dropping a control request cannot strand the handles.
+fn retain_cancellation(
+    retained: &mut RetainedCancellations,
+    plan_id: &str,
+    cancellation: &watch::Sender<CancellationState>,
+) {
+    if retained.iter().any(|(id, _)| id == plan_id) {
+        return;
+    }
+    if retained.len() == MAX_RETAINED_CANCELLATIONS
+        && let Some((evicted, _)) = retained.pop_front()
+    {
+        warn!(
+            "[executor] cancellation retention limit reached; evicting plan {evicted}; physical stop is unconfirmed"
+        );
+    }
+    retained.push_back((plan_id.to_string(), cancellation.clone()));
+}
+
+/// Dispatch independent cancels concurrently so one slow provider cannot delay
+/// the others. Tasks outlive the control request to preserve their handles.
+async fn cancel_snapshot(snapshot: &CancelSnapshot, consumer_id: &str, atlas: &mut AtlasClient) {
+    let mut cancels = Vec::new();
+    for running in &snapshot.async_calls {
+        let pending = running.clone();
+        let running = running.clone();
+        let cancellation = snapshot.cancellation.clone();
+        let consumer_id = consumer_id.to_string();
+        let mut atlas = atlas.clone();
+        let cancel = tokio::spawn(async move {
+            record_async_cancel(&consumer_id, &running, &mut atlas, &cancellation).await;
+        });
+        cancels.push((pending, cancel));
+    }
+    for (running, cancel) in cancels {
+        if let Err(error) = cancel.await {
+            let error = format!("async cancel task failed: {error}; physical stop is unconfirmed");
+            warn!("[executor] {error}");
+            snapshot.cancellation.send_modify(|state| {
+                state.pending_async -= 1;
+                state
+                    .errors
+                    .insert(running.call_id.clone(), (running, error));
+            });
+        }
+    }
+}
+
+/// Keep failures available to a control request even if execution has already
+/// removed the plan, including cancellation after an async initial response.
+async fn record_async_cancel(
+    consumer_id: &str,
+    running: &RunningAsyncCall,
+    atlas: &mut AtlasClient,
+    cancellation: &watch::Sender<CancellationState>,
+) {
+    let result = cancel_async_call(consumer_id, running, atlas).await;
+    cancellation.send_modify(|state| {
+        state.pending_async -= 1;
+        if let Err(error) = result {
+            let error = format!("{}: {error:#}", running.call_id);
+            warn!("[executor] async cancel failed: {error}; physical stop is unconfirmed");
+            state
+                .errors
+                .insert(running.call_id.clone(), (running.clone(), error));
+        }
+    });
+}
+
+/// Read pending work and failures together so a concurrent retry cannot clear
+/// an error and make an unfinished cancellation appear complete.
+fn cancellation_status(plans: &[(String, CancelSnapshot)]) -> (bool, String) {
+    let mut finished = true;
+    let mut errors = Vec::new();
+    for (plan_id, snapshot) in plans {
+        let state = snapshot.cancellation.borrow();
+        finished &= state.pending_async == 0;
+        errors.extend(
+            state
+                .errors
+                .values()
+                .map(|(_, error)| format!("{plan_id}: {error}; physical stop is unconfirmed")),
+        );
+    }
+    (finished, errors.join("; "))
+}
+
 /// Call a provider's async cancel contract through atlas/MCP.
 ///
 /// The cancel payload mirrors the status polling payload and sends `run_id`
-/// when present. Atlas channels are disconnected after the MCP request returns.
+/// when present. Bound discovery and MCP together, then separately bound cleanup.
+/// A successful MCP transport can still carry a rejected cancellation.
 async fn cancel_async_call(
     consumer_id: &str,
     running: &RunningAsyncCall,
@@ -650,21 +824,75 @@ async fn cancel_async_call(
         contract_id: running.cancel_contract.clone(),
         args_json: args,
     };
-    let (channel_id, endpoint, _) = atlas
-        .connect_capability(
+    let deadline = tokio::time::Instant::now() + ASYNC_CANCEL_TIMEOUT;
+    let (channel_id, endpoint, _) = tokio::time::timeout_at(
+        deadline,
+        atlas.connect_capability(
             consumer_id,
             &running.provider_id,
             &running.cancel_contract,
             atlas_pb::Transport::Mcp,
-        )
-        .await?;
-    let result = crate::dispatch::mcp::execute(&cancel_call, &endpoint).await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
-    if result.success {
-        Ok(())
-    } else {
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("async cancel discovery timed out after {ASYNC_CANCEL_TIMEOUT:?}")
+    })??;
+    let channel = crate::dispatch::CapabilityChannel::new(atlas, channel_id);
+    let result = tokio::time::timeout_at(
+        deadline,
+        crate::dispatch::mcp::execute(&cancel_call, &endpoint),
+    )
+    .await;
+    channel.release().await;
+    let result = result.map_err(|_| {
+        anyhow::anyhow!("async cancel RPC timed out after {ASYNC_CANCEL_TIMEOUT:?}")
+    })?;
+    if !result.success {
         anyhow::bail!("{}", result.error)
     }
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&result.output)
+        && ["accepted", "ok", "success"]
+            .iter()
+            .any(|field| payload.get(*field).and_then(serde_json::Value::as_bool) == Some(false))
+    {
+        anyhow::bail!("async cancel rejected: {}", result.output);
+    }
+    let contract = running
+        .cancel_contract
+        .strip_suffix("/cancel")
+        .ok_or_else(|| anyhow::anyhow!("async cancel contract has no status counterpart"))?;
+    let status_contract = format!("{contract}/status");
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let output = crate::dispatch::async_poll::poll_status(
+                consumer_id,
+                &running.provider_id,
+                &status_contract,
+                &running.run_id,
+                atlas,
+            )
+            .await?;
+            let payload: serde_json::Value = serde_json::from_str(&output)?;
+            anyhow::ensure!(
+                payload.get("known").and_then(serde_json::Value::as_bool) != Some(false),
+                "async cancel status does not identify the requested run"
+            );
+            let state = payload
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::dispatch::async_poll::parse_state_name)
+                .ok_or_else(|| anyhow::anyhow!("async cancel status is not a valid run state"))?;
+            if crate::rtdl_wire::is_terminal_state(state) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("async cancel status confirmation timed out; run may remain active")
+    })?
 }
 
 /// Build a failed capability result for a builtin.
@@ -769,6 +997,7 @@ mod tests {
         assert!(plans.get("p").unwrap().running_async.is_empty());
     }
 
+    /// Marking all plans must publish every plan's cancellation signal.
     #[tokio::test]
     async fn begin_cancel_all_marks_every_plan() {
         let runtime = PlanRuntime::default();
@@ -776,11 +1005,12 @@ mod tests {
         runtime.register_plan("p2").await;
         let snapshot = runtime.begin_cancel_all(None).await;
 
-        assert!(snapshot.async_calls.is_empty());
+        assert!(snapshot.iter().all(|(_, plan)| plan.async_calls.is_empty()));
         assert!(runtime.is_cancelled("p1").await);
         assert!(runtime.is_cancelled("p2").await);
     }
 
+    /// A control plan can exclude itself while other plans are canceled.
     #[tokio::test]
     async fn begin_cancel_all_excludes_control_plan() {
         let runtime = PlanRuntime::default();
@@ -789,7 +1019,13 @@ mod tests {
 
         let snapshot = runtime.begin_cancel_all(Some("control")).await;
 
-        assert_eq!(snapshot.plan_ids, vec!["task"]);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(plan_id, _)| plan_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task"]
+        );
         assert!(runtime.is_cancelled("task").await);
         assert!(!runtime.is_cancelled("control").await);
     }
@@ -801,6 +1037,41 @@ mod tests {
             cancel_contract: "robonix/test/cancel".into(),
             run_id: "r".into(),
         }
+    }
+
+    /// Watch state must cover both cancellation before subscription and a
+    /// cancellation that arrives while a dispatch waiter is already asleep.
+    #[tokio::test]
+    async fn cancellation_waiters_observe_early_and_late_signals_per_plan() {
+        let runtime = PlanRuntime::default();
+        runtime.register_plan("early").await;
+        runtime.register_plan("late").await;
+        runtime.register_plan("other").await;
+        runtime.begin_cancel("early").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.wait_for_cancellation("early"),
+        )
+        .await
+        .unwrap();
+        let waiting_runtime = runtime.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_runtime.wait_for_cancellation("late").await;
+        });
+        tokio::task::yield_now().await;
+        runtime.begin_cancel("late").await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                runtime.wait_for_cancellation("other"),
+            )
+            .await
+            .is_err()
+        );
     }
 
     fn stop_call(args_json: &str) -> CapabilityCall {

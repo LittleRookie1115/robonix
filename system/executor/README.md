@@ -76,22 +76,57 @@ fields. Executor copies both fields into every `RtdlNodeState` so callers can
 match execution results back to the original RTDL node.
 
 Executor keeps an in-process table of active RTDL plans. The builtin
-`cancel_plan` capability can mark a plan as cancelled by `plan_id`; `sequence`
-skips children that have not started yet, `parallel` shares the cancellation
-state across branches, and the target plan still emits `plan_complete` with
-`any_failed=true`.
+`cancel_plan` capability and `ControlPlan(action="cancel", plan_id=...)` mark
+only the target plan as cancelled. A per-plan watch interrupts synchronous
+dispatch futures immediately, including capability discovery and synchronous
+verification. `sequence` skips children that have not started yet, `parallel`
+shares the signal across branches, and the target plan still emits
+`plan_complete` with `any_failed=true`. Other plans continue independently.
 
 Executor declares five gRPC contracts:
 
 - `robonix/system/executor/execute`: Pilot submits one `Plan` and receives an
   `RtdlEvent` stream.
-- `robonix/system/executor/control_plan`: applies one RTDL meta operation to
-  active plans without creating another plan.
+- `robonix/system/executor/control_plan`: applies the existing `cancel`,
+  `cancel_all`, or `stop_at` action without submitting another RTDL plan.
 - `robonix/system/executor/list_active_plans`: returns the RTDL plans Executor
   currently owns, without creating a plan.
 - `robonix/system/executor/cancel_all_plans`: cancels every active RTDL plan.
 - `robonix/system/executor/get_health`: returns Executor's module health report
   for Vitals.
+
+Cancellation is best-effort. Dropping a local synchronous future does not
+confirm that a remote provider or physical action stopped. Atlas bindings are
+released on normal completion and when a dispatch future is dropped, with a
+250 ms cleanup deadline per attempt; cleanup remains best-effort if Atlas is
+unavailable. The `run_command` builtin keeps its existing process-group
+cancellation and cleanup. An async call whose initial request has started is
+allowed to return its `run_id`; if cancellation arrives first, Executor cancels
+that run immediately after registration. Async status polling retains its
+two-second interval, while cancellation interrupts both the interval wait and
+an in-progress status RPC.
+
+Async cancel requests run concurrently with a two-second deadline covering
+Atlas discovery, the provider RPC, and terminal-status confirmation, followed
+by at most 250 ms of Atlas channel cleanup.
+`ControlPlanResponse.completed=true` means local execution
+has finished and every known async run reports a terminal status after its
+cancel request succeeds. A queued `accepted=true` response alone does not
+complete cancellation; an active, unknown, malformed, or unavailable status
+retains the exact handle for retry. This does not confirm physical stop.
+Remote rejection or timeout returns `success=false`,
+`completed=false`, and a non-empty `error` stating that physical stop is
+unconfirmed. A cancel response with `accepted=false`, `ok=false`, or
+`success=false` is a rejection even when MCP reports a successful call.
+
+Failed async cancel handles remain available after the plan leaves the active
+table. Repeating `ControlPlan(action="cancel", plan_id=...)` retries the same
+provider, contract, and `run_id`. Successful retries release the retained
+handles once local execution finishes. Executor retains cancellation records
+for at most 256 plans in memory; reaching the limit evicts the oldest record
+and logs that physical stop is unconfirmed. Restarting Executor also loses
+these records. `wait_ms` bounds the wait for local completion after the
+current cancel attempts, which have their own deadline.
 
 The Execute stream emits `RtdlEvent` messages:
 
@@ -182,8 +217,10 @@ Executor declares builtin MCP capabilities under
   that never wrote a `CAPABILITY.md` still answer.
 - `cancel_plan`: best-effort cancellation for an in-flight RTDL plan. Args:
   `plan_id` (required) and `wait_ms` (optional, default 5000). Async capability
-  calls receive cancel requests through `<contract_id>/cancel`; synchronous
-  calls already in progress are allowed to return naturally.
+  calls receive bounded cancel requests through `<contract_id>/cancel`;
+  synchronous dispatch futures are dropped locally. Remote cancel failures
+  return a failed result and retain handles for retry. Physical stop remains
+  unconfirmed.
 - `get_all_plans`: list every in-flight RTDL plan (no args). Returns each
   `plan_id` with a short `description` of the task (the root node's description,
   which carries the model's `rtdl_description`), `op_count`, `cancelled`, and the
