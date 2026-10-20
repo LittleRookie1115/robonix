@@ -32,12 +32,74 @@ class WebotsDeployConfigTest(unittest.TestCase):
         self.assertNotIn("rtabmap_profile", mapping)
         self.assertNotIn("rtabmap_params", mapping)
         self.assertTrue((ROOT / mapping["params_file"]).is_file())
+        params = yaml.safe_load((ROOT / mapping["params_file"]).read_text())
+        self.assertTrue(params["Grid/RayTracing"])
+        self.assertEqual(params["qos_scan"], 2)
+        soma = yaml.safe_load((ROOT / "soma.yaml").read_text())
+        self.assertGreater(params["GridGlobal/FootprintRadius"], 0.0)
+        self.assertLessEqual(
+            params["GridGlobal/FootprintRadius"], soma["robot"]["dimensions"]["width_m"] / 2,
+        )
 
     def test_navigation_uses_deploy_owned_file(self):
         navigation = entries(self.document, "service")["nav2"]["config"]
         self.assertEqual(navigation["params_file"], "config/nav2_params.yaml")
         self.assertNotIn("params_profile", navigation)
         self.assertTrue((ROOT / navigation["params_file"]).is_file())
+        self.assertTrue((ROOT / navigation["bt_xml_file"]).is_file())
+
+    def test_navigation_observes_overhangs_with_the_head_depth_camera(self):
+        navigation = entries(self.document, "service")["nav2"]["config"]
+        self.assertEqual(navigation["provider_ids"]["depth"], "tiago_camera")
+        params = yaml.safe_load((ROOT / navigation["params_file"]).read_text())
+        for name in ("local_costmap", "global_costmap"):
+            costmap = params[name][name]["ros__parameters"]
+            self.assertEqual(costmap["footprint"], "__ROBONIX_FOOTPRINT__")
+            self.assertEqual(costmap["footprint_padding"], 0.03)
+            self.assertNotIn("robot_radius", costmap)
+            self.assertIn("depth_layer", costmap["plugins"])
+            layer = costmap["depth_layer"]
+            self.assertEqual(
+                layer["plugin"], "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer",
+            )
+            self.assertEqual(layer["observation_sources"].split(), ["depth_mark", "depth_clear"])
+            self.assertGreater(layer["voxel_size"], 0.0)
+            self.assertGreater(layer["voxel_decay"], 0.0)
+            depth = layer["depth_mark"]
+            self.assertEqual(depth["topic"], "__ROBONIX_DEPTH_CLOUD_TOPIC__")
+            self.assertEqual(depth["data_type"], "PointCloud2")
+            self.assertTrue(depth["marking"])
+            self.assertEqual(depth["expected_update_rate"], 0.0)
+            self.assertFalse(depth["clearing"])
+            clearing = layer["depth_clear"]
+            self.assertEqual(clearing["topic"], depth["topic"])
+            self.assertTrue(clearing["clearing"])
+            self.assertFalse(clearing["marking"])
+            self.assertLess(depth["min_obstacle_height"], 1.0)
+            self.assertGreater(depth["max_obstacle_height"], 1.05)
+        monitor = params["collision_monitor"]["ros__parameters"]
+        self.assertEqual(monitor["depth"]["topic"], "__ROBONIX_DEPTH_CLOUD_TOPIC__")
+        self.assertIn("depth", monitor["observation_sources"])
+        self.assertGreater(monitor["source_timeout"], 0.0)
+        controller = params["controller_server"]["ros__parameters"]["FollowPath"]
+        self.assertIn("ObstacleFootprint", controller["critics"])
+        self.assertEqual(
+            params["planner_server"]["ros__parameters"]["GridBased"]["tolerance"], 0.0,
+        )
+        self.assertFalse(
+            params["planner_server"]["ros__parameters"]["GridBased"]["allow_unknown"],
+        )
+
+    def test_navigation_parameters_have_no_duplicate_mapping_keys(self):
+        pending = [yaml.compose((ROOT / "config/nav2_params.yaml").read_text())]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, yaml.MappingNode):
+                keys = [key.value for key, _value in node.value]
+                self.assertEqual(len(keys), len(set(keys)), keys)
+                pending.extend(value for _key, value in node.value)
+            elif isinstance(node, yaml.SequenceNode):
+                pending.extend(node.value)
 
     def test_vitals_has_a_non_conflicting_loopback_listener(self):
         # The merge follows #188's provider-loopback direction: vitals binds

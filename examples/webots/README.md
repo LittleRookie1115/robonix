@@ -119,6 +119,41 @@ Then a third terminal for `rbnx chat`. `rbnx caps` lists the
 capabilities atlas knows about; `rbnx tools` lists the MCP tools
 the LLM agent can call.
 
+## Navigation obstacles
+
+Mapping loads `config/rtabmap_params.yaml` to ray-trace observed free space
+and clear the TIAGo base's 0.272 metre radius under its recorded poses. Without
+that configuration, sparse free cells and an unknown cell under the robot can
+prevent a frontier explorer from finding connected targets.
+Laser scans use best-effort sensor QoS so mapping prioritizes current scans.
+
+Navigation uses both the planar lidar and the head camera's registered depth.
+The existing navigation service converts depth and camera intrinsics discovered
+through Atlas into a point cloud. Both costmaps use a spatio-temporal voxel
+layer to retain obstacles with heights between -0.05 and 1.3 metres in the
+costmap frame, including window sills and table tops that the low lidar cannot
+see. The controller checks the Soma footprint with a 0.03 metre margin.
+Nav2's collision monitor also observes the lidar and depth point cloud.
+Nav2 checks that it can plan to a goal before dispatching motion. The simulator
+planner does not silently substitute a nearby goal for an obstructed frontier.
+
+The deployment's navigation behavior tree replans and retains spin, wait and
+backup recovery, but never automatically clears either costmap. Clearing near
+an overhang can erase its last observation after it enters the depth blind
+zone. If the depth point cloud stops advancing for one second, the navigation
+service's final velocity guard latches zero velocity output and requests
+cancellation of the current navigation UUID. A fresh goal and fresh depth
+data are required to resume. The timeout is
+configurable through `depth_obstacles.source_timeout_s`.
+This guard covers Nav2's velocity output, not direct chassis motion commands.
+
+The camera has a 0.6 metre minimum depth range. Avoidance must see an overhang
+before entering that blind zone; enabling depth is not a contact sensor or a
+guarantee that a robot already touching an obstacle can recover autonomously.
+Keep the camera TF and intrinsics consistent with the simulator. A blocked
+robot with healthy sensor streams is a navigation failure, not a disconnected
+camera or lidar.
+
 ## Simulated hardware health
 
 `rbnx boot` starts `tiago_health` during Soma stage 1. The primitive publishes
