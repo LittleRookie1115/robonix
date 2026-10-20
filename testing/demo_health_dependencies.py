@@ -589,7 +589,6 @@ async def run():
                                                             "timeout_s": 300})))]))
             await wait_for(lambda: any(plan["plan_id"] == DIRECT_PLAN for plan in hardware_plans()),
                            20, "direct Explore execution while Pilot is stopped")
-            await asyncio.sleep(5)
             inspected = await atlas.InspectAtlas(atlas_pb2.InspectAtlasRequest(), timeout=5)
             channels = json.loads(inspected.json)["channels"]
             assert any(edge["provider_id"] == "tiago_lidar" and edge["consumer_id"] == "mapping"
@@ -605,7 +604,6 @@ async def run():
             assert not any(edge["provider_id"] == "tiago_lidar"
                            for edge in json.loads(inspected.json)["channels"].values()), \
                 "Lidar channels survived cleanup"
-            await asyncio.sleep(3)
             assert any(plan["plan_id"] == DIRECT_PLAN for plan in await asyncio.to_thread(plans)), \
                 "Direct exploration ended before the health fault"
             fault_at = record(events, "pilot_stopped", "inject_error_after_channel_removal")
