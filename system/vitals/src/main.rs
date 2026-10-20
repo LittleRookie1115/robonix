@@ -18,7 +18,7 @@ mod config;
 mod mock_soma;
 pub mod module_health;
 mod module_health_poll;
-mod pb;
+use robonix_vitals::pb;
 mod service;
 mod soma_ingest;
 mod subprocess;

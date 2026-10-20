@@ -3239,6 +3239,7 @@ dependencies = [
  "robonix-atlas",
  "robonix-codegen",
  "robonix-scribe",
+ "robonix-vitals",
  "serde",
  "serde_json",
  "serde_yaml",
