@@ -208,11 +208,14 @@ bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh lidar
 
 The helper updates the local fault file inside the simulator container without
 restarting Webots or any Robonix component. The next health frame reports
-`body/hokuyo_lidar` offline; Soma maps it to `ERROR`, Vitals publishes the
-change, and Pilot interrupts an active planning round with the alert. Pilot
-should cancel only the in-flight plan that depends on lidar, preserving
-unrelated plans. Inspect the Vitals snapshot with the `grpcurl` command above
-and Pilot logs for `[pilot/health]`.
+`body/hokuyo_lidar` offline; Soma maps it to `ERROR`. Vitals independently
+requests cancellation of plans that depend on lidar through Executor without
+waiting for model analysis. Pilot receives the alert for subsequent planning.
+Unrelated plans continue. Inspect the Vitals snapshot with the `grpcurl`
+command above, the Executor active-plan table, and Vitals logs for
+`[vitals/stop]`. A cancellation request alone does not prove completion:
+check local plan completion in Executor's active table and a completed control
+result with terminal async run status. Physical stopping needs separate observation.
 
 Restore the sensor and verify the health transition:
 
@@ -221,9 +224,9 @@ bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh normal
 ```
 
 Use `camera` instead of `lidar` to inject a camera fault. The helper accepts
-only these two monitored components. Pilot's choice of affected plan is made
-by the configured VLM from the active-plan details; verify the log and active
-plan state rather than treating the prompt alone as proof of cancellation.
+only these two monitored components. `ERROR` and `STALE` trigger targeted
+stopping from recorded dependencies; `WARN` alone does not cancel a plan.
+Recovery does not automatically restart cancelled work.
 
 Pilot also receives a computed dependency impact block. Soma's `exports` must
 use the instance names from this deployment (`tiago_lidar`, `mapping`, `nav2`,
@@ -232,24 +235,85 @@ input. The impact block lists recorded input contracts, dependent services and
 skills, and matching active plan ids instead of requiring the VLM to infer
 dependencies from tool names.
 
-To verify the complete dependency path with deterministic model responses,
-stop the Robonix stack but keep the Lite simulator running, build the current
-Rust programs and Webots packages, and run:
+To verify that stopping works independently of both model replies and Pilot,
+stop the Robonix stack but keep the Lite simulator running. Build the current
+Rust programs and generated Webots package artifacts, then run the demo from
+the repository root:
 
 ```bash
+cargo build --workspace
+rbnx build -f examples/webots/robonix_manifest.yaml --no-update-check
 python3 testing/demo_health_dependencies.py
 ```
 
 The script needs `grpcio`, `protobuf`, and `PyYAML` in its Python environment
-and uses the generated Mapping bindings. It starts an isolated test manifest
-on the normal Atlas/Executor/Pilot/Vitals ports and a local fake VLM on `51090`;
-it refuses occupied ports and does not use private VLM credentials. It starts
-real Mapping, Navigation, and Explore packages plus unrelated software work,
-marks the lidar provider terminated so Atlas removes its channels, and injects
-a lidar health fault. The assertions check that cached dependency evidence
-reaches Pilot, only the exploration plan is cancelled, unrelated work stays
-running, and health recovers. Test processes are shut down afterward; Webots
-stays running. This is a simulated health fault, not a physical sensor failure.
+and uses the generated Mapping bindings. It also needs Linux with Python
+`pidfd` support, `grpcurl`, and access to the running Lite simulator through
+Docker. `ROBONIX_SIM_CONTAINER` selects the container when its name differs
+from `robonix_tiago_sim`.
+
+The fixture uses Atlas `50051`, Executor `50061`, Pilot `50071`, Soma `50091`,
+Vitals `50093`, and a local fake VLM on `51090`. It refuses occupied ports.
+It supplies its own model configuration and a unique health fault file inside
+the simulator container.
+
+1. **Blocked model.** Start a real Explore task through Pilot and a separate
+   software plan using an MCP stdio worker. After warming the dependency
+   graph, inject lidar `ERROR`. The fake model holds every follow-up reply
+   behind a `threading.Event` and never emits `cancel_plan`. The target plan
+   must leave Executor's active table and have a Vitals log confirming completed
+   cancellation within **8 seconds of starting fault injection**, while the
+   original software operation remains running and
+   uncancelled. Only after observing the stop does the script release model
+   replies. The existing `impact_json` in Pilot's requests must eventually
+   include `tiago_lidar`, `mapping`, `nav2`, and `explore` with the recorded
+   Mapping-to-lidar path. Its `candidate_plans` may already be empty. After
+   stopping, the script explicitly submits an analysis-only `rbnx ask` to
+   collect refreshed evidence; the fake model returns only an empty sequence
+   outside the admission check below.
+2. **Paused Pilot.** Verify the fixture's Pilot PID against its boot state,
+   parent, executable, boot identity, and process start time, then send
+   `SIGSTOP` through a pinned pidfd. Submit another task to the same Explore
+   capability directly through Executor. Mark only the fixture's lidar
+   instance terminated before removing its channels, then inject another health
+   fault after graph refresh. The target must stop within the same 8-second
+   limit while Pilot remains paused and software work continues. A `finally`
+   block sends `SIGCONT`. A new fixture-owned analysis-only `rbnx ask` then
+   obtains Pilot's existing impact report, which must retain Mapping's
+   `evidence: "last_known"` and lidar dependency path. This does not depend
+   on the first ask or its session remaining active.
+3. **Reject unsafe model actions.** Keep the fault present after Pilot resumes.
+   Enable the fake model's admission flag and start a fresh fixture-owned ask.
+   The model returns the same affected Explore operation twice, including the
+   corrective retry, and emits no cancellation. The ask must finish within
+   15 seconds with `Vitals blocked this plan` in its final output and no Plan
+   event. The script continuously checks that no Explore operation enters
+   Executor's active table, then checks the appended Executor log for any
+   Explore dispatch and the Vitals log for cancellation of a newly admitted
+   plan. These checks reject execution followed by fast cancellation. The
+   model allows at most two unsafe responses and returns empty sequences
+   afterward, so the fixture cannot create an unbounded unsafe retry loop.
+
+Each recovery must report lidar healthy and leave stopped hardware work
+inactive for a further five seconds while software work continues. The sensor
+fault helper has no WARN profile, so this demo does not inject WARN; unit tests
+cover the WARN/UNKNOWN cases.
+
+The terminal prints stage markers and cancellation latency. The temporary
+artifact directory contains `boot.log`, `ask.log`, and `verification.json`,
+including ordered fault/stop/model-release timestamps, model requests, and
+the original impact reports. Admission evidence includes both unsafe model
+replies, active-table samples, and the ask/Executor/Vitals log increments;
+the full ask output remains in `ask.log`. A failed run also writes its error and any
+evidence collected before cleanup. The assertions require local plan completion
+and Vitals' confirmed control result, which includes terminal async run status.
+They do not observe physical stopping; prompt evidence is checked separately.
+An 8-second timeout is
+a failed demonstration, not a successful cancellation request.
+
+Cleanup cancels only fixture-owned plans, reaps every ask process, resumes its
+Pilot, shuts down the temporary deployment, and removes its unique fault file. Webots stays running.
+This is simulated health injection, not a physical sensor failure.
 
 To tear everything down: Ctrl-C the `rbnx boot` terminal, OR from
 any other shell:
