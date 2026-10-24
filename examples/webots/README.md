@@ -18,7 +18,7 @@ examples/webots/
 │   ├── tiago_chassis/         /amcl_pose + /cmd_vel  → chassis/{state, move}
 │   ├── tiago_camera/          /head_front_camera/*   → camera/{snapshot, depth_snapshot}
 │   ├── tiago_lidar/           /scanner               → lidar/snapshot
-│   ├── tiago_health/          nominal simulated battery/wheel/sensor health
+│   ├── tiago_health/          simulated health and demo fault injection
 │   └── audio_driver/          (separate, mic/spkr — old schema, not deployed yet)
 ├── services/
 │   └── tiago_nav2/            Nav2 launch + ActionClient wrapper
@@ -119,17 +119,43 @@ Then a third terminal for `rbnx chat`. `rbnx caps` lists the
 capabilities atlas knows about; `rbnx tools` lists the MCP tools
 the LLM agent can call.
 
+## Navigation sensor faults
+
+The upstream Webots configuration provides depth obstacle layers and Nav2's
+collision monitor. Exploration uses its upstream strategies and navigation
+parameters.
+
+Mapping uses the upstream `slam_toolbox` backend with `lidar2d: tiago_lidar`
+and `odom: tiago_chassis`. Its default SLAM Toolbox parameters apply; the
+RTAB-Map-only `params_file` setting is omitted. Optional SLAM Toolbox tuning
+belongs in Mapping's `slam_toolbox_params` configuration.
+
+The navigation service's depth watchdog latches zero velocity output and
+requests cancellation of the current navigation UUID when depth samples stop
+advancing. A fresh goal and fresh samples are required to resume. Its timeout
+defaults to one second and is configured by `depth_obstacles.source_timeout_s`.
+Vitals separately identifies affected work and requests scoped Executor
+cancellation. The velocity watchdog covers Nav2 output, not direct chassis
+commands.
+
 ## Simulated hardware health
 
 `rbnx boot` starts `tiago_health` during Soma stage 1. The primitive publishes
-nominal battery, wheel, camera, lidar, and audio readings every 500 ms; Soma
-maps those readings onto the component tree in `soma.yaml`. With the `full`
+simulated battery, wheel, and audio readings plus camera and lidar sample
+availability every 500 ms. Soma maps them onto the component tree in `soma.yaml`.
+With the `full`
 variant it also publishes all seven arm joints and the gripper against
 `soma.full.yaml`.
 
 The deployment manifest declares Vitals as a built-in system component, so
 `rbnx boot` starts it automatically after Soma and Pilot. Soma uses `50091`
 and voiceprint uses `50092` in this deployment, so Vitals listens on `50093`.
+If a cached package reports that its generated lifecycle Driver is missing or
+outdated, refresh the manifest's generated artifacts before boot:
+
+```bash
+rbnx build -f examples/webots/robonix_manifest.yaml --no-update-check
+```
 
 Confirm that Atlas sees it as active:
 
@@ -153,9 +179,195 @@ grpcurl -plaintext \
 
 Expected power values are approximately `82%` and `24.8 V`; both wheels are
 online with enabled torque and temperatures below the default thresholds.
-The primitive's manifest config includes `scenario: normal`. This is the
-reserved entry point for future fault profiles; unsupported values currently
-fail initialization instead of returning misleading healthy data.
+
+### Demonstrate a hardware fault and recovery
+
+Keep the Webots and `rbnx boot` terminals running. Start a long-running
+exploration task that uses lidar, then inject a lidar fault from a third
+terminal:
+
+```bash
+bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh lidar
+```
+
+The helper updates the local fault file inside the simulator container without
+restarting Webots or any Robonix component. The next health frame reports
+`body/hokuyo_lidar` offline; Soma maps it to `ERROR`. Vitals independently
+requests cancellation of plans that depend on lidar through Executor without
+waiting for model analysis. Pilot receives the alert for subsequent planning.
+Unrelated plans continue. Inspect the Vitals snapshot with the `grpcurl`
+command above, the Executor active-plan table, and Vitals logs for
+`[vitals/stop]`. A cancellation request alone does not prove completion:
+check local plan completion in Executor's active table and a completed control
+result with terminal async run status. Physical stopping needs separate observation.
+
+Restore the sensor and verify the health transition:
+
+```bash
+bash examples/webots/primitives/tiago_health/scripts/inject_fault.sh normal
+```
+
+Use `camera` instead of `lidar` to inject a camera fault. The helper accepts
+only these two monitored components. `ERROR` and `STALE` trigger targeted
+stopping from recorded dependencies; `WARN` alone does not cancel a plan.
+Recovery does not automatically restart cancelled work.
+
+Vitals computes the dependency impact report and includes it in its existing
+`GetVitals` and `StreamVitals` snapshots as `dependency_report_json`. Pilot
+uses that report for the model context and admission checks. Soma's `exports` must
+use the instance names from this deployment (`tiago_lidar`, `mapping`, `nav2`,
+and `explore`), and consumers must retain their Atlas channels while using an
+input. The impact block lists recorded input contracts, dependent services and
+skills, and matching active plan ids instead of requiring the VLM to infer
+dependencies from tool names.
+
+To verify that stopping works independently of both model replies and Pilot,
+stop the Robonix stack but keep the Lite simulator running. Until
+[Mapping #34](https://github.com/syswonder/service-map-rbnx/pull/34),
+[Navigation #23](https://github.com/syswonder/service-navigation-rbnx/pull/23)
+and [Explore #15](https://github.com/syswonder/skill-explore-rbnx/pull/15)
+merge, use their PR heads. From the Robonix root, prepare clean package
+checkouts in the deployment cache:
+
+```bash
+(
+  set -e
+  cache_root=examples/webots/rbnx-boot/cache
+  mkdir -p "$cache_root"
+  for entry in "service-map-rbnx 34" \
+               "service-navigation-rbnx 23" \
+               "skill-explore-rbnx 15"; do
+    read -r package pull_request <<< "$entry"
+    package_root="$cache_root/$package"
+    package_url="https://github.com/syswonder/$package"
+    if [ ! -e "$package_root/.git" ]; then
+      git clone "$package_url" "$package_root"
+    fi
+    git -C "$package_root" diff --quiet
+    git -C "$package_root" diff --cached --quiet
+    git -C "$package_root" fetch "$package_url" "pull/$pull_request/head"
+    git -C "$package_root" switch --detach FETCH_HEAD
+  done
+)
+```
+
+The clean-tree checks stop on local edits. After selecting the companion
+heads, build and run the regression from this checkout. In a dedicated
+terminal, select a temporary CLI home so package bindings come from this source
+tree. `--no-update-check` skips remote freshness checks for the selected PR heads:
+
+```bash
+cargo build --workspace
+ROBONIX_HOME="$(mktemp -d)"
+export ROBONIX_HOME
+export PATH="$PWD/target/debug:$PATH"
+rbnx setup "$PWD"
+rbnx build -f examples/webots/robonix_manifest.yaml --no-update-check
+python3 testing/demo_health_dependencies.py
+```
+
+To review an Explore change from a separate checkout, use the same terminal to
+build that package and select its path explicitly. The default remains the
+Webots cache checkout:
+
+```bash
+rbnx build -p /path/to/skill-explore-rbnx
+python3 testing/demo_health_dependencies.py --explore-path /path/to/skill-explore-rbnx
+```
+
+The script needs `grpcio`, `protobuf`, and `PyYAML` in its Python environment
+and uses the generated Mapping bindings. It also needs Linux with Python
+`pidfd` support, `grpcurl`, and access to the running Lite simulator through
+Docker. `ROBONIX_SIM_CONTAINER` selects the container when its name differs
+from `robonix_tiago_sim`.
+
+The temporary deployment uses `slam_toolbox`, the same lidar and odometry
+provider bindings as the Webots manifest, and the upstream backend defaults.
+The selected Mapping checkout must support `slam_toolbox`; the fixture copies
+only the deployment-owned Nav2 parameters and needs no RTAB-Map parameter file.
+
+The fixture uses Atlas `50051`, Executor `50061`, Pilot `50071`, Soma `50091`,
+Vitals `50093`, and a local fake VLM on `51090`. It refuses occupied ports.
+It supplies its own model configuration and a unique health fault file inside
+the simulator container. It also writes an isolated `ROBONIX_HOME` configuration
+for this source tree, so a globally configured older checkout cannot supply the
+wrong capability registry. Build the packages with this tree's CLI configuration
+to regenerate the `ExecuteStreamInput` Python bindings.
+
+The deterministic model reads its task id from Pilot's current task status
+board. Each response uses `message_updates`, `rtdl_parent_task_id`, and
+`task_updates`; a dispatched tree belongs to that task. Analysis-only replies
+wait without closing a task whose tree still runs, and mark it `done` after
+its tree ends. Each ask has one open task; unexpected task boards fail the
+fixture instead of guessing an id.
+
+1. **Blocked model.** Start a real Explore task through Pilot and a separate
+   software plan using an MCP stdio worker. After warming the dependency
+   graph, inject lidar `ERROR`. The fake model holds every follow-up reply
+   behind a `threading.Event` and never emits `cancel_plan`. The target plan
+   must leave Executor's active table and have a Vitals log confirming completed
+   cancellation within **8 seconds of starting fault injection**, while the
+   original software operation remains running and
+   uncancelled. Only after observing the stop does the script release model
+   replies. The existing `impact_json` in Pilot's requests must eventually
+   include `tiago_lidar`, `mapping`, `nav2`, and `explore` with the recorded
+   Mapping-to-lidar path. Its `candidate_plans` may already be empty. After
+   stopping, the script explicitly submits an analysis-only `rbnx ask` to
+   collect refreshed evidence; the fake model returns only an empty sequence
+   outside the admission check below.
+2. **Paused Pilot.** Verify the fixture's Pilot PID against its boot state,
+   parent, executable, boot identity, and process start time, then send
+   `SIGSTOP` through a pinned pidfd. Submit another task to the same Explore
+   capability through Executor's `ExecuteStream` RPC. Both direct fixture plans
+   use START/NODE/END, exercising the same scheduler as Pilot. Mark only the fixture's lidar
+   instance terminated before removing its channels, then inject another health
+   fault after graph refresh. The target must stop within the same 8-second
+   limit while Pilot remains paused and software work continues. A `finally`
+   block sends `SIGCONT`. A new fixture-owned analysis-only `rbnx ask` then
+   obtains Pilot's existing impact report, which must retain Mapping's
+   `evidence: "last_known"` and lidar dependency path. This does not depend
+   on the first ask or its session remaining active.
+3. **Reject unsafe model actions.** Keep the fault present after Pilot resumes.
+   Enable the fake model's admission flag and start a fresh fixture-owned ask.
+   The model returns the same affected Explore operation twice, including the
+   corrective retry, and emits no cancellation. The ask must finish within
+   15 seconds with `Vitals blocked this plan` in its final output. A streamed
+   operator prefix may produce a Plan event, but no affected capability node
+   may appear in that event. The script continuously checks that no Explore operation enters
+   Executor's active table, then checks the appended Executor log for any
+   Explore dispatch and the Vitals log for cancellation of a newly admitted
+   plan. These checks reject execution followed by fast cancellation. The
+   model allows at most two unsafe responses and returns empty sequences
+   afterward, so the fixture cannot create an unbounded unsafe retry loop.
+4. **Fault during a partial reply.** Recover first, then send a sequence prefix
+   with one harmless software call. Wait until the active table confirms that
+   call completed while its parent remains unsealed, then inject a lidar fault.
+   Once Pilot has observed the fault, release the model's later Explore call.
+   Verify that it never dispatches and the completed software prefix never
+   replays. The record distinguishes a tail written by the fixture from a
+   reply interrupted before the tail could be sent. Unrelated software must
+   continue running.
+
+Each recovery must report lidar healthy and leave stopped hardware work
+inactive for a further five seconds while software work continues. The sensor
+fault helper has no WARN profile, so this demo does not inject WARN; unit tests
+cover the WARN/UNKNOWN cases.
+
+The terminal prints stage markers and cancellation latency. The temporary
+artifact directory contains `boot.log`, `ask.log`, and `verification.json`,
+including ordered fault/stop/model-release timestamps, model requests, and
+the original impact reports. Admission evidence includes both unsafe model
+replies, active-table samples, and the ask/Executor/Vitals log increments;
+the full ask output remains in `ask.log`. A failed run also writes its error and any
+evidence collected before cleanup. The assertions require local plan completion
+and Vitals' confirmed control result, which includes terminal async run status.
+They do not observe physical stopping; prompt evidence is checked separately.
+An 8-second timeout is
+a failed demonstration, not a successful cancellation request.
+
+Cleanup cancels only fixture-owned plans, reaps every ask process, resumes its
+Pilot, shuts down the temporary deployment, and removes its unique fault file. Webots stays running.
+This is simulated health injection, not a physical sensor failure.
 
 To tear everything down: Ctrl-C the `rbnx boot` terminal, OR from
 any other shell:
@@ -215,5 +427,7 @@ Capabilities are exposed to the LLM as `<provider_id>.<area>_<leaf>`
 server inside each driver still registers tools by leaf name.
 
 Pilot replans after each tree's results arrive. The model reports progress
-in `task_update`: `in_progress` while steps remain, `done` once its
-`success_criterion` holds.
+in `task_updates`, identifying each entry by `task_id`: `in_progress` while
+steps remain, `done` once its `success_criterion` holds and its trees have
+ended. Each dispatched tree names its task in `rtdl_parent_task_id`;
+analysis-only replies use `null`.
