@@ -20,7 +20,8 @@ mod lifecycle;
 mod mock_soma;
 pub mod module_health;
 mod module_health_poll;
-mod pb;
+use robonix_vitals::pb;
+mod safety_stop;
 mod service;
 mod soma_ingest;
 mod subprocess;
@@ -215,6 +216,12 @@ async fn main() -> Result<()> {
         cfg.id.clone(),
         svc.clone(),
         cfg.expected_modules.clone(),
+    );
+    safety_stop::spawn(
+        atlas.clone(),
+        cfg.id.clone(),
+        svc.clone(),
+        lifecycle.subscribe_shutdown(),
     );
 
     let soma_rules: Vec<soma_ingest::SomaThresholdRule> =

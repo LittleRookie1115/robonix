@@ -15,16 +15,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
 
-/// Component health is nominal.
-pub const HEALTH_OK: u32 = 0;
-/// Component health is degraded but functional.
-pub const HEALTH_WARN: u32 = 1;
-/// Component health requires attention.
-pub const HEALTH_ERROR: u32 = 2;
-/// Component data is stale (sensor / stream timed out).
-pub const HEALTH_STALE: u32 = 3;
-/// No health sample has been reported for the component.
-pub const HEALTH_UNKNOWN: u32 = 4;
+pub use robonix_vitals::component_health::{
+    HEALTH_ERROR, HEALTH_OK, HEALTH_STALE, HEALTH_UNKNOWN, HEALTH_WARN,
+};
 
 /// Keep the last known component states and expire them when Soma stops
 /// refreshing the health stream or omits a previously reported component.
@@ -555,6 +548,7 @@ pub fn snapshot_to_vitals(
         power: Some(power_state(snapshot)),
         components,
         bodies: body_healths(snapshot),
+        ..Default::default()
     }
 }
 

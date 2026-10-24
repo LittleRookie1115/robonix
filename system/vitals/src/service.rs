@@ -41,6 +41,7 @@ struct PrevComponentState {
 /// Tracks per-component health to only push on state transitions (OK↔WARN↔ERROR).
 struct VitalsState {
     latest: VitalsSnapshot,
+    revision: u64,
     /// Sender for StreamVitals. Each subscriber gets a new Receiver.
     broadcast_tx: tokio::sync::broadcast::Sender<VitalsSnapshot>,
     /// Previous health per component name, keyed by name.
@@ -62,6 +63,9 @@ struct VitalsState {
 pub struct VitalsServiceImpl {
     state: Arc<RwLock<VitalsState>>,
     module_health: Arc<RwLock<ModuleHealthStore>>,
+    snapshot_changed: Arc<tokio::sync::Notify>,
+    dependencies: Arc<RwLock<robonix_vitals::health_dependencies::HealthDependencies>>,
+    active_plans: Arc<RwLock<Option<String>>>,
     #[allow(dead_code)] // Phase 3 will use for uptime in snapshot metadata
     start_time: Instant,
 }
@@ -83,7 +87,9 @@ impl VitalsServiceImpl {
                     }),
                     components: vec![],
                     bodies: vec![],
+                    dependency_report_json: String::new(),
                 },
+                revision: 0,
                 broadcast_tx,
                 prev_health: HashMap::new(),
                 prev_body_state: HashMap::new(),
@@ -93,6 +99,9 @@ impl VitalsServiceImpl {
                 first_body: true,
             })),
             module_health: Arc::new(RwLock::new(ModuleHealthStore::new())),
+            snapshot_changed: Arc::new(tokio::sync::Notify::new()),
+            dependencies: Arc::new(RwLock::new(Default::default())),
+            active_plans: Arc::new(RwLock::new(None)),
             start_time: Instant::now(),
         }
     }
@@ -102,6 +111,7 @@ impl VitalsServiceImpl {
     /// or signal membership changes, including the first collected snapshot.
     pub async fn update_snapshot(&self, snapshot: VitalsSnapshot) {
         let mut state = self.state.write().await;
+        state.revision = state.revision.wrapping_add(1);
 
         // Check for health state transitions.
         let names: std::collections::HashSet<_> = snapshot
@@ -347,12 +357,56 @@ impl VitalsServiceImpl {
                 log::info!("[vitals] {} | {}", voltage_str, non_ok.join(" "));
             }
             let _ = state.broadcast_tx.send(snapshot);
+            self.snapshot_changed.notify_one();
+        }
+    }
+
+    pub fn snapshot_changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.snapshot_changed)
+    }
+
+    pub fn dependencies(
+        &self,
+    ) -> Arc<RwLock<robonix_vitals::health_dependencies::HealthDependencies>> {
+        Arc::clone(&self.dependencies)
+    }
+
+    pub async fn update_active_plans(&self, plans: Option<String>) {
+        *self.active_plans.write().await = plans;
+    }
+
+    pub async fn publish_dependency_report(&self) {
+        let (snapshot, revision) = {
+            let state = self.state.read().await;
+            (state.latest.clone(), state.revision)
+        };
+        let snapshot = self.annotate_snapshot(snapshot).await;
+        let mut state = self.state.write().await;
+        if state.revision == revision
+            && state.latest.dependency_report_json != snapshot.dependency_report_json
+        {
+            state
+                .latest
+                .dependency_report_json
+                .clone_from(&snapshot.dependency_report_json);
+            let _ = state.broadcast_tx.send(snapshot);
         }
     }
 
     /// Return the latest cached snapshot.
     pub async fn latest_snapshot(&self) -> VitalsSnapshot {
-        self.state.read().await.latest.clone()
+        let snapshot = self.state.read().await.latest.clone();
+        self.annotate_snapshot(snapshot).await
+    }
+
+    async fn annotate_snapshot(&self, mut snapshot: VitalsSnapshot) -> VitalsSnapshot {
+        let plans = self.active_plans.read().await;
+        snapshot.dependency_report_json = self
+            .dependencies
+            .read()
+            .await
+            .snapshot_report(&snapshot, plans.as_deref());
+        snapshot
     }
 
     /// Ingest one self-reported module health frame into Vitals' aggregate view.
@@ -537,21 +591,25 @@ impl RobonixSystemVitalsStream for VitalsServiceImpl {
         _request: Request<StreamVitalsRequest>,
     ) -> Result<Response<Self::StreamVitalsStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut broadcast_rx = {
+        let (current, mut broadcast_rx) = {
             let state = self.state.read().await;
-            // Send current snapshot immediately so the subscriber has initial state.
-            let current = state.latest.clone();
-            if tx.send(Ok(current)).await.is_err() {
-                log::warn!("[vitals] StreamVitals initial send failed (subscriber disconnected)");
-            }
-            state.broadcast_tx.subscribe()
+            (state.latest.clone(), state.broadcast_tx.subscribe())
         };
+        let current = self.annotate_snapshot(current).await;
+        if tx.send(Ok(current)).await.is_err() {
+            log::warn!("[vitals] StreamVitals initial send failed (subscriber disconnected)");
+        }
 
+        let service = self.clone();
         tokio::spawn(async move {
             loop {
                 match broadcast_rx.recv().await {
                     Ok(snapshot) => {
-                        if tx.send(Ok(snapshot)).await.is_err() {
+                        if tx
+                            .send(Ok(service.annotate_snapshot(snapshot).await))
+                            .await
+                            .is_err()
+                        {
                             break; // subscriber disconnected
                         }
                     }
@@ -572,6 +630,77 @@ impl RobonixSystemVitalsStream for VitalsServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dependency_publication_does_not_replay_an_older_health_frame() {
+        let service = VitalsServiceImpl::new();
+        let mut frames = service.state.read().await.broadcast_tx.subscribe();
+        let dependencies = service.dependencies();
+        let guard = dependencies.write().await;
+        let publishing = service.clone();
+        let task = tokio::spawn(async move { publishing.publish_dependency_report().await });
+        tokio::task::yield_now().await;
+        service
+            .update_snapshot(VitalsSnapshot {
+                components: vec![crate::pb::vitals::ComponentHealth {
+                    name: "body/camera".into(),
+                    health: crate::soma_ingest::HEALTH_ERROR,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await;
+        drop(guard);
+        task.await.unwrap();
+        assert_eq!(
+            frames.recv().await.unwrap().components[0].health,
+            crate::soma_ingest::HEALTH_ERROR
+        );
+        assert!(matches!(
+            frames.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_queued_error_is_not_replaced_by_a_later_recovery() {
+        let service = VitalsServiceImpl::new();
+        let healthy = VitalsSnapshot {
+            components: vec![crate::pb::vitals::ComponentHealth {
+                name: "body/camera".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        service.update_snapshot(healthy.clone()).await;
+        let mut frames = service
+            .stream_vitals(Request::new(StreamVitalsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        tokio_stream::StreamExt::next(&mut frames)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut failed = healthy.clone();
+        failed.components[0].health = crate::soma_ingest::HEALTH_ERROR;
+        service.update_snapshot(failed).await;
+        service.update_snapshot(healthy).await;
+        for severity in [
+            crate::soma_ingest::HEALTH_ERROR,
+            crate::soma_ingest::HEALTH_OK,
+        ] {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio_stream::StreamExt::next(&mut frames),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(frame.components[0].health, severity);
+        }
+    }
 
     #[tokio::test]
     /// Removing a signal broadcasts the new snapshot instead of hiding recovery.

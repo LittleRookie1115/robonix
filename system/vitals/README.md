@@ -1,5 +1,15 @@
 # robonix-vitals
 
+`GetVitals` and `StreamVitals` include the monitor's dependency assessment in
+`VitalsSnapshot.dependency_report_json`. Vitals owns Soma export bindings,
+Atlas dependency traversal, retained fault evidence, and matching against
+Executor's active plans. Pilot consumes this result rather than recomputing it.
+The JSON contains the bounded explanation and exact provider/contract admission
+data; an empty or unavailable report does not certify hardware actions as safe.
+The explanation is limited to 24 KiB, and the full assessment to 2 MiB.
+Stream subscribers receive each queued health transition, including an error
+followed immediately by recovery.
+
 Monitors robot onboard health (CPU/GPU/NVMe temperature, voltage) and body (joint motors), evaluates thresholds, and reports via gRPC.
 
 Vitals consumes the unified health stream (`SomaHealthSnapshot`) from Soma
@@ -45,6 +55,51 @@ report an explicit `online=false`, communication
 failure, or fault for Vitals to detect an individual device that stops producing
 data while its health stream remains alive.
 
+`StreamVitals` sends the initial snapshot and subsequent health transitions.
+Pilot consumes that stream, reads the cached snapshot before planning, and
+immediately steers active sessions on health changes.
+
+Vitals also runs an independent control loop. For component `ERROR` or `STALE`,
+it joins Soma's component `exports` with Atlas's recorded consumer dependencies
+and Executor's active steps, then calls the existing `ControlPlan(cancel)` for
+each matching plan. This works without a Pilot session and while Pilot or its
+model is stalled. Dependency data refreshes every two seconds; cached health
+changes wake the control loop immediately, with a 250 ms fallback poll. These
+intervals are not a real-time or physical stopping guarantee.
+
+Each cancellation stops the affected plan, including its other branches.
+Unrelated plans continue. `WARN` and startup `UNKNOWN` do not automatically
+cancel plans. Control requests have a two-second deadline, up to eight can run
+concurrently, and pending requests retry at one-second intervals. Recovery
+does not restart canceled work. Failed control or remote cancellation is
+logged as `stop unconfirmed`, never as a confirmed physical stop.
+
+Vitals owns the dependency resolver and sends its result to Pilot. Monitoring and lifecycle
+control channels do not count as functional input dependencies. Lost-provider
+edges remain available as cached evidence, pinned while the fault persists.
+Closing a fault-relevant input also retains that evidence until recovery.
+Missing component bindings, unavailable graph/Executor data, and bounded
+table overflow are reported as incomplete coverage. Only confirmed matches
+are canceled; no component alert invokes global `cancel_all`. The active
+table and cancellation capability must come from the same, uniquely discovered
+Executor. The Soma body lookup must also resolve to one provider. A deployment
+with multiple Somas or Executors needs an explicit routing policy before this
+control loop can select them.
+
+The active table includes nodes accepted through `ExecuteStream` before the
+model has closed its operators or sent END. Vitals matches those accepted
+nodes on every control pass. `ControlPlan` now carries only action, plan id
+and wait duration; a successful response without `completed=true` remains
+pending and is retried. An accepted stream prefix does not certify its later
+nodes as healthy: Pilot checks each capability node before submitting it.
+
+This is software cancellation, not a hardware emergency stop. A driver or
+service must implement cancellation that actually stops its remote action;
+closing a synchronous request alone cannot guarantee that a device stopped.
+Deployments requiring a physical interlock must provide it independently.
+The mock Soma server has no component-to-provider YAML bindings, so a mock
+health alert alone cannot identify task dependencies for automatic control.
+
 ### Mock SOMA path (no SOMA needed)
 
 The `--mock-soma` flag starts an embedded gRPC server inside the Vitals process that
@@ -55,6 +110,14 @@ Optionally, `--mock-soma-arm piper` spawns `scripts/piper_bridge.py` as a subpro
 (stdin/stdout JSON) to merge real joint data into synthetic snapshots.
 
 ## Running
+
+Vitals uses `system/lifecycle.rs`, shared with Executor, Pilot, and Liaison,
+to serve `robonix/lifecycle/driver`. Startup calls `CMD_INIT` and
+`CMD_ACTIVATE` through that RPC before reporting readiness. Successful
+`CMD_SHUTDOWN` publishes `TERMINATED` and signals graceful gRPC shutdown,
+heartbeat termination, and the Soma freshness expiration task through the
+same watch channel. Expiration stops even while waiting for a health-state
+lock. Failed Atlas transitions return `ok=false` and leave the server running.
 
 For a screen-recording-friendly end-to-end health demo, see
 [`VITALS_HEALTH_DEMO.md`](VITALS_HEALTH_DEMO.md).
@@ -264,5 +327,3 @@ grpcurl -plaintext -d '{}' 127.0.0.1:50093 \
 grpcurl -plaintext -d '{}' 127.0.0.1:50092 \
   robonix.contracts.RobonixSystemSomaGetHealth/GetHealth
 ```
-
-The lifecycle Driver implementation is shared in `system/lifecycle.rs`.
