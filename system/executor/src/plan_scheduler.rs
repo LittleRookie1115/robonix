@@ -100,12 +100,7 @@ impl PlanScheduler {
         self.cancelled = true;
         self.input.seal();
         self.runtime
-            .cancel_plan_control(
-                &self.input.plan().plan_id,
-                0,
-                &self.provider_id,
-                &mut self.atlas.clone(),
-            )
+            .cancel_execution(&self.input.plan().plan_id, &self.provider_id, &self.atlas)
             .await;
     }
 

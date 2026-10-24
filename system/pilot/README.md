@@ -200,3 +200,5 @@ advancing while nothing will run, so the reply is rejected
 (`empty_dispatch_problem`) and the model gets one corrective round; if it repeats,
 the turn ends with what the model said. An empty sequence with no task update is
 an answer or a question to the user.
+
+The lifecycle Driver implementation is shared in `system/lifecycle.rs`.

@@ -61,6 +61,13 @@ User
 All six contracts are registered by the `liaison` provider id, which also
 declares the shared lifecycle Driver contract.
 
+Liaison uses the implementation in `system/lifecycle.rs`, shared with
+Executor, Pilot, and Vitals. Startup calls `CMD_INIT` and `CMD_ACTIVATE`
+through the Driver RPC before reporting readiness. Successful
+`CMD_SHUTDOWN` publishes `TERMINATED`, stops heartbeats, and requests
+graceful gRPC shutdown. Failed Atlas transitions return `ok=false` and leave
+the server running.
+
 A voice turn normally ends on the ASR backend's own end-of-utterance
 detection. Continuous background noise can keep that from ever firing, which
 strands the speaker until `record_seconds` expires, so `voice/finish` offers

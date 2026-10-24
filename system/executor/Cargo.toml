@@ -25,6 +25,9 @@ uuid.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 robonix-atlas = { path = "../atlas" }
 
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }
 

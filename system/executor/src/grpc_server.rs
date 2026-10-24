@@ -47,6 +47,10 @@ pub struct ExecutorServiceImpl {
     pub(crate) runtime: PlanRuntime,
     /// Immutable verification timing and routing rules applied to submitted plans.
     pub(crate) verification: Arc<VerificationPolicy>,
+    /// Serializes admission with shutdown so accepted streams are included in the drain.
+    shutting_down: Arc<tokio::sync::Mutex<bool>>,
+    /// Interrupts incoming execution streams that have not yet supplied START.
+    admission_closed: Arc<tokio::sync::Notify>,
 }
 
 impl ExecutorServiceImpl {
@@ -61,7 +65,18 @@ impl ExecutorServiceImpl {
             provider_id,
             runtime: PlanRuntime::default(),
             verification,
+            shutting_down: Arc::new(tokio::sync::Mutex::new(false)),
+            admission_closed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Reject new work before cancelling and confirming all currently owned executions.
+    pub(crate) async fn shutdown(&self) -> bool {
+        *self.shutting_down.lock().await = true;
+        self.admission_closed.notify_waiters();
+        self.runtime
+            .cancel_all_plans(&self.provider_id, &mut self.atlas.clone())
+            .await
     }
 }
 
@@ -75,6 +90,10 @@ impl RobonixSystemExecutorExecute for ExecutorServiceImpl {
         request: Request<Plan>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         let input = PlanInput::from_plan(request.into_inner()).map_err(Status::invalid_argument)?;
+        let admission = self.shutting_down.lock().await;
+        if *admission {
+            return Err(Status::unavailable("Executor is shutting down"));
+        }
         Ok(Response::new(
             PlanScheduler::start(
                 self.atlas.clone(),
@@ -99,12 +118,24 @@ impl RobonixSystemExecutorExecuteStream for ExecutorServiceImpl {
         request: Request<Streaming<ExecuteStreamInput>>,
     ) -> Result<Response<Self::ExecuteStreamStream>, Status> {
         let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("missing START"))?;
+        let closed = self.admission_closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if *self.shutting_down.lock().await {
+            return Err(Status::unavailable("Executor is shutting down"));
+        }
+        let first = tokio::select! {
+            biased;
+            _ = &mut closed => return Err(Status::unavailable("Executor is shutting down")),
+            first = stream.message() => first?,
+        }
+        .ok_or_else(|| Status::invalid_argument("missing START"))?;
         let mut input = PlanInput::default();
         input.accept(first).map_err(Status::invalid_argument)?;
+        let admission = self.shutting_down.lock().await;
+        if *admission {
+            return Err(Status::unavailable("Executor is shutting down"));
+        }
         Ok(Response::new(
             PlanScheduler::start(
                 self.atlas.clone(),
@@ -166,15 +197,15 @@ impl RobonixSystemExecutorControlPlan for ExecutorServiceImpl {
                 } else {
                     request.wait_ms
                 };
-                let (completed, message) = self
+                let outcome = self
                     .runtime
                     .cancel_plan_control(&request.plan_id, wait_ms, &self.provider_id, &mut atlas)
                     .await;
                 ControlPlanResponse {
-                    success: true,
-                    completed,
-                    message,
-                    error: String::new(),
+                    success: outcome.error.is_empty(),
+                    completed: outcome.completed,
+                    message: outcome.message,
+                    error: outcome.error,
                 }
             }
             "cancel_all" => {
@@ -183,17 +214,15 @@ impl RobonixSystemExecutorControlPlan for ExecutorServiceImpl {
                 } else {
                     request.wait_ms
                 };
-                let (target_count, completed) = self
+                let (_, outcome) = self
                     .runtime
                     .cancel_all_plans_except(&self.provider_id, &mut atlas, None, wait_ms)
                     .await;
                 ControlPlanResponse {
-                    success: true,
-                    completed,
-                    message: format!(
-                        "Cancellation requested for all RTDL plans; target_count={target_count}, completed={completed}."
-                    ),
-                    error: String::new(),
+                    success: outcome.error.is_empty(),
+                    completed: outcome.completed,
+                    message: outcome.message,
+                    error: outcome.error,
                 }
             }
             action => ControlPlanResponse {

@@ -40,13 +40,74 @@ use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::plan_runtime::PlanRuntime;
 use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
-use robonix_scribe::{debug, info};
+use robonix_scribe::{debug, info, warn};
 
 const CMD_ACTIVATE: u32 = 1;
 const DRIVER_ACTIVATE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEPLOY_CONSUMER_ID: &str = "com.robonix.executor.skill_activate";
+const CHANNEL_RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
 
 static ACTIVATED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Release an Atlas binding even when its owning dispatch future is dropped.
+pub(crate) struct CapabilityChannel {
+    /// Independent client used to release the binding after its dispatch is dropped.
+    atlas: AtlasClient,
+    /// Owned Atlas binding, cleared only after explicit release completes.
+    channel_id: Option<String>,
+}
+
+impl CapabilityChannel {
+    /// Own a client clone so cleanup survives cancellation of the caller.
+    pub(crate) fn new(atlas: &AtlasClient, channel_id: String) -> Self {
+        Self {
+            atlas: atlas.clone(),
+            channel_id: Some(channel_id),
+        }
+    }
+
+    /// Keep ownership until cleanup finishes so cancellation during release
+    /// still invokes the drop fallback.
+    pub(crate) async fn release(mut self) {
+        if let Some(channel_id) = self.channel_id.as_deref() {
+            Self::disconnect(&mut self.atlas, channel_id).await;
+            self.channel_id = None;
+        }
+    }
+
+    /// Cleanup has its own deadline so an unavailable Atlas cannot hold a
+    /// completed or canceled capability call open.
+    async fn disconnect(atlas: &mut AtlasClient, channel_id: &str) {
+        match tokio::time::timeout(
+            CHANNEL_RELEASE_TIMEOUT,
+            atlas.disconnect_capability(channel_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!("[executor] channel {channel_id} cleanup failed: {error:#}"),
+            Err(_) => warn!("[executor] channel {channel_id} cleanup timed out"),
+        }
+    }
+}
+
+impl Drop for CapabilityChannel {
+    /// Only channel cleanup outlives the dispatch; capability execution stays
+    /// owned by the caller's future.
+    fn drop(&mut self) {
+        let Some(channel_id) = self.channel_id.take() else {
+            return;
+        };
+        let mut atlas = self.atlas.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                Self::disconnect(&mut atlas, &channel_id).await;
+            });
+        } else {
+            warn!("[executor] channel {channel_id} cleanup unavailable: runtime stopped");
+        }
+    }
+}
 
 fn mark_activated(provider_id: &str) -> bool {
     let mut g = ACTIVATED.lock().expect("ACTIVATED poisoned");
@@ -116,6 +177,7 @@ pub async fn dispatch_with_timeout(
             return error_result(call, format!("ConnectCapability failed: {e:#}"));
         }
     };
+    let channel = CapabilityChannel::new(atlas, channel_id);
 
     let result = match timeout {
         Some(duration) => match tokio::time::timeout(duration, mcp::execute(call, &endpoint)).await
@@ -129,7 +191,7 @@ pub async fn dispatch_with_timeout(
         None => mcp::execute(call, &endpoint).await,
     };
 
-    let _ = atlas.disconnect_capability(&channel_id).await;
+    channel.release().await;
     result
 }
 
@@ -195,6 +257,7 @@ async fn ensure_skill_active(atlas: &mut AtlasClient, provider_id: &str) -> Resu
         )
         .await
         .with_context(|| format!("ConnectCapability({driver_contract})"))?;
+    let channel = CapabilityChannel::new(atlas, channel_id);
     let normalized = if endpoint.starts_with("http") {
         endpoint
     } else {
@@ -232,7 +295,7 @@ async fn ensure_skill_active(atlas: &mut AtlasClient, provider_id: &str) -> Resu
         Ok::<_, anyhow::Error>(resp.into_inner())
     }
     .await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
+    channel.release().await;
     let r = result?;
     if !r.ok {
         anyhow::bail!(

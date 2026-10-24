@@ -111,10 +111,20 @@ pub(crate) async fn execute_call(
         )
         .await;
 
-    let async_group = if call.provider_id == provider_id {
-        Ok(None)
-    } else {
-        async_registry::resolve_async_group(&mut atlas, &call.provider_id, &call.contract_id).await
+    let async_group = tokio::select! {
+        biased;
+        _ = runtime.wait_for_cancellation(&node.plan_id) => {
+            Err("plan canceled locally; physical stop is unconfirmed".to_string())
+        }
+        group = async {
+            if call.provider_id == provider_id {
+                Ok(None)
+            } else {
+                async_registry::resolve_async_group(
+                    &mut atlas, &call.provider_id, &call.contract_id,
+                ).await
+            }
+        } => group,
     };
 
     let (mut result, mut state) = match async_group {
@@ -134,9 +144,20 @@ pub(crate) async fn execute_call(
                 .await
         }
         Ok(None) => {
-            let r =
-                crate::dispatch::dispatch(call, &provider_id, &mut atlas, &runtime, &node.plan_id)
-                    .await;
+            let owns_cancellation = call.provider_id == provider_id
+                && call.contract_id == "robonix/system/executor/builtin/run_command";
+            let r = tokio::select! {
+                biased;
+                _ = runtime.wait_for_cancellation(&node.plan_id), if !owns_cancellation => {
+                    crate::dispatch::error_result(
+                        call,
+                        "plan canceled locally; synchronous dispatch future dropped; physical stop is unconfirmed".into(),
+                    )
+                }
+                result = crate::dispatch::dispatch(
+                    call, &provider_id, &mut atlas, &runtime, &node.plan_id,
+                ) => result,
+            };
             let cancelled = runtime.is_cancelled(&node.plan_id).await;
             let state = leaf_terminal_state(r.success, cancelled);
             (r, state)
@@ -187,16 +208,18 @@ pub(crate) async fn execute_call(
     }
 
     if eligible_for_verification {
-        result = verification::verify_result(
-            verification.as_ref(),
-            call,
-            &node,
-            result,
-            &provider_id,
-            &mut atlas,
-            &runtime,
-        )
-        .await;
+        result = tokio::select! {
+            biased;
+            _ = runtime.wait_for_cancellation(&node.plan_id) => {
+                crate::dispatch::error_result(
+                    call,
+                    "plan canceled locally during verification; physical stop is unconfirmed".into(),
+                )
+            }
+            verified = verification::verify_result(
+                verification.as_ref(), call, &node, result, &provider_id, &mut atlas, &runtime,
+            ) => verified,
+        };
         if !result.success {
             state = RtdlNodeStateEnum::Failed as u32;
         }

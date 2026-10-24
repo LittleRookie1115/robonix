@@ -264,3 +264,5 @@ grpcurl -plaintext -d '{}' 127.0.0.1:50093 \
 grpcurl -plaintext -d '{}' 127.0.0.1:50092 \
   robonix.contracts.RobonixSystemSomaGetHealth/GetHealth
 ```
+
+The lifecycle Driver implementation is shared in `system/lifecycle.rs`.

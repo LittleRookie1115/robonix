@@ -13,10 +13,14 @@
 //      `ConnectCapability(provider_id, contract_id, MCP)` on atlas.
 
 mod active_plans;
+#[cfg(test)]
+mod cancellation_tests;
 mod capability_execution;
 mod config;
 mod dispatch;
 mod grpc_server;
+#[path = "../../lifecycle.rs"]
+mod lifecycle;
 mod pb;
 mod plan_input;
 mod plan_scheduler;
@@ -32,6 +36,11 @@ use clap::Parser;
 use config::{Args, EXECUTOR_NAMESPACE, ExecutorConfig};
 use dispatch::builtin::BUILTINS;
 use grpc_server::ExecutorServiceImpl;
+use lifecycle::{
+    CMD_ACTIVATE, CMD_INIT, SHARED_DRIVER_CONTRACT, SystemLifecycleDriver, call_startup_driver,
+    connect_startup_driver, startup_driver_endpoint, wait_for_driver_shutdown,
+};
+use pb::contracts::robonix_lifecycle_driver_server::RobonixLifecycleDriverServer;
 use pb::contracts::robonix_system_executor_cancel_all_plans_server::RobonixSystemExecutorCancelAllPlansServer;
 use pb::contracts::robonix_system_executor_control_plan_server::RobonixSystemExecutorControlPlanServer;
 use pb::contracts::robonix_system_executor_execute_server::RobonixSystemExecutorExecuteServer;
@@ -43,6 +52,23 @@ use robonix_atlas::pb as atlas_pb;
 use robonix_scribe::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn executor_lifecycle(
+    atlas: AtlasClient,
+    provider_id: String,
+    executor: ExecutorServiceImpl,
+) -> SystemLifecycleDriver {
+    SystemLifecycleDriver::new(atlas, provider_id).with_shutdown(move || {
+        let executor = executor.clone();
+        async move {
+            anyhow::ensure!(
+                executor.shutdown().await,
+                "Executor plans did not finish cancellation before shutdown"
+            );
+            Ok(())
+        }
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -191,15 +217,19 @@ async fn main() -> Result<()> {
         BUILTINS.len()
     );
 
-    // Executor has no Driver lifecycle handshake — it's ready as soon as
-    // the gRPC server is up. Push ACTIVE so `rbnx caps` doesn't show the
-    // legacy-fallback INACTIVE forever.
-    if let Err(e) = atlas
-        .set_lifecycle_state(&cfg.id, atlas_pb::LifecycleState::StateActive, "")
-        .await
-    {
-        warn!("SetLifecycleState(ACTIVE) failed: {e:#}");
-    }
+    atlas
+        .declare_capability(
+            &cfg.id,
+            SHARED_DRIVER_CONTRACT,
+            atlas_pb::Transport::Grpc,
+            &advertised,
+            atlas_client::grpc_params(
+                "capabilities/lifecycle/driver.v1.toml",
+                "robonix.contracts.RobonixLifecycleDriver",
+                "/robonix.contracts.RobonixLifecycleDriver/Driver",
+            ),
+        )
+        .await?;
 
     // Atlas evicts providers after ~60s without a heartbeat. Send one every
     // 20s so we stay registered for the lifetime of the process.
@@ -226,19 +256,42 @@ async fn main() -> Result<()> {
         "loaded {} executor verification rule(s)",
         verification.len()
     );
-    let svc = ExecutorServiceImpl::new(atlas, cfg.id.clone(), verification);
+    let svc = ExecutorServiceImpl::new(atlas.clone(), cfg.id.clone(), verification);
+    let lifecycle = executor_lifecycle(atlas, cfg.id.clone(), svc.clone());
+    let shutdown = lifecycle.subscribe_shutdown();
     info!("executor gRPC on {listen_addr}");
-    info!("robonix-executor ready on {listen_addr}");
-
-    tonic::transport::Server::builder()
-        .add_service(RobonixSystemExecutorExecuteServer::new(svc.clone()))
-        .add_service(RobonixSystemExecutorExecuteStreamServer::new(svc.clone()))
-        .add_service(RobonixSystemExecutorCancelAllPlansServer::new(svc.clone()))
-        .add_service(RobonixSystemExecutorControlPlanServer::new(svc.clone()))
-        .add_service(RobonixSystemExecutorListActivePlansServer::new(svc.clone()))
-        .add_service(RobonixSystemExecutorGetHealthServer::new(svc))
-        .serve(listen_addr)
+    let mut server_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RobonixLifecycleDriverServer::new(lifecycle))
+            .add_service(RobonixSystemExecutorExecuteServer::new(svc.clone()))
+            .add_service(RobonixSystemExecutorExecuteStreamServer::new(svc.clone()))
+            .add_service(RobonixSystemExecutorCancelAllPlansServer::new(svc.clone()))
+            .add_service(RobonixSystemExecutorControlPlanServer::new(svc.clone()))
+            .add_service(RobonixSystemExecutorListActivePlansServer::new(svc.clone()))
+            .add_service(RobonixSystemExecutorGetHealthServer::new(svc))
+            .serve_with_shutdown(listen_addr, wait_for_driver_shutdown(shutdown))
+            .await
+    });
+    let startup_endpoint = startup_driver_endpoint(listen_addr);
+    let mut startup_driver = tokio::select! {
+        client = connect_startup_driver(&startup_endpoint) => client?,
+        result = &mut server_task => {
+            result.context("join Executor gRPC server")?
+                .context("Executor gRPC server failed before readiness")?;
+            anyhow::bail!("Executor gRPC server stopped before readiness");
+        }
+    };
+    call_startup_driver(&mut startup_driver, CMD_INIT)
         .await
+        .context("initialize Executor lifecycle")?;
+    call_startup_driver(&mut startup_driver, CMD_ACTIVATE)
+        .await
+        .context("activate Executor lifecycle")?;
+    drop(startup_driver);
+    info!("robonix-executor ready on {listen_addr}");
+    server_task
+        .await
+        .context("join Executor gRPC server")?
         .context("executor gRPC server failed")?;
 
     Ok(())

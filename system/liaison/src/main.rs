@@ -23,15 +23,20 @@
 
 mod access;
 mod handsfree;
+#[path = "../../lifecycle.rs"]
+mod lifecycle;
 mod pb;
 mod voice;
 
 use access::{AccessControlConfig, AccessDecision};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use lifecycle::{
+    CMD_ACTIVATE, CMD_INIT, SHARED_DRIVER_CONTRACT, SystemLifecycleDriver, call_startup_driver,
+    connect_startup_driver, startup_driver_endpoint, wait_for_driver_shutdown,
+};
 use pb::contracts::{
-    robonix_lifecycle_driver_client::RobonixLifecycleDriverClient,
-    robonix_lifecycle_driver_server::{RobonixLifecycleDriver, RobonixLifecycleDriverServer},
+    robonix_lifecycle_driver_server::RobonixLifecycleDriverServer,
     robonix_system_liaison_handsfree_events_server::{
         RobonixSystemLiaisonHandsfreeEvents, RobonixSystemLiaisonHandsfreeEventsServer,
     },
@@ -57,7 +62,6 @@ use pb::liaison::{
     GetHandsfreeStatusResponse, SetHandsfreeRequest, SetHandsfreeResponse,
     StartVoiceSessionRequest, VoiceEvent, WatchHandsfreeEventsRequest,
 };
-use pb::lifecycle::{DriverRequest, DriverResponse};
 use pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use pb::pilot::{CapabilityCall, PilotEvent, Plan, Task};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
@@ -86,154 +90,6 @@ const LIAISON_HANDSFREE_SET_TOML: &str =
     "capabilities/system/liaison/handsfree/set_enabled.v1.toml";
 const LIAISON_HANDSFREE_STATUS_TOML: &str = "capabilities/system/liaison/handsfree/status.v1.toml";
 const LIAISON_HANDSFREE_EVENTS_TOML: &str = "capabilities/system/liaison/handsfree/events.v1.toml";
-const SHARED_DRIVER_CONTRACT: &str = "robonix/lifecycle/driver";
-const CMD_INIT: u32 = 0;
-const CMD_ACTIVATE: u32 = 1;
-const CMD_DEACTIVATE: u32 = 2;
-const CMD_SHUTDOWN: u32 = 3;
-
-#[derive(Clone)]
-struct SystemLifecycleDriver {
-    atlas: AtlasClient,
-    provider_id: String,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-}
-
-impl SystemLifecycleDriver {
-    fn new(atlas: AtlasClient, provider_id: String) -> Self {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        Self {
-            atlas,
-            provider_id,
-            shutdown_tx,
-        }
-    }
-
-    /// Apply one no-op lifecycle callback and publish its authoritative state
-    /// to Atlas. Unknown commands and rejected Atlas transitions are errors.
-    async fn transition(&self, command: u32) -> Result<&'static str> {
-        let (state, label) = lifecycle_target(command)
-            .ok_or_else(|| anyhow!("unknown lifecycle command code {command}"))?;
-        let mut atlas = self.atlas.clone();
-        atlas
-            .set_lifecycle_state(&self.provider_id, state, "")
-            .await
-            .with_context(|| format!("publish lifecycle state for '{}'", self.provider_id))?;
-        if command == CMD_SHUTDOWN {
-            self.shutdown_tx.send_replace(true);
-        }
-        Ok(label)
-    }
-
-    fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.shutdown_tx.subscribe()
-    }
-}
-
-#[tonic::async_trait]
-impl RobonixLifecycleDriver for SystemLifecycleDriver {
-    /// Serve the shared Driver RPC and report callback/transition failures in
-    /// the stable DriverResponse envelope used by launchers.
-    async fn driver(
-        &self,
-        request: Request<DriverRequest>,
-    ) -> std::result::Result<Response<DriverResponse>, Status> {
-        let response = match self.transition(request.into_inner().command).await {
-            Ok(state) => DriverResponse {
-                ok: true,
-                state: state.to_string(),
-                error: String::new(),
-            },
-            Err(error) => DriverResponse {
-                ok: false,
-                state: "error".to_string(),
-                error: format!("{error:#}"),
-            },
-        };
-        Ok(Response::new(response))
-    }
-}
-
-fn lifecycle_target(command: u32) -> Option<(atlas_pb::LifecycleState, &'static str)> {
-    match command {
-        CMD_INIT => Some((atlas_pb::LifecycleState::StateInactive, "inactive")),
-        CMD_ACTIVATE => Some((atlas_pb::LifecycleState::StateActive, "active")),
-        CMD_DEACTIVATE => Some((atlas_pb::LifecycleState::StateInactive, "inactive")),
-        CMD_SHUTDOWN => Some((atlas_pb::LifecycleState::StateTerminated, "terminated")),
-        _ => None,
-    }
-}
-
-/// Wait until Driver(CMD_SHUTDOWN) has published TERMINATED. A watch channel
-/// preserves a shutdown sent before this particular waiter starts polling.
-async fn wait_for_driver_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            return;
-        }
-    }
-}
-
-/// Return a loopback endpoint for an unspecified bind address so the process
-/// can self-dial without changing the endpoint it advertises through Atlas.
-fn startup_driver_endpoint(listen_addr: std::net::SocketAddr) -> String {
-    let ip = match listen_addr.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        }
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-        }
-        ip => ip,
-    };
-    std::net::SocketAddr::new(ip, listen_addr.port()).to_string()
-}
-
-/// Connect to this process's just-spawned Driver endpoint. Retries only the
-/// bounded bind/startup window; a connected endpoint is returned immediately.
-async fn connect_startup_driver(
-    endpoint: &str,
-) -> Result<RobonixLifecycleDriverClient<tonic::transport::Channel>> {
-    let endpoint = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match RobonixLifecycleDriverClient::connect(endpoint.clone()).await {
-            Ok(client) => return Ok(client),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => return Err(error).context("connect startup lifecycle Driver"),
-        }
-    }
-}
-
-/// Invoke one startup lifecycle command through the real generated Driver RPC
-/// and reject an `ok=false` response as a startup failure.
-async fn call_startup_driver(
-    client: &mut RobonixLifecycleDriverClient<tonic::transport::Channel>,
-    command: u32,
-) -> Result<String> {
-    let response = client
-        .driver(DriverRequest {
-            command,
-            config_json: "{}".to_string(),
-        })
-        .await
-        .context("call startup lifecycle Driver")?
-        .into_inner();
-    if !response.ok {
-        anyhow::bail!("startup lifecycle Driver failed: {}", response.error);
-    }
-    Ok(response.state)
-}
-
 /// `lib/system/pilot/msg/Task.msg` source: TEXT=0 AUDIO=1
 const INTENT_SOURCE_TEXT: u32 = 0;
 const INTENT_SOURCE_AUDIO: u32 = 1;
@@ -1046,7 +902,9 @@ fn plan_calls(plan: &Plan) -> Vec<&CapabilityCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecycle::CMD_SHUTDOWN;
     use pb::contracts::robonix_lifecycle_driver_client::RobonixLifecycleDriverClient;
+    use pb::lifecycle::DriverRequest;
     use robonix_atlas::service::{AtlasRegistry, serve_atlas};
     use std::net::SocketAddr;
 

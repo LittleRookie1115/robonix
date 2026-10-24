@@ -4,7 +4,7 @@
 use robonix_scribe::warn;
 use std::time::Duration;
 
-use crate::dispatch::{self, async_registry::AsyncGroup};
+use crate::dispatch::{self, CapabilityChannel, async_registry::AsyncGroup};
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, CapabilityCallResult};
 use crate::plan_runtime::{PlanRuntime, RunningAsyncCall};
@@ -17,6 +17,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Dispatch an async cap and poll status every 2s. The caller owns the single
 /// terminal event so successful work can be verified before it is published.
+/// Only polling is interruptible; initial dispatch must yield its run_id.
 pub async fn run_until_terminal(
     call: &CapabilityCall,
     group: &AsyncGroup,
@@ -25,6 +26,12 @@ pub async fn run_until_terminal(
     node: &NodeEventContext,
     runtime: &PlanRuntime,
 ) -> (CapabilityCallResult, u32) {
+    if runtime.is_cancelled(&node.plan_id).await {
+        return (
+            canceled_result(call, "plan canceled before async dispatch"),
+            RtdlNodeStateEnum::Canceled as u32,
+        );
+    }
     let initial = dispatch::dispatch(call, self_provider_id, atlas, runtime, &node.plan_id).await;
     if !initial.success {
         return (initial, RtdlNodeStateEnum::Failed as u32);
@@ -53,36 +60,49 @@ pub async fn run_until_terminal(
     interval.tick().await;
 
     loop {
-        interval.tick().await;
-        if runtime.is_cancelled(&node.plan_id).await {
-            runtime
-                .cancel_async_call_for_plan(&node.plan_id, &call.call_id, self_provider_id, atlas)
-                .await;
-            let result = canceled_result(call, "plan was cancelled");
+        let status_out = tokio::select! {
+            biased;
+            _ = runtime.wait_for_cancellation(&node.plan_id) => None,
+            result = async {
+                interval.tick().await;
+                poll_status(
+                    self_provider_id,
+                    &call.provider_id,
+                    &group.status_contract,
+                    &run_id,
+                    atlas,
+                ).await
+            } => Some(result),
+        };
+        let Some(status_out) = status_out else {
+            let result = canceled_result(call, "plan was cancelled; physical stop is unconfirmed");
             return (result, RtdlNodeStateEnum::Canceled as u32);
-        }
-        let status_out = match poll_status(
-            self_provider_id,
-            &call.provider_id,
-            &group.status_contract,
-            &run_id,
-            atlas,
-        )
-        .await
-        {
+        };
+        let status_out = match status_out {
             Ok(s) => s,
             Err(e) => {
                 let error = format!("status poll failed for {}: {e:#}", call.contract_id);
                 warn!("[executor] {error}");
                 let result = failed_result(call, &error);
                 runtime
-                    .unregister_async_call(&node.plan_id, &call.call_id)
+                    .cancel_execution(&node.plan_id, self_provider_id, atlas)
                     .await;
                 return (result, RtdlNodeStateEnum::Failed as u32);
             }
         };
 
-        let (state, detail) = parse_status_json(&status_out);
+        let (state, detail) = match parse_run_status(&status_out, &run_id) {
+            Ok(status) => status,
+            Err(error) => {
+                runtime
+                    .cancel_execution(&node.plan_id, self_provider_id, atlas)
+                    .await;
+                return (
+                    failed_result(call, &format!("status poll failed: {error:#}")),
+                    RtdlNodeStateEnum::Failed as u32,
+                );
+            }
+        };
         if rtdl_wire::is_terminal_state(state) {
             let result = terminal_result(call, state, &detail, &status_out);
             runtime
@@ -98,18 +118,16 @@ pub async fn run_until_terminal(
     }
 }
 
-async fn poll_status(
+/// Own the status binding through its RPC so dropping a hung poll releases it.
+pub(crate) async fn poll_status(
     consumer_id: &str,
     provider_id: &str,
     status_contract: &str,
     run_id: &str,
     atlas: &mut AtlasClient,
 ) -> anyhow::Result<String> {
-    let args = if run_id.is_empty() {
-        "{}".to_string()
-    } else {
-        serde_json::json!({ "run_id": run_id }).to_string()
-    };
+    anyhow::ensure!(!run_id.trim().is_empty(), "status requires an exact run_id");
+    let args = serde_json::json!({ "run_id": run_id }).to_string();
     let status_call = CapabilityCall {
         call_id: format!("status-{}", uuid::Uuid::new_v4()),
         provider_id: provider_id.to_string(),
@@ -124,8 +142,9 @@ async fn poll_status(
             atlas_pb::Transport::Mcp,
         )
         .await?;
+    let channel = CapabilityChannel::new(atlas, channel_id);
     let result = crate::dispatch::mcp::execute(&status_call, &endpoint).await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
+    channel.release().await;
     if result.success {
         Ok(result.output)
     } else {
@@ -144,33 +163,34 @@ pub fn extract_run_id(output: &str) -> String {
         .to_string()
 }
 
-/// Parse status MCP JSON: requires uppercase `state` enum; optional `detail` string.
-pub fn parse_status_json(output: &str) -> (u32, String) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(output) else {
-        warn!("[executor] status response is not valid JSON: {output}");
-        return (RtdlNodeStateEnum::Running as u32, output.to_string());
-    };
-
-    let Some(state_str) = v.get("state").and_then(|s| s.as_str()) else {
-        let error = format!("status response missing required 'state' field: {output}");
-        warn!("[executor] {error}");
-        return (RtdlNodeStateEnum::Failed as u32, error);
-    };
-
-    let detail = v
+/// Validate status evidence before allowing it to release an owned execution.
+pub(crate) fn parse_run_status(output: &str, run_id: &str) -> anyhow::Result<(u32, String)> {
+    let payload: serde_json::Value = serde_json::from_str(output)?;
+    if let Some(known) = payload.get("known") {
+        anyhow::ensure!(
+            known.as_bool() == Some(true),
+            "status does not identify the requested run"
+        );
+    }
+    if let Some(returned_id) = payload.get("run_id") {
+        anyhow::ensure!(
+            returned_id.as_str() == Some(run_id),
+            "status returned a different run_id"
+        );
+    }
+    let state = payload
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_state_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("status response missing required 'state' or has unknown state")
+        })?;
+    let detail = payload
         .get("detail")
-        .and_then(|x| x.as_str())
+        .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-
-    match parse_state_name(state_str) {
-        Some(state) => (state, detail),
-        None => {
-            let error = format!("status response has unknown state '{state_str}': {output}");
-            warn!("[executor] {error}");
-            (RtdlNodeStateEnum::Failed as u32, error)
-        }
-    }
+    Ok((state, detail))
 }
 
 /// Convert status response state names into RTDL node state constants.
@@ -242,15 +262,26 @@ mod tests {
 
     #[test]
     fn parse_status_requires_state_field() {
-        let (s, d) = parse_status_json(r#"{"state":"SUCCEEDED","detail":"done"}"#);
+        let (s, d) = parse_run_status(r#"{"state":"SUCCEEDED","detail":"done"}"#, "r1").unwrap();
         assert_eq!(s, RtdlNodeStateEnum::Succeeded as u32);
         assert_eq!(d, "done");
     }
 
     #[test]
     fn parse_status_missing_state_fails() {
-        let (s, d) = parse_status_json(r#"{"known":true,"terminal":false}"#);
-        assert_eq!(s, RtdlNodeStateEnum::Failed as u32);
-        assert!(d.contains("missing required 'state' field"));
+        let error = parse_run_status(r#"{"known":true,"terminal":false}"#, "r1").unwrap_err();
+        assert!(error.to_string().contains("missing required 'state'"));
+    }
+
+    #[test]
+    fn unknown_or_mismatched_runs_never_confirm_terminal_state() {
+        for output in [
+            r#"{"known":false,"state":"CANCELED"}"#,
+            r#"{"known":true,"run_id":"other","state":"CANCELED"}"#,
+            r#"{"state":"invalid"}"#,
+            "not json",
+        ] {
+            assert!(parse_run_status(output, "owned").is_err(), "{output}");
+        }
     }
 }

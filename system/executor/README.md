@@ -52,9 +52,22 @@ Both execution RPCs share one scheduler:
 - Events are `plan_started`, `node_state`, and `plan_complete`. Node events
   retain node identity; leaf results carry the capability output. Parallel
   results arrive in completion order. Failures and cancellation set `any_failed`.
-- Cancellation stops new work and requests cancellation of async calls.
-  Synchronous calls may finish naturally. Active state is in memory and is
-  removed after running work and verification finish.
+- Cancellation seals streaming input, skips later work, and interrupts hung
+  synchronous dispatch and async status polling. Dropping a synchronous request
+  only confirms local cancellation; it cannot confirm a physical stop.
+- Async cancellation sends the exact owned `run_id`, then polls its status.
+  `accepted=true` alone is insufficient. Discovery, cancel, and confirmation
+  share a two-second deadline; failed handles remain available for a retry.
+  `success=true, completed=false` means cancellation is pending. A remote
+  refusal, including an MCP error, still permits status confirmation within
+  that same deadline: an already terminal run needs no further cancellation.
+  Without valid terminal evidence, the handle and cancellation/status errors
+  remain available and return `success=false, completed=false` once known.
+- Local completion or input disconnection does not remove unconfirmed async
+  work. The canceled plan stays in `list_active_plans`, with its owned calls
+  visible as `running`, so health dependency matching and scoped retries keep
+  working. Its plan ID cannot be reused until it drains. At most 256 plans are
+  retained; admission fails at the limit instead of evicting unresolved handles.
 
 Incremental input follows `START → NODE / CLOSE → END`. Execution can begin
 before `END`; operators close innermost first. Invalid input returns
@@ -69,10 +82,25 @@ See the [stream protocol](../../capabilities/lib/executor/msg/ExecuteStreamInput
 Async MCP capabilities register both `<contract_id>/status` and
 `<contract_id>/cancel`; registering only one is an error. Executor polls status
 every 2 seconds until `SUCCEEDED`, `FAILED`, `CANCELED`, or `TIMEOUT`.
-Status responses provide `state` and optional `detail`. The initial response's `run_id`
-identifies subsequent status/cancel requests; without it, the provider must
-resolve the current or latest run. Calls without either sub-contract complete
-when their initial response returns.
+Status responses provide `state` and optional `detail`. The initial response
+must identify the execution with a nonempty `run_id`; status/cancel calls never
+fall back to a provider's current or latest run. `known=false`, a different
+returned `run_id`, and malformed status cannot confirm completion. A missing
+initial ID retains unresolved ownership and requires operator intervention.
+An initial request already in flight remains owned until its response arrives,
+even after cancellation, so its late run ID can be canceled accurately.
+Calls without either sub-contract complete when their initial response returns.
+
+Executor serves the shared `robonix/lifecycle/driver` contract and initializes
+and activates it through the same gRPC endpoint before reporting readiness.
+`CMD_SHUTDOWN` first closes admission to both execution RPCs, then drains tracked
+plans. A failed drain returns `ok=false`, keeps the server available for
+cancellation retries, and does not publish `TERMINATED`. New execution remains
+rejected. Only a confirmed drain allows lifecycle shutdown.
+
+The deployment supervisor currently terminates built-in system processes with
+signals rather than calling their Driver. That path does not invoke this
+cancellation-confirmation callback; use the Driver RPC for a confirmed shutdown.
 
 Verification is optional. Configure it in the deployment manifest:
 
@@ -130,9 +158,13 @@ Under `robonix/system/executor/builtin/`:
 
 ```sh
 cargo test -p robonix-executor --all-targets
+cargo test -p robonix-executor cancellation_tests
 cargo build -p robonix-atlas -p robonix-executor -p robonix-pilot
 python3 scripts/test_execute_stream.py
 ```
 
 The cross-process test uses a local fake VLM, requires `grpcio` and
 `grpcio-tools`, and retains logs under `/tmp`.
+The cancellation tests run real Executor gRPC, Atlas, and HTTP MCP services.
+They cover cancellation before `END`, late input, late initial responses,
+unrelated plans, hung calls, retained failures, retries, and lifecycle shutdown.

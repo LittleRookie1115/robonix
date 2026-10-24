@@ -15,6 +15,8 @@
 // --soma-endpoint at a real Soma instance.
 
 mod config;
+#[path = "../../lifecycle.rs"]
+mod lifecycle;
 mod mock_soma;
 pub mod module_health;
 mod module_health_poll;
@@ -26,170 +28,23 @@ mod subprocess;
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Args, VITALS_NAMESPACE, VitalsConfig};
-use log::info;
-use pb::contracts::robonix_lifecycle_driver_client::RobonixLifecycleDriverClient;
-use pb::contracts::robonix_lifecycle_driver_server::{
-    RobonixLifecycleDriver, RobonixLifecycleDriverServer,
+#[cfg(test)]
+use lifecycle::CMD_SHUTDOWN;
+pub(crate) use lifecycle::{
+    CMD_ACTIVATE, CMD_INIT, SHARED_DRIVER_CONTRACT, SystemLifecycleDriver, call_startup_driver,
+    connect_startup_driver, startup_driver_endpoint, wait_for_driver_shutdown,
 };
+use log::info;
+use pb::contracts::robonix_lifecycle_driver_server::RobonixLifecycleDriverServer;
 use pb::contracts::robonix_system_vitals_get_server::RobonixSystemVitalsGetServer;
 use pb::contracts::robonix_system_vitals_modules_get_server::RobonixSystemVitalsModulesGetServer;
 use pb::contracts::robonix_system_vitals_stream_server::RobonixSystemVitalsStreamServer;
-use pb::lifecycle::{DriverRequest, DriverResponse};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_atlas::pb as atlas_pb;
 use service::VitalsServiceImpl;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
-use tonic::{Request, Response, Status};
-
-pub(crate) const SHARED_DRIVER_CONTRACT: &str = "robonix/lifecycle/driver";
-pub(crate) const CMD_INIT: u32 = 0;
-pub(crate) const CMD_ACTIVATE: u32 = 1;
-const CMD_DEACTIVATE: u32 = 2;
-const CMD_SHUTDOWN: u32 = 3;
-
-#[derive(Clone)]
-pub(crate) struct SystemLifecycleDriver {
-    atlas: AtlasClient,
-    provider_id: String,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-}
-
-impl SystemLifecycleDriver {
-    pub(crate) fn new(atlas: AtlasClient, provider_id: String) -> Self {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        Self {
-            atlas,
-            provider_id,
-            shutdown_tx,
-        }
-    }
-
-    /// Apply one no-op lifecycle callback and publish its authoritative state
-    /// to Atlas. Unknown commands and rejected Atlas transitions are errors.
-    pub(crate) async fn transition(&self, command: u32) -> Result<&'static str> {
-        let (state, label) = lifecycle_target(command)
-            .ok_or_else(|| anyhow::anyhow!("unknown lifecycle command code {command}"))?;
-        let mut atlas = self.atlas.clone();
-        atlas
-            .set_lifecycle_state(&self.provider_id, state, "")
-            .await
-            .with_context(|| format!("publish lifecycle state for '{}'", self.provider_id))?;
-        if command == CMD_SHUTDOWN {
-            self.shutdown_tx.send_replace(true);
-        }
-        Ok(label)
-    }
-
-    pub(crate) fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.shutdown_tx.subscribe()
-    }
-}
-
-#[tonic::async_trait]
-impl RobonixLifecycleDriver for SystemLifecycleDriver {
-    /// Serve the shared Driver RPC and report callback/transition failures in
-    /// the stable DriverResponse envelope used by launchers.
-    async fn driver(
-        &self,
-        request: Request<DriverRequest>,
-    ) -> std::result::Result<Response<DriverResponse>, Status> {
-        let response = match self.transition(request.into_inner().command).await {
-            Ok(state) => DriverResponse {
-                ok: true,
-                state: state.to_string(),
-                error: String::new(),
-            },
-            Err(error) => DriverResponse {
-                ok: false,
-                state: "error".to_string(),
-                error: format!("{error:#}"),
-            },
-        };
-        Ok(Response::new(response))
-    }
-}
-
-fn lifecycle_target(command: u32) -> Option<(atlas_pb::LifecycleState, &'static str)> {
-    match command {
-        CMD_INIT => Some((atlas_pb::LifecycleState::StateInactive, "inactive")),
-        CMD_ACTIVATE => Some((atlas_pb::LifecycleState::StateActive, "active")),
-        CMD_DEACTIVATE => Some((atlas_pb::LifecycleState::StateInactive, "inactive")),
-        CMD_SHUTDOWN => Some((atlas_pb::LifecycleState::StateTerminated, "terminated")),
-        _ => None,
-    }
-}
-
-/// Wait until Driver(CMD_SHUTDOWN) has published TERMINATED. A watch channel
-/// preserves a shutdown sent before this particular waiter starts polling.
-pub(crate) async fn wait_for_driver_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            return;
-        }
-    }
-}
-
-/// Return a loopback endpoint for an unspecified bind address so the process
-/// can self-dial without changing the endpoint it advertises through Atlas.
-pub(crate) fn startup_driver_endpoint(listen_addr: std::net::SocketAddr) -> String {
-    let ip = match listen_addr.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        }
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-        }
-        ip => ip,
-    };
-    std::net::SocketAddr::new(ip, listen_addr.port()).to_string()
-}
-
-/// Connect to this process's just-spawned Driver endpoint. Retries only the
-/// bounded bind/startup window; a connected endpoint is returned immediately.
-pub(crate) async fn connect_startup_driver(
-    endpoint: &str,
-) -> Result<RobonixLifecycleDriverClient<tonic::transport::Channel>> {
-    let endpoint = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match RobonixLifecycleDriverClient::connect(endpoint.clone()).await {
-            Ok(client) => return Ok(client),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => return Err(error).context("connect startup lifecycle Driver"),
-        }
-    }
-}
-
-/// Invoke one startup lifecycle command through the real generated Driver RPC
-/// and reject an `ok=false` response as a startup failure.
-pub(crate) async fn call_startup_driver(
-    client: &mut RobonixLifecycleDriverClient<tonic::transport::Channel>,
-    command: u32,
-) -> Result<String> {
-    let response = client
-        .driver(DriverRequest {
-            command,
-            config_json: "{}".to_string(),
-        })
-        .await
-        .context("call startup lifecycle Driver")?
-        .into_inner();
-    if !response.ok {
-        anyhow::bail!("startup lifecycle Driver failed: {}", response.error);
-    }
-    Ok(response.state)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -394,17 +249,8 @@ async fn main() -> Result<()> {
         {
             let freshness = std::sync::Arc::clone(&freshness);
             let stale_svc = svc.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_millis(100));
-                loop {
-                    tick.tick().await;
-                    let mut tracker = freshness.lock().await;
-                    let mut latest = stale_svc.latest_snapshot().await;
-                    if tracker.expire(&mut latest, Instant::now()) {
-                        stale_svc.update_snapshot(latest).await;
-                    }
-                }
-            });
+            let shutdown = lifecycle.subscribe_shutdown();
+            tokio::spawn(expire_soma_health(freshness, stale_svc, shutdown));
         }
         let svc_for_stream = svc.clone();
         let rules_for_stream = soma_rules.clone();
@@ -500,6 +346,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn expire_soma_health(
+    freshness: std::sync::Arc<tokio::sync::Mutex<soma_ingest::SomaFreshnessTracker>>,
+    svc: VitalsServiceImpl,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let expiration = async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tick.tick().await;
+            let mut tracker = freshness.lock().await;
+            let mut latest = svc.latest_snapshot().await;
+            if tracker.expire(&mut latest, Instant::now()) {
+                svc.update_snapshot(latest).await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = wait_for_driver_shutdown(shutdown) => {}
+        _ = expiration => {}
+    };
+}
+
 fn monotonic_ns() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
@@ -509,6 +377,7 @@ fn monotonic_ns() -> u64 {
 mod lifecycle_tests {
     use super::*;
     use pb::contracts::robonix_lifecycle_driver_client::RobonixLifecycleDriverClient;
+    use pb::lifecycle::DriverRequest;
     use robonix_atlas::service::{AtlasRegistry, serve_atlas};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -516,6 +385,27 @@ mod lifecycle_tests {
     fn reserve_address() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         listener.local_addr().expect("reserved address")
+    }
+
+    #[tokio::test]
+    async fn soma_expiration_stops_on_shutdown_while_waiting_for_freshness() {
+        let freshness = Arc::new(tokio::sync::Mutex::new(
+            soma_ingest::SomaFreshnessTracker::default(),
+        ));
+        let _guard = freshness.lock().await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let expiration = tokio::spawn(expire_soma_health(
+            Arc::clone(&freshness),
+            VitalsServiceImpl::new(),
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+        assert!(!expiration.is_finished());
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), expiration)
+            .await
+            .expect("expiration task must observe shutdown while its input is locked")
+            .unwrap();
     }
 
     #[test]
