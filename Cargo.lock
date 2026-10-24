@@ -3232,6 +3232,7 @@ dependencies = [
  "async-openai",
  "clap",
  "futures-util",
+ "log",
  "prost",
  "protoc-bin-vendored",
  "reqwest 0.13.4",

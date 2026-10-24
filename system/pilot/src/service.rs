@@ -3,12 +3,18 @@
 //
 // `RobonixSystemPilot` gRPC handler (contract `robonix/system/pilot`).
 
+use crate::health_dependencies::HealthDependencies;
+use crate::health_dependencies::component_health::{
+    HEALTH_ERROR, HEALTH_OK, HEALTH_STALE, HEALTH_WARN,
+};
 use crate::pb::contracts::{
     robonix_system_executor_control_plan_client::RobonixSystemExecutorControlPlanClient,
     robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient,
     robonix_system_executor_list_active_plans_client::RobonixSystemExecutorListActivePlansClient,
     robonix_system_pilot_get_health_server::RobonixSystemPilotGetHealth,
     robonix_system_pilot_server::RobonixSystemPilot,
+    robonix_system_vitals_get_client::RobonixSystemVitalsGetClient,
+    robonix_system_vitals_stream_client::RobonixSystemVitalsStreamClient,
 };
 use crate::pb::module_health::{
     GetModuleHealthRequest, GetModuleHealthResponse, ModuleHealth, ModuleHealthReport,
@@ -16,7 +22,9 @@ use crate::pb::module_health::{
 use crate::pb::pilot::{
     BatchResult, PilotEvent, Plan, RtdlNodeState, SessionStatusEvent, Task, TaskStateEvent,
 };
+use crate::pb::vitals::{GetVitalsRequest, StreamVitalsRequest, VitalsSnapshot};
 use crate::planner::{self, ExecutorConn, HistoryBudget, SessionForest};
+use crate::soma_context;
 use crate::tasks::TaskTable;
 use crate::transcript::Transcript;
 use crate::vlm::{Message, VlmClient};
@@ -26,7 +34,8 @@ use robonix_scribe::{debug, error, info};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -53,6 +62,8 @@ pub const EVT_TASK_STATE: u32 = 6;
 const MODULE_HEALTH_SCHEMA_VERSION: u32 = 1;
 const MODULE_HEALTH_OK: u32 = 0;
 const MODULE_HEALTH_TTL_MS: u32 = 5000;
+const VITALS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const VITALS_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[allow(dead_code)]
 pub enum PilotStreamBody {
@@ -113,11 +124,68 @@ type Forests = Arc<Mutex<HashMap<String, Arc<Mutex<SessionForest>>>>>;
 type Transcripts = Arc<Mutex<HashMap<String, Arc<Mutex<Transcript>>>>>;
 
 #[derive(Clone)]
+/// Active session input and the single shared stream observed by its callers.
 struct ActiveTurnInput {
+    /// Identity used to reject steers for superseded turns.
     turn_id: String,
+    /// Ordered user messages that may update the session's task table.
     tx: mpsc::Sender<Task>,
+    /// Coalesced monitor events that must never create user goals.
+    health_tx: watch::Sender<Option<Task>>,
+    /// Session events broadcast to the current SubmitTask subscribers.
     events: broadcast::Sender<Result<PilotEvent, String>>,
+    /// Generation whose subscriber owns the next user-facing response.
     reply_generation: Arc<AtomicU64>,
+}
+
+/// Separate health and user channels consumed by the planning supervisor.
+pub(crate) struct TurnSteers {
+    /// Ordered user steers retained even when health updates coalesce.
+    tasks: mpsc::Receiver<Task>,
+    /// Latest health change, always read ahead of queued user messages.
+    health: watch::Receiver<Option<Task>>,
+}
+
+impl TurnSteers {
+    /// Combine ordered user input with coalesced, prioritized health updates.
+    pub(crate) fn new(tasks: mpsc::Receiver<Task>, health: watch::Receiver<Option<Task>>) -> Self {
+        Self { tasks, health }
+    }
+
+    /// Await either input source without letting a full user queue block health.
+    pub(crate) async fn recv(&mut self) -> Option<Task> {
+        loop {
+            if self.is_closed() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                changed = self.health.changed(), if self.health.has_changed().is_ok() => {
+                    if changed.is_ok()
+                        && let Some(task) = self.health.borrow_and_update().clone()
+                    {
+                        return Some(task);
+                    }
+                }
+                task = self.tasks.recv(), if !self.tasks.is_closed() || !self.tasks.is_empty() => return task,
+            }
+        }
+    }
+
+    /// Both sources have ended and no queued user messages remain.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tasks.is_closed() && self.tasks.is_empty() && self.health.has_changed().is_err()
+    }
+
+    /// Drain the latest health update before queued user steers.
+    pub(crate) fn try_recv(&mut self) -> Result<Task, mpsc::error::TryRecvError> {
+        if self.health.has_changed().unwrap_or(false)
+            && let Some(task) = self.health.borrow_and_update().clone()
+        {
+            return Ok(task);
+        }
+        self.tasks.try_recv()
+    }
 }
 
 /// Give each SubmitTask caller its own view of the active supervisor stream.
@@ -167,8 +235,19 @@ fn subscribe_turn_events(
 }
 
 const SEEN_TASK_IDS_PER_SESSION: usize = 256;
+const MAX_SEVERE_COMPONENTS: usize = 2048;
+
+#[derive(Default)]
+/// Latest verified planning snapshot and severe faults retained until recovery.
+pub(crate) struct VitalsContext {
+    /// Most recent probe or transition; absent after verification fails.
+    pub(crate) snapshot: Option<VitalsSnapshot>,
+    /// Severe component observations not yet explicitly cleared by recovery.
+    pub(crate) faults: VitalsSnapshot,
+}
 
 #[derive(Clone)]
+/// Per-session planning state and shared discovery, model, and health clients.
 pub struct PilotServiceImpl {
     /// `AtlasClient` is cheap to clone (its inner channel is just a handle);
     /// each Stream RPC clones it to discover executor concurrently without
@@ -178,14 +257,18 @@ pub struct PilotServiceImpl {
     /// `ConnectCapability` so the channel record reflects who is using
     /// the executor.
     provider_id: String,
+    /// Deployment's configured inference client, cloned by active sessions.
     vlm: VlmClient,
+    /// Context-window policy applied when compacting a session's history.
     history_budget: HistoryBudget,
+    /// Ordered prompt history retained separately for each session.
     histories: Histories,
     /// The tasks of each session (see `tasks`). They survive a transport turn
     /// that pauses for user input.
     task_states: TaskStates,
     /// The RTDL trees of each session, supervised across turns.
     forests: Forests,
+    /// Durable session history and task records used across Pilot restarts.
     transcripts: Transcripts,
     /// Per-session cancellation senders. `abort_turn` Task signals this
     /// without holding the history lock.
@@ -201,6 +284,10 @@ pub struct PilotServiceImpl {
     /// Process-global RTDL plan-id counter. Executor's active table is global,
     /// so ids must be unique across sessions as well as turns.
     plan_seq: Arc<AtomicU64>,
+    /// Vitals snapshot used in every planning round, invalidated on probe failure.
+    latest_vitals: Arc<RwLock<VitalsContext>>,
+    /// Vitals-computed admission restrictions shared with streaming submission.
+    health_dependencies: Arc<RwLock<HealthDependencies>>,
 }
 
 impl PilotServiceImpl {
@@ -223,7 +310,86 @@ impl PilotServiceImpl {
             steers: Arc::new(Mutex::new(HashMap::new())),
             seen_task_ids: Arc::new(Mutex::new(HashMap::new())),
             plan_seq: Arc::new(AtomicU64::new(0)),
+            latest_vitals: Arc::new(RwLock::new(VitalsContext::default())),
+            health_dependencies: Arc::new(RwLock::new(HealthDependencies::default())),
         }
+    }
+
+    /// Subscribe to Vitals so active turns receive hardware health transitions.
+    pub fn start_vitals_monitor(&self) {
+        let mut atlas = self.atlas.clone();
+        let consumer_id = self.provider_id.clone();
+        let latest_vitals = Arc::clone(&self.latest_vitals);
+        let steers = Arc::clone(&self.steers);
+        let health_dependencies = Arc::clone(&self.health_dependencies);
+        tokio::spawn(async move {
+            let mut previous_alert: Option<String> = None;
+            loop {
+                let connection = tokio::time::timeout(
+                    VITALS_RPC_TIMEOUT,
+                    atlas_client::connect_to_capability(
+                        &mut atlas,
+                        &consumer_id,
+                        "robonix/system/vitals/stream",
+                    ),
+                )
+                .await
+                .context("Vitals stream connection timed out")
+                .and_then(|result| result);
+                let (channel_id, provider_id, channel) = match connection {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        debug!("[pilot/vitals] stream unavailable; retrying: {error:#}");
+                        invalidate_vitals_context(&latest_vitals, &steers, &mut previous_alert)
+                            .await;
+                        tokio::time::sleep(VITALS_PROBE_INTERVAL).await;
+                        continue;
+                    }
+                };
+
+                let (probe_channel_id, mut probe) =
+                    match connect_vitals_probe(&mut atlas, &consumer_id, &provider_id).await {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            debug!("[pilot/vitals] probe unavailable; retrying: {error:#}");
+                            invalidate_vitals_context(&latest_vitals, &steers, &mut previous_alert)
+                                .await;
+                            disconnect_vitals_channel(&mut atlas, &channel_id).await;
+                            tokio::time::sleep(VITALS_PROBE_INTERVAL).await;
+                            continue;
+                        }
+                    };
+                let mut client = RobonixSystemVitalsStreamClient::new(channel);
+                let stream = tokio::time::timeout(
+                    VITALS_RPC_TIMEOUT,
+                    client.stream_vitals(StreamVitalsRequest {}),
+                )
+                .await
+                .context("Vitals stream open timed out")
+                .and_then(|response| response.context("open Vitals stream"));
+                let outcome = match stream {
+                    Ok(response) => {
+                        consume_vitals_stream(
+                            response.into_inner(),
+                            &mut probe,
+                            &latest_vitals,
+                            &steers,
+                            &mut previous_alert,
+                            &health_dependencies,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = outcome {
+                    debug!("[pilot/vitals] health verification failed; retrying: {error:#}");
+                }
+                invalidate_vitals_context(&latest_vitals, &steers, &mut previous_alert).await;
+                disconnect_vitals_channel(&mut atlas, &channel_id).await;
+                disconnect_vitals_channel(&mut atlas, &probe_channel_id).await;
+                tokio::time::sleep(VITALS_PROBE_INTERVAL).await;
+            }
+        });
     }
 
     /// The history, task state, and transcript of a session, created on
@@ -314,6 +480,254 @@ impl PilotServiceImpl {
         }
         true
     }
+}
+
+/// Bind the unary health probe to the same provider as the selected stream.
+async fn connect_vitals_probe(
+    atlas: &mut AtlasClient,
+    consumer_id: &str,
+    provider_id: &str,
+) -> anyhow::Result<(
+    String,
+    RobonixSystemVitalsGetClient<tonic::transport::Channel>,
+)> {
+    let (channel_id, endpoint, _) = tokio::time::timeout(
+        VITALS_RPC_TIMEOUT,
+        atlas.connect_capability(
+            consumer_id,
+            provider_id,
+            "robonix/system/vitals/get",
+            robonix_atlas::pb::Transport::Grpc,
+        ),
+    )
+    .await
+    .context("Vitals probe binding timed out")??;
+    let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint
+    } else {
+        format!("http://{endpoint}")
+    };
+    let connected = async {
+        tonic::transport::Endpoint::new(endpoint)?
+            .connect_timeout(VITALS_RPC_TIMEOUT)
+            .connect()
+            .await
+            .context("connect Vitals probe")
+    }
+    .await;
+    match connected {
+        Ok(channel) => Ok((channel_id, RobonixSystemVitalsGetClient::new(channel))),
+        Err(error) => {
+            disconnect_vitals_channel(atlas, &channel_id).await;
+            Err(error)
+        }
+    }
+}
+
+/// Bound bookkeeping cleanup so failed Atlas RPCs cannot stall reconnection.
+async fn disconnect_vitals_channel(atlas: &mut AtlasClient, channel_id: &str) {
+    match tokio::time::timeout(VITALS_RPC_TIMEOUT, atlas.disconnect_capability(channel_id)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => debug!("[pilot/vitals] channel cleanup failed: {error:#}"),
+        Err(_) => debug!("[pilot/vitals] channel cleanup timed out"),
+    }
+}
+
+/// Verify Vitals liveness without treating a transition-only stream's silence as failure.
+async fn probe_vitals(
+    client: &mut RobonixSystemVitalsGetClient<tonic::transport::Channel>,
+) -> anyhow::Result<VitalsSnapshot> {
+    tokio::time::timeout(VITALS_RPC_TIMEOUT, client.get_vitals(GetVitalsRequest {}))
+        .await
+        .context("Vitals probe timed out")?
+        .context("Vitals probe failed")?
+        .into_inner()
+        .snapshot
+        .context("Vitals probe returned no snapshot")
+}
+
+/// Refresh planning context from stream transitions and deadline-bounded probes.
+async fn consume_vitals_stream(
+    mut stream: tonic::Streaming<VitalsSnapshot>,
+    probe: &mut RobonixSystemVitalsGetClient<tonic::transport::Channel>,
+    latest: &Arc<RwLock<VitalsContext>>,
+    steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
+    previous_alert: &mut Option<String>,
+    dependencies: &Arc<RwLock<HealthDependencies>>,
+) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(VITALS_PROBE_INTERVAL);
+    loop {
+        let snapshot = tokio::select! {
+            frame = stream.message() => {
+                frame.context("read Vitals stream")?.context("Vitals stream ended")?
+            }
+            _ = tick.tick() => probe_vitals(probe).await?,
+        };
+        update_vitals_context(snapshot, latest, steers, previous_alert, dependencies).await;
+    }
+}
+
+/// Cache verified health and notify active turns only when the alert changes.
+async fn update_vitals_context(
+    snapshot: VitalsSnapshot,
+    latest: &Arc<RwLock<VitalsContext>>,
+    steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
+    previous_alert: &mut Option<String>,
+    dependencies: &Arc<RwLock<HealthDependencies>>,
+) {
+    let snapshot = {
+        let mut context = latest.write().await;
+        if crate::health_dependencies::verified_recovery(&snapshot) {
+            context.faults.components.clear();
+        }
+        context.faults.components.retain(|fault| {
+            !snapshot.components.iter().any(|component| {
+                component.name == fault.name && matches!(component.health, HEALTH_OK | HEALTH_WARN)
+            })
+        });
+        for component in snapshot
+            .components
+            .iter()
+            .filter(|component| matches!(component.health, HEALTH_ERROR | HEALTH_STALE))
+        {
+            if let Some(fault) = context
+                .faults
+                .components
+                .iter_mut()
+                .find(|fault| fault.name == component.name)
+            {
+                fault.clone_from(component);
+            } else if context.faults.components.len() < MAX_SEVERE_COMPONENTS {
+                context.faults.components.push(component.clone());
+            } else {
+                error!(
+                    "[pilot/vitals] severe-component retention limit reached; admission coverage is incomplete"
+                );
+            }
+        }
+        let mut effective = snapshot.clone();
+        effective.components = context.faults.components.clone();
+        effective.components.extend(
+            snapshot
+                .components
+                .iter()
+                .filter(|component| {
+                    !context
+                        .faults
+                        .components
+                        .iter()
+                        .any(|fault| fault.name == component.name)
+                })
+                .cloned(),
+        );
+        context.snapshot = Some(snapshot);
+        effective
+    };
+    let alert = soma_context::vitals_alert(&snapshot);
+    let mut scope = dependencies.write().await;
+    scope.observe_health(&snapshot);
+    let next_alert =
+        soma_context::vitals_alert_key(&snapshot).map(|key| format!("{key};{}", scope.alert_key()));
+    let dependency_report = scope.report().to_string();
+    drop(scope);
+    if &next_alert != previous_alert {
+        if let Some((detail, stop_active_plans)) = alert {
+            let detail = format!("{detail}\nDependency evidence: {dependency_report}");
+            let message = vitals_event_message(&detail, stop_active_plans);
+            let notified = notify_active_turns(steers, &message).await;
+            info!("[pilot/vitals] health alert received; active_turns_notified={notified}");
+        } else if previous_alert.is_some() {
+            let verified_healthy = (!snapshot.components.is_empty() || !snapshot.bodies.is_empty())
+                && snapshot
+                    .components
+                    .iter()
+                    .all(|component| component.health == HEALTH_OK)
+                && snapshot
+                    .bodies
+                    .iter()
+                    .all(|body| body.state == 0 && body.message.is_empty());
+            let message = if verified_healthy {
+                "Vitals reports that the previous hardware alert has recovered. Re-check the current snapshot before resuming dependent work."
+            } else {
+                "Vitals no longer reports the previous alert, but current hardware health is unknown. Do not resume work requiring unverified hardware."
+            };
+            let notified = notify_active_turns(steers, message).await;
+            info!("[pilot/vitals] health recovery received; active_turns_notified={notified}");
+        }
+    }
+    *previous_alert = next_alert;
+}
+
+/// Invalidate cached health and steer active turns once after verification fails.
+async fn invalidate_vitals_context(
+    latest: &Arc<RwLock<VitalsContext>>,
+    steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
+    previous_alert: &mut Option<String>,
+) {
+    if latest.write().await.snapshot.take().is_none() {
+        return;
+    }
+    let message = "Vitals health connection is unverified. Reassess active plans immediately, use targeted cancellation for plans that require unverified hardware, and preserve unrelated work.".to_string();
+    let notified = notify_active_turns(steers, &message).await;
+    info!("[pilot/vitals] health verification lost; active_turns_notified={notified}");
+    *previous_alert = Some(message);
+}
+
+/// Format monitor guidance for either severe faults or nonfatal warnings.
+fn vitals_event_message(detail: &str, requires_targeted_stop: bool) -> String {
+    if requires_targeted_stop {
+        format!(
+            "URGENT Vitals hardware alert: {detail}\n\
+             Vitals independently requests cancellation of affected Executor plans without \
+             waiting for model analysis. Reassess the current Executor snapshot: already canceled plans \
+             need no repeated cancel. If an affected plan remains active, use its exact plan_id \
+             for targeted control and verify the result. Never use cancel_all for this component alert; preserve \
+             unrelated plans. Use the computed hardware dependency impact and current \
+             Executor candidate plan ids rather than guessing from capability names. \
+             Do not dispatch dependent actions while the component is \
+             ERROR or STALE. If dependency is unclear, report that uncertainty instead of \
+             claiming the affected work was stopped."
+        )
+    } else {
+        format!(
+            "Vitals hardware warning: {detail}\n\
+             Reassess active work and plan conservatively; preserve unrelated work."
+        )
+    }
+}
+
+/// Send a health steer to active sessions and return the delivered count.
+async fn notify_active_turns(
+    steers: &Arc<Mutex<HashMap<String, ActiveTurnInput>>>,
+    message: &str,
+) -> usize {
+    let targets: Vec<_> = steers
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, input)| (session_id.clone(), input.health_tx.clone()))
+        .collect();
+    let mut notified = 0;
+    for (session_id, sender) in targets {
+        let task = Task {
+            task_id: format!("vitals-{}", Uuid::new_v4()),
+            session_id,
+            source: 2,
+            text: message.to_string(),
+            audio_data: Vec::new(),
+            context_json: r#"{"steer":true,"system_vitals_alert":true}"#.to_string(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        if sender.send(Some(task)).is_err() {
+            debug!("[pilot/vitals] active turn ended before health update was delivered");
+        } else {
+            notified += 1;
+        }
+    }
+    notified
 }
 
 fn task_context(task: &Task) -> Option<serde_json::Value> {
@@ -437,6 +851,7 @@ impl RobonixSystemPilot for PilotServiceImpl {
         // check and the registration atomically prevents a check-then-insert race
         // where two near-simultaneous submits for one session both start a turn.
         let (steer_tx, steer_rx) = mpsc::channel::<Task>(32);
+        let (health_tx, health_rx) = watch::channel(None);
         let (candidate_events, _) = broadcast::channel(128);
         let candidate_reply_generation = Arc::new(AtomicU64::new(0));
         let explicit_steer = task_is_steer(&task);
@@ -457,6 +872,7 @@ impl RobonixSystemPilot for PilotServiceImpl {
                         ActiveTurnInput {
                             turn_id: task.task_id.clone(),
                             tx: steer_tx.clone(),
+                            health_tx,
                             events: candidate_events.clone(),
                             reply_generation: Arc::clone(&candidate_reply_generation),
                         },
@@ -518,6 +934,8 @@ impl RobonixSystemPilot for PilotServiceImpl {
         let history_budget = self.history_budget.clone();
         let session_id = task.session_id.clone();
         let term_signals = Arc::clone(&self.term_signals);
+        let vitals_snapshot = Arc::clone(&self.latest_vitals);
+        let health_dependencies = Arc::clone(&self.health_dependencies);
         let steers = Arc::clone(&self.steers);
 
         let (cancel_tx, term_signal) = watch::channel(false);
@@ -569,9 +987,11 @@ impl RobonixSystemPilot for PilotServiceImpl {
                 &mut executor,
                 &mut atlas_for_turn,
                 &provider_id,
+                vitals_snapshot,
+                health_dependencies,
                 &tx,
                 term_signal,
-                steer_rx,
+                TurnSteers::new(steer_rx, health_rx),
                 plan_seq,
                 &history_budget,
                 &mut transcript,
@@ -683,12 +1103,33 @@ async fn build_executor_conn(
 #[cfg(test)]
 mod tests {
     use super::{
-        EVT_FINAL_TEXT, EVT_STATUS, MODULE_HEALTH_OK, MODULE_HEALTH_SCHEMA_VERSION,
-        MODULE_HEALTH_TTL_MS, expected_turn_id, pilot_health_report, strict_expected_turn,
-        subscribe_turn_events, task_is_abort_turn, task_is_steer,
+        ActiveTurnInput, EVT_FINAL_TEXT, EVT_STATUS, MODULE_HEALTH_OK,
+        MODULE_HEALTH_SCHEMA_VERSION, MODULE_HEALTH_TTL_MS, TurnSteers, VitalsContext,
+        consume_vitals_stream, expected_turn_id, invalidate_vitals_context, notify_active_turns,
+        pilot_health_report, strict_expected_turn, subscribe_turn_events, task_is_abort_turn,
+        task_is_steer, vitals_event_message,
+    };
+    use crate::health_dependencies::HealthDependencies;
+    use crate::pb::contracts::{
+        robonix_system_vitals_get_client::RobonixSystemVitalsGetClient,
+        robonix_system_vitals_get_server::{RobonixSystemVitalsGet, RobonixSystemVitalsGetServer},
+        robonix_system_vitals_stream_client::RobonixSystemVitalsStreamClient,
+        robonix_system_vitals_stream_server::{
+            RobonixSystemVitalsStream, RobonixSystemVitalsStreamServer,
+        },
     };
     use crate::pb::pilot::{PilotEvent, Task};
+    use crate::pb::vitals::{
+        ComponentHealth, GetVitalsRequest, GetVitalsResponse, StreamVitalsRequest, VitalsSnapshot,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{Mutex, RwLock, mpsc, watch};
     use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{Request, Response, Status};
 
     fn task(ctx: &str) -> Task {
         Task {
@@ -700,6 +1141,357 @@ mod tests {
             context_json: ctx.into(),
             timestamp_ms: 0,
         }
+    }
+
+    #[derive(Clone)]
+    /// Test provider with a silent transition stream and configurable probe liveness.
+    struct SilentVitals {
+        /// Keeps unary probes pending to exercise the verification deadline.
+        stalled_probe: bool,
+        /// Counts successful probes and supplies distinct snapshot timestamps.
+        probes: Arc<AtomicU64>,
+    }
+
+    /// Build a verified healthy component for cache invalidation tests.
+    fn healthy_vitals(ts_ns: u64) -> VitalsSnapshot {
+        VitalsSnapshot {
+            ts_ns,
+            components: vec![ComponentHealth {
+                name: "body/camera".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    /// Same-severity value updates refresh context without restarting inference.
+    async fn changing_alert_details_do_not_starve_plan_cancellation() {
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let (task_tx, task_rx) = mpsc::channel(1);
+        let (health_tx, health_rx) = watch::channel(None);
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        steers.lock().await.insert(
+            "session".into(),
+            ActiveTurnInput {
+                turn_id: "turn".into(),
+                tx: task_tx,
+                health_tx,
+                events,
+                reply_generation: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        let mut receiver = TurnSteers::new(task_rx, health_rx);
+        let mut previous = None;
+        let mut snapshot = healthy_vitals(1);
+        let dependencies = Arc::new(RwLock::new(HealthDependencies::default()));
+        snapshot.components[0].health = 2;
+        snapshot.components[0].detail = "temperature 90".into();
+        super::update_vitals_context(
+            snapshot.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
+        assert!(receiver.try_recv().is_ok());
+        snapshot.components[0].detail = "temperature 91".into();
+        super::update_vitals_context(
+            snapshot.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            latest.read().await.snapshot.as_ref().unwrap().components[0].detail,
+            "temperature 91"
+        );
+        snapshot.components[0].health = 3;
+        super::update_vitals_context(snapshot, &latest, &steers, &mut previous, &dependencies)
+            .await;
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn severe_admission_survives_invalidation_until_each_component_recovers() {
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let dependencies = Arc::new(RwLock::new(HealthDependencies::default()));
+        let mut previous = None;
+        let mut unknown = healthy_vitals(1);
+        unknown.components[0].health = 4;
+        super::update_vitals_context(
+            unknown.clone(),
+            &latest,
+            &steers,
+            &mut previous,
+            &dependencies,
+        )
+        .await;
+        assert!(latest.read().await.faults.components.is_empty());
+        let mut failed = healthy_vitals(2);
+        failed.components[0].health = 2;
+        failed.components.push(ComponentHealth {
+            name: "body/laser".into(),
+            health: 3,
+            ..Default::default()
+        });
+        failed.dependency_report_json = serde_json::json!({
+            "blocked_calls":[
+                {"provider_id":"camera","component":"body/camera","component_contracts":{"robonix/primitive/camera/rgb":"body/camera"}},
+                {"provider_id":"laser","component":"body/laser","component_contracts":{"robonix/primitive/lidar/lidar":"body/laser"}}
+            ]
+        }).to_string();
+        super::update_vitals_context(failed, &latest, &steers, &mut previous, &dependencies).await;
+        invalidate_vitals_context(&latest, &steers, &mut previous).await;
+        assert!(latest.read().await.snapshot.is_none());
+
+        let mut unrelated = healthy_vitals(3);
+        unrelated.components[0].name = "body/other".into();
+        for snapshot in [
+            VitalsSnapshot::default(),
+            VitalsSnapshot {
+                bodies: vec![Default::default()],
+                ..Default::default()
+            },
+            unknown,
+            unrelated,
+        ] {
+            super::update_vitals_context(snapshot, &latest, &steers, &mut previous, &dependencies)
+                .await;
+            invalidate_vitals_context(&latest, &steers, &mut previous).await;
+            let context = latest.read().await;
+            let scope = dependencies.read().await;
+            assert_eq!(context.faults.components.len(), 2);
+            assert!(scope.blocks_call("camera", "robonix/primitive/camera/rgb"));
+            assert!(scope.blocks_call("laser", "robonix/primitive/lidar/lidar"));
+            assert!(scope.blocks_call("memory", "robonix/service/memory/search"));
+        }
+
+        let mut recovered = healthy_vitals(4);
+        recovered.components[0].health = 1;
+        recovered.dependency_report_json = serde_json::json!({
+            "blocked_calls":[{"provider_id":"laser","component":"body/laser",
+                "component_contracts":{"robonix/primitive/lidar/lidar":"body/laser"}}]
+        })
+        .to_string();
+        super::update_vitals_context(recovered, &latest, &steers, &mut previous, &dependencies)
+            .await;
+        assert_eq!(latest.read().await.faults.components.len(), 1);
+        {
+            let scope = dependencies.read().await;
+            assert!(!scope.blocks_call("camera", "robonix/primitive/camera/rgb"));
+            assert!(scope.blocks_call("laser", "robonix/primitive/lidar/lidar"));
+        }
+        let mut recovered = healthy_vitals(5);
+        recovered.components[0].name = "body/laser".into();
+        recovered.dependency_report_json = serde_json::json!({
+            "status":"verified","blocked_calls":[]
+        })
+        .to_string();
+        super::update_vitals_context(recovered, &latest, &steers, &mut previous, &dependencies)
+            .await;
+        assert!(latest.read().await.faults.components.is_empty());
+    }
+
+    #[tonic::async_trait]
+    impl RobonixSystemVitalsGet for SilentVitals {
+        /// Return verified snapshots or simulate a connected but unresponsive server.
+        async fn get_vitals(
+            &self,
+            _request: Request<GetVitalsRequest>,
+        ) -> Result<Response<GetVitalsResponse>, Status> {
+            if self.stalled_probe {
+                return std::future::pending().await;
+            }
+            Ok(Response::new(GetVitalsResponse {
+                snapshot: Some(healthy_vitals(
+                    self.probes.fetch_add(1, Ordering::Relaxed) + 1,
+                )),
+            }))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl RobonixSystemVitalsStream for SilentVitals {
+        type StreamVitalsStream = ReceiverStream<Result<VitalsSnapshot, Status>>;
+
+        /// Send one snapshot and keep the transition stream open without new events.
+        async fn stream_vitals(
+            &self,
+            _request: Request<StreamVitalsRequest>,
+        ) -> Result<Response<Self::StreamVitalsStream>, Status> {
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = sender.send(Ok(healthy_vitals(1))).await;
+                sender.closed().await;
+            });
+            Ok(Response::new(ReceiverStream::new(receiver)))
+        }
+    }
+
+    /// Real Vitals RPC connections and the server task owned by a liveness test.
+    struct VitalsFixture {
+        /// Unary health client connected to the same provider as the stream.
+        probe: RobonixSystemVitalsGetClient<tonic::transport::Channel>,
+        /// Transition stream whose silence must not imply a stale provider.
+        stream: tonic::Streaming<VitalsSnapshot>,
+        /// Background test server retained for explicit cleanup.
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    /// Start real unary and streaming RPCs for liveness tests without a model.
+    async fn vitals_fixture(stalled_probe: bool) -> VitalsFixture {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let service = SilentVitals {
+            stalled_probe,
+            probes: Arc::new(AtomicU64::new(0)),
+        };
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(RobonixSystemVitalsGetServer::new(service.clone()))
+                .add_service(RobonixSystemVitalsStreamServer::new(service))
+                .serve(address),
+        );
+        let endpoint = tonic::transport::Endpoint::new(format!("http://{address}")).unwrap();
+        let mut channel = None;
+        for _ in 0..50 {
+            if let Ok(connected) = endpoint.connect().await {
+                channel = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let channel = channel.expect("connect Vitals fixture");
+        let stream = RobonixSystemVitalsStreamClient::new(channel.clone())
+            .stream_vitals(StreamVitalsRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        VitalsFixture {
+            probe: RobonixSystemVitalsGetClient::new(channel),
+            stream,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    /// A silent transition stream remains healthy when unary verification succeeds.
+    async fn silent_vitals_stream_is_verified_by_unary_probes() {
+        let mut fixture = vitals_fixture(false).await;
+        let latest = Arc::new(RwLock::new(VitalsContext::default()));
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let mut previous_alert = None;
+        let result = tokio::time::timeout(
+            Duration::from_millis(2400),
+            consume_vitals_stream(
+                fixture.stream,
+                &mut fixture.probe,
+                &latest,
+                &steers,
+                &mut previous_alert,
+                &Arc::new(RwLock::new(HealthDependencies::default())),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "healthy monitor should remain connected");
+        assert!(latest.read().await.snapshot.as_ref().unwrap().ts_ns >= 2);
+        assert!(previous_alert.is_none());
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    /// A hung unary probe invalidates health despite an open transition stream.
+    async fn stalled_vitals_probe_invalidates_cached_health() {
+        let mut fixture = vitals_fixture(true).await;
+        let latest = Arc::new(RwLock::new(VitalsContext {
+            snapshot: Some(healthy_vitals(1)),
+            ..Default::default()
+        }));
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let mut previous_alert = None;
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            consume_vitals_stream(
+                fixture.stream,
+                &mut fixture.probe,
+                &latest,
+                &steers,
+                &mut previous_alert,
+                &Arc::new(RwLock::new(HealthDependencies::default())),
+            ),
+        )
+        .await
+        .expect("probe deadline must bound the monitor");
+        assert!(result.is_err());
+        invalidate_vitals_context(&latest, &steers, &mut previous_alert).await;
+        assert!(latest.read().await.snapshot.is_none());
+        assert!(previous_alert.unwrap().contains("unverified"));
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    /// Full user queues cannot delay notification of this or another session.
+    async fn health_notifications_bypass_full_user_queues() {
+        let steers = Arc::new(Mutex::new(HashMap::new()));
+        let mut receivers = Vec::new();
+        for session_id in ["full", "responsive"] {
+            let (task_tx, task_rx) = mpsc::channel(1);
+            if session_id == "full" {
+                task_tx.send(task("")).await.unwrap();
+            }
+            let (health_tx, health_rx) = watch::channel(None);
+            let (events, _) = tokio::sync::broadcast::channel(1);
+            steers.lock().await.insert(
+                session_id.to_string(),
+                ActiveTurnInput {
+                    turn_id: "turn".into(),
+                    tx: task_tx,
+                    health_tx,
+                    events,
+                    reply_generation: Arc::new(AtomicU64::new(0)),
+                },
+            );
+            receivers.push(TurnSteers::new(task_rx, health_rx));
+        }
+        let delivered = tokio::time::timeout(
+            Duration::from_millis(100),
+            notify_active_turns(&steers, "hardware alert"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered, 2);
+        for receiver in &mut receivers {
+            let received = receiver.recv().await.unwrap();
+            assert_eq!(received.text, "hardware alert");
+            assert!(received.context_json.contains("system_vitals_alert"));
+        }
+        assert_eq!(receivers[0].try_recv().unwrap().task_id, "t");
+    }
+
+    #[tokio::test]
+    /// Rapid health changes coalesce without dropping ordered user input.
+    async fn health_updates_coalesce_and_preserve_user_steers() {
+        let (task_tx, task_rx) = mpsc::channel(1);
+        task_tx.send(task("")).await.unwrap();
+        let (health_tx, health_rx) = watch::channel(None);
+        let mut first = task("");
+        first.text = "fault".into();
+        health_tx.send(Some(first)).unwrap();
+        let mut second = task("");
+        second.text = "recovered".into();
+        health_tx.send(Some(second)).unwrap();
+        let mut receiver = TurnSteers::new(task_rx, health_rx);
+        assert_eq!(receiver.try_recv().unwrap().text, "recovered");
+        assert_eq!(receiver.try_recv().unwrap().task_id, "t");
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -728,6 +1520,24 @@ mod tests {
         assert!(!task_is_abort_turn(&task(r#"{"foo":1}"#)));
         assert!(!task_is_abort_turn(&task("")));
         assert!(!task_is_abort_turn(&task("not json")));
+    }
+
+    #[test]
+    /// Severe alerts request exact plan targets rather than global cancellation.
+    fn severe_vitals_events_request_targeted_plan_stops() {
+        let message = vitals_event_message(r#"{"component":"body/camera","health":"STALE"}"#, true);
+        assert!(message.contains("exact plan_id"));
+        assert!(message.contains("Never use cancel_all"));
+        assert!(message.contains("preserve unrelated plans"));
+    }
+
+    #[test]
+    /// Warning notifications do not instruct the model to cancel plans.
+    fn warning_vitals_events_do_not_request_plan_cancellation() {
+        let message =
+            vitals_event_message(r#"{"component":"body/battery","health":"WARN"}"#, false);
+        assert!(message.contains("warning"));
+        assert!(!message.contains("cancel_plan"));
     }
 
     #[test]

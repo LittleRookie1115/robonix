@@ -42,6 +42,13 @@ Common configuration:
 - `ROBONIX_PILOT_VLM_IDLE_TIMEOUT_SECS`: maximum time without a VLM stream event before ending the turn and canceling its submitted plan. Defaults to `30` seconds and is clamped to `5..=300`. Non-empty `reasoning_content` deltas refresh this timer but are not appended to the assistant JSON.
 - `ROBONIX_SESSION_DIR`: where session transcripts are kept (see Session transcripts). `rbnx boot` sets it; defaults to `./sessions`.
 
+Pilot uses `system/lifecycle.rs`, shared with Executor, Liaison, and Vitals,
+to serve `robonix/lifecycle/driver`. Startup calls `CMD_INIT` and
+`CMD_ACTIVATE` through that RPC before reporting readiness. A successful
+`CMD_SHUTDOWN` publishes `TERMINATED`, stops heartbeats, and requests
+graceful gRPC shutdown. Failed Atlas transitions return `ok=false` and leave
+the server running.
+
 ## Context capacity: automatic, visible, and overrideable
 
 Pilot compacts history before the next request would exceed the model's total context capacity. This is not the same thing as `max_tokens`: it is the full input + output budget.
@@ -118,9 +125,47 @@ Atlas discovery still runs before every planning round. Pilot omits contracts wh
 
 A plan names a capability by the exact catalog entry `<provider_id>.<llm_name>`. Contract ids remain runtime identifiers for Atlas, contracts, and internal configuration; they are not a second model-facing spelling. Pilot omits a capability from both the catalog and target map when its contract metadata sets `llm_callable = false`.
 
-A planning request is split so that its prefix is cacheable. The system message carries only what never changes, Pilot rules and the RTDL contract, before the ordered conversation history. Everything that can change lives in history. Memory and an explicit response mode are appended once for each submitted task; every task records either voice or text mode, so a later text request supersedes voice-only constraints without rewriting history. The callable capability catalog, the Soma body data, and the provider-doc index are re-read before every planning round. The first round of each task, and the first round after history compaction, appends each of them in full; later rounds append only what changed, and for the catalog that is a list of the capabilities added, changed, or removed. A snapshot counts as shown only once its round is written to history, so a round dropped for a steer or a stale plan does not leave the model without it. A provider registering or leaving therefore never invalidates the cached prefix. Live embodiment health, in-flight trees, Executor state, and environment state are appended on every round, followed by the assistant reply and any task-state/result records. The next request therefore extends rather than reorders the prior message sequence. Prompt logs include both the cacheable-prefix byte length and fingerprint, making accidental prefix churn observable.
+A planning request is split so that its prefix is cacheable. The system message carries only what never changes, Pilot rules and the RTDL contract, before the ordered conversation history. Everything that can change lives in history. Memory and an explicit response mode are appended once for each submitted task; every task records either voice or text mode, so a later text request supersedes voice-only constraints without rewriting history. The callable capability catalog, the Soma body data, and the provider-doc index are re-read before every planning round. The first round of each task, and the first round after history compaction, appends each of them in full; later rounds append only what changed, and for the catalog that is a list of the capabilities added, changed, or removed. A snapshot counts as shown only once its round is written to history, so a round dropped for a steer or a stale plan does not leave the model without it. A provider registering or leaving therefore never invalidates the cached prefix. The current hardware-health block comes from Vitals; in-flight trees, Executor state, and environment state are appended on every round, followed by the assistant reply and any task-state/result records. The next request therefore extends rather than reorders the prior message sequence. Prompt logs include both the cacheable-prefix byte length and fingerprint, making accidental prefix churn observable.
 
-Both Soma blocks are projected onto what a planner acts on. From the body description that drops the `urdf` file reference — a path in the provider's own filesystem namespace, pointing at the kinematics this crate already declines to inject — the `footprint` collision polygon that navigation rather than the planner consumes, and the description of each exported capability, which the capability catalog in the same prompt already carries verbatim; the component-to-capability mapping stays, since the catalog does not say which part of the body offers a capability. From the live health snapshot it drops fields at an absent value, which the prompt's own "missing means unknown" rule already covers. `dimensions`, sensor `placement`, `can_do` / `cannot_do`, and the deployment notes are body facts and remain.
+Pilot also subscribes to Vitals' existing `StreamVitals` capability. It caches the latest snapshot for the next planning round and injects a health event into active sessions immediately when component health changes, interrupting an in-progress VLM response so Pilot replans with the new state. Vitals independently requests targeted Executor cancellation for `ERROR` or `STALE`, without waiting for model analysis or requiring an active Pilot session. The model sees the dependency evidence and current Executor state, verifies pending stops, and preserves unrelated plans. A missing or disconnected Vitals stream is presented as unknown health, not as an all-clear.
+
+Before each streamed capability node is sent, Pilot checks Vitals' cached provider/contract admission policy. The check runs between nodes even when one model text delta contains several calls, and again after waiting for input capacity. Pilot also checks the accepted prefix before sending CLOSE or END, since these messages can release more execution. A matching call is rejected and the model gets one corrective retry; a second unsafe response ends that interaction with an explicit blocked-action message. Pilot cancels only this response's exact plan before closing its input, without sending CLOSE or END on the rejected tree. Already submitted nodes and observed results remain visible in the session forest; cancellation does not undo completed actions or prove every accepted action stopped. Other in-flight plans remain untouched. `WARN` and startup `UNKNOWN` alone do not trigger automatic rejection, and health recovery does not automatically restart canceled plans. Software cancellation cannot replace a device's physical safety mechanism.
+
+Known severe component faults continue to block admission after Vitals disconnects
+or a later snapshot omits the component. Only a verified `OK` or `WARN` report for
+that same component clears its retained fault; `UNKNOWN` and empty snapshots do
+not. Pilot retains at most 2,048 severe components and reports incomplete admission
+coverage if this limit is reached.
+
+Because the stream sends transitions rather than heartbeats, Pilot verifies
+the same Vitals provider with `GetVitals` every two seconds using a two-second
+RPC deadline. Failed verification invalidates cached health and notifies active
+turns. Health notifications use a coalesced channel separate from ordered user
+input, so a full user queue cannot block health monitoring or other sessions.
+Health-state, component, or recorded-dependency changes interrupt inference; changing
+values in an existing alarm still refresh context without restarting sampling.
+Failed verification invalidates health before deadline-bounded Atlas cleanup.
+
+Vitals computes dependency impact from Soma exports, Atlas connections, and
+Executor's active plans. Pilot receives that result in
+`VitalsSnapshot.dependency_report_json` over the existing GetVitals and
+StreamVitals RPCs. Pilot does not rebuild the dependency graph or depend on
+the Vitals Rust crate.
+
+Fault-time requests include Vitals' causal input contracts and candidate plan
+ids; healthy requests use a compact summary. The report also supplies bounded
+provider/contract admission data, which Pilot checks before each streamed NODE,
+CLOSE, and END. Retained faults survive lost Vitals connections until verified
+recovery. Missing reports are reported as unavailable; older Vitals servers can
+still provide health, but cannot provide deterministic dependency admission.
+Candidate plans are not proof of a completed cancellation. Missing bindings,
+cached evidence, malformed data, or truncation remain explicit uncertainty.
+An unavailable or oversized admission policy rejects new non-control calls
+until a usable Vitals policy arrives; system control remains available.
+Restrictions are retained per provider and component so recovery of one device
+cannot clear another device's fault on the same provider.
+
+The Soma body description is projected onto what a planner acts on. The `urdf` file reference — a path in the provider's own filesystem namespace, pointing at the kinematics this crate already declines to inject — the `footprint` collision polygon that navigation rather than the planner consumes, and the description of each exported capability, which the capability catalog in the same prompt already carries verbatim, are omitted; the component-to-capability mapping stays, since the catalog does not say which part of the body offers a capability. The Vitals block contains only non-OK component health, or a compact all-reported-healthy summary, to avoid repeating empty telemetry. `dimensions`, sensor `placement`, `can_do` / `cannot_do`, and the deployment notes are body facts and remain.
 
 The catalog prints each capability's name, the opening paragraph of its description, and its argument schema. A description longer than that paragraph — a provider that wrote its request/response manual into the description field rather than a `CAPABILITY.md` — is summarized, and the entry carries a `more:` line naming the `provider_id` to pass to the Executor's `read_capability_doc` builtin for the full text. The catalog stays in history, with later rounds appending only changes. A manual is fetched when the model requests it.
 
@@ -200,5 +245,3 @@ advancing while nothing will run, so the reply is rejected
 (`empty_dispatch_problem`) and the model gets one corrective round; if it repeats,
 the turn ends with what the model said. An empty sequence with no task update is
 an answer or a question to the user.
-
-The lifecycle Driver implementation is shared in `system/lifecycle.rs`.

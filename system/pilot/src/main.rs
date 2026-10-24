@@ -21,6 +21,7 @@
 
 mod config;
 mod discovery;
+mod health_dependencies;
 mod history;
 #[path = "../../lifecycle.rs"]
 mod lifecycle;
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
     info!("declared RobonixSystemPilotGetHealth gRPC at {advertised}");
 
     let svc = PilotServiceImpl::new(atlas.clone(), cfg.id.clone(), vlm, history_budget);
+    let vitals_monitor = svc.clone();
     let server_shutdown = lifecycle.subscribe_shutdown();
     let server_lifecycle = lifecycle.clone();
     let mut server_task = tokio::spawn(async move {
@@ -192,6 +194,7 @@ async fn main() -> Result<()> {
         .await
         .context("activate Pilot lifecycle")?;
     drop(startup_driver);
+    vitals_monitor.start_vitals_monitor();
 
     // Atlas evicts providers after ~60s without a heartbeat. Send one every
     // 20s so we stay registered for the lifetime of the process.
