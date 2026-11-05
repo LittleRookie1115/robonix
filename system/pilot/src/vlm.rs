@@ -390,6 +390,9 @@ pub enum ReplyShape {
     /// The RTDL envelope asked for as any JSON object, for a provider that
     /// answered the schema with nothing.
     RtdlJsonObject,
+    /// One to three failure situations, each with the RTDL envelope prepared
+    /// for it (see `speculation`).
+    Situations,
 }
 
 /// The RTDL envelope as a JSON schema.
@@ -497,6 +500,32 @@ fn rtdl_envelope_schema() -> Value {
     })
 }
 
+/// A list of failure situations, each with its reply as an RTDL envelope. The
+/// envelope's `$defs` move to the root, where its `$ref`s resolve.
+fn situations_schema() -> Value {
+    let mut reply = rtdl_envelope_schema();
+    let defs = reply
+        .as_object_mut()
+        .and_then(|reply| reply.remove("$defs"));
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "situations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {"when": {"type": "string"}, "reply": reply},
+                    "required": ["when", "reply"],
+                },
+            },
+        },
+        "required": ["situations"],
+        "$defs": defs,
+    })
+}
+
 /// Claude caches a prompt only up to an explicit `cache_control` breakpoint.
 /// Mark the system prompt and the two newest messages: the newest is the
 /// per-round context, which is not kept in history, so the one before it is
@@ -549,6 +578,14 @@ fn response_format_for(shape: ReplyShape) -> Option<ResponseFormat> {
             },
         }),
         ReplyShape::RtdlJsonObject => Some(ResponseFormat::JsonObject),
+        ReplyShape::Situations => Some(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                description: None,
+                name: "situations".to_string(),
+                schema: Some(situations_schema()),
+                strict: Some(false),
+            },
+        }),
     }
 }
 

@@ -1397,6 +1397,9 @@ pub async fn run_turn(
     let speculate = task_speculates(task);
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
+    // Every step reported this turn, since a reply may close the task on
+    // results of earlier trees.
+    let mut turn_steps: Vec<serde_json::Value> = Vec::new();
 
     'supervisor: loop {
         while let Ok(event) = forest.interrupt_rx.try_recv() {
@@ -1667,6 +1670,7 @@ pub async fn run_turn(
         let mut prepared = None;
         let mut request = None;
         if let Some(mut spec) = speculation.take() {
+            turn_steps.extend_from_slice(spec.report());
             let branch = if tasks.messages.len() != spec.messages_seen {
                 Err("user message arrived".to_string())
             } else if compacted {
@@ -1690,6 +1694,13 @@ pub async fn run_turn(
                     if !branch.is_ready() {
                         request = Some(open_request(history, tasks));
                     }
+                    let dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(
+                        target_map.clone(),
+                        Arc::new(AtomicU64::new(0)),
+                        session_id.clone(),
+                        round,
+                    )
+                    .with_outputs(spec.outputs().clone());
                     let reply = tokio::select! {
                         biased;
                         _ = term_signal.changed() => {
@@ -1702,25 +1713,9 @@ pub async fn run_turn(
                             request = None;
                             Err("user message arrived".to_string())
                         }
-                        reply = branch.reply() => reply.ok_or_else(|| "request failed".to_string()),
+                        reply = spec.resolve(&mut branch, &turn_steps, dry_run) => reply,
                     };
-                    reply.and_then(|reply| {
-                        if speculation::needs_results(&reply) {
-                            return Err("reply needs results".to_string());
-                        }
-                        let mut dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(
-                            target_map.clone(),
-                            Arc::new(AtomicU64::new(0)),
-                            session_id.clone(),
-                            round,
-                        )
-                        .with_outputs(spec.outputs().clone());
-                        match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
-                            Ok((_, None)) => Ok((reply, branch)),
-                            Ok((_, Some(_))) => Err("reply is a plan-control op".to_string()),
-                            Err(error) => Err(format!("reply rejected: {error:#}")),
-                        }
-                    })
+                    reply.map(|reply| (reply, branch))
                 }
             };
             match reply {
@@ -2139,6 +2134,7 @@ pub async fn run_turn(
                 vlm,
                 &graph,
                 prefix,
+                task,
                 tasks.messages.len(),
                 vlm_idle_timeout(),
             ));
