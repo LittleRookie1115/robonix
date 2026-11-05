@@ -116,7 +116,7 @@ impl PlanInput {
             return Err(format!("node {index} has duplicate op_id '{op_id}'"));
         }
         match node.node_kind {
-            0 | 1 if node.call.is_none() => {}
+            0 | 1 | 3 if node.call.is_none() => {}
             2 => {
                 if !node.children.is_empty() {
                     return Err(format!("do node {index} must not have children"));
@@ -499,6 +499,7 @@ mod complete_plan_tests {
     const RTDL_SEQUENCE: u32 = 0;
     const RTDL_PARALLEL: u32 = 1;
     const RTDL_DO: u32 = 2;
+    const RTDL_FALLBACK: u32 = 3;
 
     /// Construct a valid call so tree tests isolate the targeted structural error.
     fn call(id: &str) -> CapabilityCall {
@@ -562,6 +563,28 @@ mod complete_plan_tests {
             0,
         );
         PlanInput::from_plan(p).unwrap();
+    }
+
+    /// Accept a fallback operator and reject one that carries a call.
+    #[test]
+    fn validates_fallback_nodes() {
+        let fallback = |own_call| {
+            plan(
+                vec![
+                    node_with_identity(
+                        "op_1",
+                        "try alternatives",
+                        RTDL_FALLBACK,
+                        vec![1],
+                        own_call,
+                    ),
+                    node_with_identity("op_2", "first try", RTDL_DO, vec![], Some(call("p:0"))),
+                ],
+                0,
+            )
+        };
+        PlanInput::from_plan(fallback(None)).unwrap();
+        assert!(PlanInput::from_plan(fallback(Some(call("p:1")))).is_err());
     }
 
     /// Require an identity for every operator as well as every leaf.

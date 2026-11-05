@@ -149,11 +149,12 @@ impl StreamExecution {
     }
 
     /// Remember events until the final prefix Plan has been published to the forest.
+    /// Returns whether a failure outside any fallback makes the rest of the reply stale.
     pub(crate) fn remember(&mut self, event: RtdlEvent) -> bool {
-        let failed = event
-            .node_state
-            .as_ref()
-            .is_some_and(|n| matches!(n.state, 3..=5));
+        let failed = event.node_state.as_ref().is_some_and(|n| {
+            matches!(n.state, 3..=5)
+                && !crate::planner::fallback_descendants(&self.plan).contains(&n.node_index)
+        });
         if event.plan_complete.is_some() {
             self.complete = true;
         }
@@ -302,6 +303,38 @@ mod tests {
                 ..Default::default()
             }))
         }
+    }
+
+    #[test]
+    fn failures_under_a_fallback_do_not_interrupt_generation() {
+        use crate::pb::pilot::{RtdlNode, RtdlNodeState};
+        let mut live = StreamExecution::default();
+        live.plan.nodes = vec![
+            RtdlNode {
+                node_kind: crate::planner::RTDL_SEQUENCE,
+                children: vec![1, 3],
+                ..Default::default()
+            },
+            RtdlNode {
+                node_kind: crate::planner::RTDL_FALLBACK,
+                children: vec![2],
+                ..Default::default()
+            },
+            RtdlNode::default(),
+            RtdlNode::default(),
+        ];
+        let failed = |node_index| RtdlEvent {
+            node_state: Some(RtdlNodeState {
+                node_index,
+                state: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!live.remember(failed(2)));
+        assert!(live.remember(failed(1)));
+        assert!(live.remember(failed(3)));
+        assert_eq!(live.events.len(), 3);
     }
 
     /// Neither successful nor failed cancellation may seal a partial plan first.

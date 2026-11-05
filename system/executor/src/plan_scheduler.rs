@@ -5,9 +5,11 @@ use crate::capability_execution;
 use crate::pb::executor::{ExecuteStreamInput, RtdlEvent};
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum as State;
 use crate::plan_input::{EXECUTE_STREAM_NODE, PlanInput};
-use crate::rtdl_events;
+use crate::rtdl_events::{self, RTDL_FALLBACK, RTDL_PARALLEL};
 use crate::verification::VerificationPolicy;
 use robonix_atlas::client::AtlasClient;
+use robonix_scribe::warn;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -28,6 +30,8 @@ struct Execution {
     verifying: bool,
     /// Whether the scheduler skipped this node due to cancellation or a failed sibling.
     canceled: bool,
+    /// Output of a successful call, kept so later nodes can read it through `$ref`.
+    output: Option<String>,
 }
 
 enum Completion {
@@ -109,7 +113,8 @@ impl PlanScheduler {
             .await;
     }
 
-    /// Return whether the parent permits execution and whether an earlier sequence child failed.
+    /// Return whether the parent permits execution and whether an earlier sibling rules it out:
+    /// a failure in a sequence, or a success in a fallback.
     fn permitted(&self, index: usize) -> (bool, bool) {
         let Some(parent) = self.input.parent(index) else {
             return (true, false);
@@ -121,7 +126,8 @@ impl PlanScheduler {
         if !p.started {
             return (false, false);
         }
-        if self.input.plan().nodes[parent].node_kind == 1 {
+        let kind = self.input.plan().nodes[parent].node_kind;
+        if kind == RTDL_PARALLEL {
             return (true, false);
         }
         for sibling in &self.input.plan().nodes[parent].children {
@@ -129,12 +135,70 @@ impl PlanScheduler {
                 break;
             }
             match self.execution[*sibling as usize].immediate {
-                Some(true) => return (false, true),
                 None => return (false, false),
-                Some(false) => {}
+                Some(failed) if failed != (kind == RTDL_FALLBACK) => return (false, true),
+                Some(_) => {}
             }
         }
         (true, false)
+    }
+
+    /// Whether an operator failed, given its children's outcomes: a fallback needs one success,
+    /// the other operators need every child to succeed.
+    fn operator_failed(&self, index: usize, outcome: impl Fn(&Execution) -> Option<bool>) -> bool {
+        let node = &self.input.plan().nodes[index];
+        let mut children = node
+            .children
+            .iter()
+            .map(|c| outcome(&self.execution[*c as usize]));
+        self.cancelled
+            || self.execution[index].canceled
+            || if node.node_kind == RTDL_FALLBACK {
+                !children.any(|failed| failed == Some(false))
+            } else {
+                children.any(|failed| failed == Some(true))
+            }
+    }
+
+    /// Replace each `{"$ref": "<op_id>#<JSON pointer>"}` in the arguments with that part of an
+    /// earlier node's output; arguments without references pass through unchanged.
+    fn resolve_refs(&self, args_json: &str) -> Result<String, String> {
+        if !args_json.contains("\"$ref\"") {
+            return Ok(args_json.to_string());
+        }
+        let mut args: Value = serde_json::from_str(args_json).map_err(|e| e.to_string())?;
+        self.substitute_refs(&mut args)?;
+        Ok(args.to_string())
+    }
+
+    fn substitute_refs(&self, value: &mut Value) -> Result<(), String> {
+        match value {
+            Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
+                let reference = map["$ref"]
+                    .as_str()
+                    .ok_or("$ref must be a string")?
+                    .to_string();
+                let (op_id, pointer) = reference.split_once('#').unwrap_or((&reference, ""));
+                let output = self
+                    .input
+                    .plan()
+                    .nodes
+                    .iter()
+                    .position(|n| n.op_id == op_id)
+                    .and_then(|i| self.execution[i].output.as_deref())
+                    .ok_or_else(|| format!("$ref '{reference}' names no succeeded call"))?;
+                let output = serde_json::from_str(output)
+                    .unwrap_or_else(|_| Value::String(output.to_string()));
+                *value = output
+                    .pointer(pointer)
+                    .cloned()
+                    .ok_or_else(|| format!("$ref '{reference}' is not in {op_id}'s output"))?;
+            }
+            Value::Object(map) => map.values_mut().try_for_each(|v| self.substitute_refs(v))?,
+            Value::Array(items) => items.iter_mut().try_for_each(|v| self.substitute_refs(v))?,
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Advance runnable nodes and closed operators; report transitions that may unlock more work.
@@ -158,7 +222,7 @@ impl PlanScheduler {
                     immediate: leaf.then_some(true),
                     final_failed: leaf.then_some(true),
                     canceled: true,
-                    verifying: false,
+                    ..Execution::default()
                 };
                 if !leaf {
                     continue;
@@ -179,7 +243,31 @@ impl PlanScheduler {
             }
             self.execution[index].started = true;
             let node = &self.input.plan().nodes[index];
-            if let Some(call) = node.call.clone() {
+            if let Some(mut call) = node.call.clone() {
+                match self.resolve_refs(&call.args_json) {
+                    Ok(args_json) => call.args_json = args_json,
+                    Err(error) => {
+                        warn!(
+                            "[executor] call_id={} not dispatched: {error}",
+                            call.call_id
+                        );
+                        self.execution[index].immediate = Some(true);
+                        self.execution[index].final_failed = Some(true);
+                        self.runtime
+                            .record_op_state(&ctx.plan_id, &ctx.op_id, State::Failed as u32)
+                            .await;
+                        let result = crate::dispatch::error_result(&call, error);
+                        let _ = self
+                            .tx
+                            .send(Ok(rtdl_events::node_state_from_result(
+                                &ctx,
+                                result,
+                                State::Failed as u32,
+                            )))
+                            .await;
+                        continue;
+                    }
+                }
                 let atlas = self.atlas.clone();
                 let provider_id = self.provider_id.clone();
                 let runtime = self.runtime.clone();
@@ -201,10 +289,7 @@ impl PlanScheduler {
                             .await;
                         return Completion::Call(
                             index,
-                            capability_execution::NodeExecution {
-                                failed: true,
-                                verifier: None,
-                            },
+                            capability_execution::NodeExecution::finished(true, String::new()),
                         );
                     }
                     let result = capability_execution::execute_call(
@@ -245,11 +330,7 @@ impl PlanScheduler {
                 .iter()
                 .all(|c| self.execution[*c as usize].immediate.is_some())
             {
-                let failed = self.cancelled
-                    || self.execution[index].canceled
-                    || children
-                        .iter()
-                        .any(|c| self.execution[*c as usize].immediate == Some(true));
+                let failed = self.operator_failed(index, |e| e.immediate);
                 progressed |= self.execution[index].immediate != Some(failed);
                 self.execution[index].immediate = Some(failed);
             }
@@ -258,11 +339,7 @@ impl PlanScheduler {
                 .iter()
                 .all(|c| self.execution[*c as usize].final_failed.is_some())
             {
-                let failed = self.cancelled
-                    || self.execution[index].canceled
-                    || children
-                        .iter()
-                        .any(|c| self.execution[*c as usize].final_failed == Some(true));
+                let failed = self.operator_failed(index, |e| e.final_failed);
                 self.execution[index].final_failed = Some(failed);
                 progressed = true;
                 rtdl_events::send_operator_final(
@@ -333,6 +410,9 @@ impl PlanScheduler {
                     match result {
                         Some(Ok(Completion::Call(index, outcome))) => {
                             self.execution[index].immediate = Some(outcome.failed);
+                            if !outcome.failed {
+                                self.execution[index].output = Some(outcome.output);
+                            }
                             if let Some(verifier) = outcome.verifier {
                                 self.tasks.spawn(async move { Completion::Verified(index, capability_execution::wait_for_verifier(verifier).await) });
                             } else {
@@ -417,7 +497,7 @@ mod scheduling_tests {
     use crate::pb::contracts::robonix_system_executor_execute_stream_server::RobonixSystemExecutorExecuteStreamServer;
     use crate::pb::pilot::Plan;
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
-    use crate::pb::pilot::{CapabilityCall, RtdlNode};
+    use crate::pb::pilot::{CapabilityCall, RtdlNode, RtdlNodeState};
     use crate::plan_input::{EXECUTE_STREAM_CLOSE, EXECUTE_STREAM_END, EXECUTE_STREAM_START};
     use crate::verification::VerificationPolicy;
     use robonix_atlas::{
@@ -706,5 +786,139 @@ mod scheduling_tests {
         assert_eq!(states.last(), Some(&(0, RtdlNodeStateEnum::Failed as u32)));
         assert_eq!(plan_failed, Some(true));
         atlas_server.abort();
+    }
+
+    /// Build a builtin call node whose op_id is also its call_id.
+    fn builtin(op_id: &str, op: &str, args: serde_json::Value) -> RtdlNode {
+        RtdlNode {
+            node_kind: RTDL_DO,
+            call: Some(CapabilityCall {
+                call_id: op_id.into(),
+                provider_id: "executor".into(),
+                contract_id: format!("robonix/system/executor/builtin/{op}"),
+                args_json: args.to_string(),
+            }),
+            op_id: op_id.into(),
+            description: op_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Run a complete plan without verification; return node states and whether the plan failed.
+    async fn run_plan(nodes: Vec<RtdlNode>) -> (Vec<RtdlNodeState>, bool) {
+        let atlas_addr = reserve_address();
+        let atlas_server =
+            tokio::spawn(serve_atlas(Arc::new(AtlasRegistry::default()), atlas_addr));
+        let atlas = AtlasClient::connect_with_retry(
+            format!("http://{atlas_addr}"),
+            50,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("connect test Atlas");
+        let service = ExecutorServiceImpl::new(
+            atlas,
+            "executor".into(),
+            Arc::new(VerificationPolicy::new(false, Vec::new())),
+        );
+        let plan = Plan {
+            plan_id: "branching".into(),
+            nodes,
+            ..Default::default()
+        };
+        let mut stream = service
+            .execute(Request::new(plan))
+            .await
+            .unwrap()
+            .into_inner();
+        let (mut states, mut failed) = (Vec::new(), None);
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            states.extend(event.node_state);
+            failed = event.plan_complete.map(|c| c.any_failed).or(failed);
+        }
+        atlas_server.abort();
+        (states, failed.expect("plan_complete"))
+    }
+
+    fn final_state(states: &[RtdlNodeState], index: u32) -> RtdlNodeStateEnum {
+        let state = states.iter().rfind(|s| s.node_index == index).unwrap();
+        RtdlNodeStateEnum::try_from(state.state as i32).unwrap()
+    }
+
+    /// A fallback stops at its first succeeding child and fails only when every child fails.
+    #[tokio::test]
+    async fn fallback_runs_children_until_one_succeeds() {
+        let fallback = |children| RtdlNode {
+            node_kind: RTDL_FALLBACK,
+            children,
+            op_id: "fallback".into(),
+            description: "try alternatives".into(),
+            ..Default::default()
+        };
+        let fails = |id| {
+            builtin(
+                id,
+                "check",
+                serde_json::json!({"left":1,"op":"==","right":2}),
+            )
+        };
+        let holds = |id| {
+            builtin(
+                id,
+                "check",
+                serde_json::json!({"left":1,"op":"==","right":1}),
+            )
+        };
+
+        let (states, failed) = run_plan(vec![
+            fallback(vec![1, 2, 3]),
+            fails("a"),
+            holds("b"),
+            holds("c"),
+        ])
+        .await;
+        assert_eq!(final_state(&states, 1), RtdlNodeStateEnum::Failed);
+        assert_eq!(final_state(&states, 2), RtdlNodeStateEnum::Succeeded);
+        assert_eq!(final_state(&states, 3), RtdlNodeStateEnum::Canceled);
+        assert_eq!(final_state(&states, 0), RtdlNodeStateEnum::Succeeded);
+        assert!(!failed);
+
+        let (states, failed) = run_plan(vec![fallback(vec![1, 2]), fails("a"), fails("b")]).await;
+        assert_eq!(final_state(&states, 2), RtdlNodeStateEnum::Failed);
+        assert_eq!(final_state(&states, 0), RtdlNodeStateEnum::Failed);
+        assert!(failed);
+    }
+
+    /// A `$ref` argument is replaced by the named part of an earlier output, and a reference
+    /// that cannot be resolved fails its node without dispatching it.
+    #[tokio::test]
+    async fn refs_read_earlier_outputs() {
+        let sequence = RtdlNode {
+            node_kind: RTDL_SEQUENCE,
+            children: vec![1, 2, 3],
+            op_id: "sequence".into(),
+            description: "read an output".into(),
+            ..Default::default()
+        };
+        let compare = |id, reference| {
+            builtin(
+                id,
+                "check",
+                serde_json::json!({"left":{"$ref":reference},"op":"==","right":"branching"}),
+            )
+        };
+        let (states, failed) = run_plan(vec![
+            sequence,
+            builtin("plans", "get_all_plans", serde_json::json!({})),
+            compare("found", "plans#/plans/0/plan_id"),
+            compare("missing", "plans#/plans/1/plan_id"),
+        ])
+        .await;
+        assert_eq!(final_state(&states, 2), RtdlNodeStateEnum::Succeeded);
+        assert_eq!(final_state(&states, 3), RtdlNodeStateEnum::Failed);
+        let missing = states.iter().rfind(|s| s.node_index == 3).unwrap();
+        assert!(missing.leaf_result.as_ref().unwrap().error.contains("$ref"));
+        assert!(failed);
     }
 }

@@ -21,14 +21,17 @@ pub(crate) struct NodeExecution {
     pub(crate) failed: bool,
     /// Pending background verification task, returning true if verification fails.
     pub(crate) verifier: Option<JoinHandle<bool>>,
+    /// Capability output that later nodes in the plan may reference through `$ref`.
+    pub(crate) output: String,
 }
 
 impl NodeExecution {
     /// Build an outcome with no background verification still pending.
-    fn finished(failed: bool) -> Self {
+    pub(crate) fn finished(failed: bool, output: String) -> Self {
         Self {
             failed,
             verifier: None,
+            output,
         }
     }
 }
@@ -179,6 +182,7 @@ pub(crate) async fn execute_call(
             )))
             .await;
         log_success(call, &result);
+        let output = result.output.clone();
 
         let verifier = tokio::spawn(
             OverlapVerifier {
@@ -196,6 +200,7 @@ pub(crate) async fn execute_call(
         return NodeExecution {
             failed: false,
             verifier: Some(verifier),
+            output,
         };
     }
 
@@ -236,7 +241,7 @@ pub(crate) async fn execute_call(
         warn!("[executor] '{}' failed: {}", call.contract_id, result.error);
     }
 
-    NodeExecution::finished(failed)
+    NodeExecution::finished(failed, result.output)
 }
 
 impl OverlapVerifier {

@@ -18,8 +18,9 @@ use async_openai::types::chat::{
 use futures_util::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -367,6 +368,10 @@ pub struct VlmClient {
     /// would defeat reuse between independent tasks with the same standing
     /// prompt. It is opaque and is not derived from a user/session id.
     prompt_cache_key: String,
+    /// Optional request fields and `response_format` types this upstream
+    /// refused earlier in the process. Later requests leave them out up front
+    /// rather than pay the same rejected round trip on every planning round.
+    refused: Arc<Mutex<HashSet<String>>>,
 }
 
 /// What the caller wants back from one completion.
@@ -401,7 +406,7 @@ fn rtdl_envelope_schema() -> Value {
     let node = serde_json::json!({
         "type": "object",
         "properties": {
-            "op": {"type": "string", "enum": ["sequence", "parallel", "do"]},
+            "op": {"type": "string", "enum": ["sequence", "parallel", "fallback", "do"]},
             "op_id": {"type": "integer"},
             "description": {"type": "string"},
             "cap": {"type": "string"},
@@ -556,6 +561,7 @@ impl VlmClient {
             model: cfg.model.clone(),
             configured_context_window_tokens: cfg.context_window_tokens,
             prompt_cache_key: Uuid::new_v4().simple().to_string(),
+            refused: Arc::default(),
         }
     }
 
@@ -686,6 +692,19 @@ impl VlmClient {
             );
         }
         add_claude_cache_breakpoints(&self.model, &mut request_body);
+        let refused = self.refused.lock().expect("VLM refusal lock").clone();
+        if let Some(body) = request_body.as_object_mut() {
+            for field in &refused {
+                body.remove(field);
+            }
+        }
+        while request_body
+            .pointer("/response_format/type")
+            .and_then(Value::as_str)
+            .is_some_and(|format| refused.contains(format))
+        {
+            downgrade_response_format(&mut request_body);
+        }
 
         let url = format!("{}/chat/completions", self.api_base);
         let mut retry_index = 0;
@@ -729,6 +748,10 @@ impl VlmClient {
                 let lowered = text.to_ascii_lowercase();
                 let names_format =
                     lowered.contains("response_format") || lowered.contains("json_schema");
+                let format_before = request_body
+                    .pointer("/response_format/type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let downgraded = if format_refused || names_format {
                     downgrade_response_format(&mut request_body)
                 } else {
@@ -750,13 +773,18 @@ impl VlmClient {
                 if dropped.is_empty() && downgraded.is_none() {
                     bail!("open VLM chat stream: HTTP {status}: {text}");
                 }
+                {
+                    let mut refused = self.refused.lock().expect("VLM refusal lock");
+                    refused.extend(dropped.iter().map(|field| field.to_string()));
+                    refused.extend(format_before.filter(|_| downgraded.is_some()));
+                }
                 // Name what changed rather than "retrying without them": a
                 // downgrade is not a removal, and a run that later reads as
                 // schema-guided needs this line to say it was not.
                 if let Some(now) = downgraded {
                     robonix_scribe::warn!(
                         "[pilot/vlm] upstream rejected response_format with HTTP {status}; \
-                         response_format is now {now} for the rest of this stream. RTDL shape \
+                         response_format is now {now} for this and later requests. RTDL shape \
                          is no longer schema-guided; admission still runs in Pilot. \
                          Upstream said: {text}"
                     );
@@ -764,7 +792,7 @@ impl VlmClient {
                 if !dropped.is_empty() {
                     robonix_scribe::warn!(
                         "[pilot/vlm] upstream rejected optional request fields with HTTP {status}; \
-                         retrying without {}",
+                         retrying without {} now and on later requests",
                         dropped.join(", ")
                     );
                 }
@@ -893,7 +921,7 @@ mod tests {
         downgrade_response_format, open_retry_delay, parse_usage, process_stream_line,
         rejects_optional_request_fields, response_format_for,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -1144,36 +1172,115 @@ mod tests {
         ));
     }
 
+    /// Read one HTTP request from the client and return its JSON body.
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Value {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut bytes = [0; 4096];
+        loop {
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert!(count > 0, "client closed before sending its request");
+            request.extend_from_slice(&bytes[..count]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    return serde_json::from_slice(&request[end + 4..end + 4 + length]).unwrap();
+                }
+            }
+        }
+    }
+
+    fn local_client(address: std::net::SocketAddr) -> super::VlmClient {
+        super::VlmClient {
+            inner: reqwest::Client::builder().no_proxy().build().unwrap(),
+            api_base: format!("http://{address}"),
+            api_key: "local-test".into(),
+            model: "local-test".into(),
+            configured_context_window_tokens: None,
+            prompt_cache_key: "local-test".into(),
+            refused: Default::default(),
+        }
+    }
+
+    /// A field the upstream refused once is left out of later requests, so
+    /// each planning round does not pay the rejected round trip again.
+    #[tokio::test]
+    async fn refused_fields_stay_dropped_on_later_requests() {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_http_request(&mut socket).await;
+                let response = if body.get("prompt_cache_options").is_some() {
+                    let error = r#"{"error":{"message":"prompt_cache_options is not supported on this model"}}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                        error.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndata: [DONE]".to_string()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        let client = local_client(address);
+        for _ in 0..2 {
+            let stream = client
+                .chat_stream(
+                    &[super::Message::user("reply in JSON")],
+                    &[],
+                    None,
+                    ReplyShape::RtdlEnvelope,
+                )
+                .await
+                .unwrap();
+            stream.collect::<Vec<_>>().await;
+        }
+        let bodies = server.await.unwrap();
+        let shape = |body: &Value| {
+            (
+                body.get("prompt_cache_options").is_some(),
+                body.pointer("/response_format/type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+        };
+        assert_eq!(
+            bodies.iter().map(shape).collect::<Vec<_>>(),
+            [
+                (true, Some("json_schema".into())),
+                (false, Some("json_object".into())),
+                (false, Some("json_object".into())),
+            ]
+        );
+    }
+
     /// Exercise the real HTTP receiver with deliberately fragmented response bytes.
     async fn receive_http_chunks(chunks: Vec<Vec<u8>>) -> Vec<anyhow::Result<VlmStreamItem>> {
         use futures_util::StreamExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut bytes = [0; 4096];
-            loop {
-                let count = socket.read(&mut bytes).await.unwrap();
-                assert!(count > 0, "client closed before sending its request");
-                request.extend_from_slice(&bytes[..count]);
-                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = std::str::from_utf8(&request[..end]).unwrap();
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse().unwrap())
-                        })
-                        .unwrap();
-                    if request.len() >= end + 4 + length {
-                        break;
-                    }
-                }
-            }
+            read_http_request(&mut socket).await;
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
             for chunk in chunks {
                 socket
@@ -1186,15 +1293,7 @@ mod tests {
             }
             socket.write_all(b"0\r\n\r\n").await.unwrap();
         });
-        let client = super::VlmClient {
-            inner: reqwest::Client::builder().no_proxy().build().unwrap(),
-            api_base: format!("http://{address}"),
-            api_key: "local-test".into(),
-            model: "local-test".into(),
-            configured_context_window_tokens: None,
-            prompt_cache_key: "local-test".into(),
-        };
-        let stream = client
+        let stream = local_client(address)
             .chat_stream(&[super::Message::user("test")], &[], None, ReplyShape::Text)
             .await
             .unwrap();

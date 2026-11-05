@@ -602,12 +602,13 @@ fn state_label(state: u32) -> &'static str {
     }
 }
 
-/// Label an RTDL node kind (0=sequence, 1=parallel, 2=do).
+/// Label an RTDL node kind (0=sequence, 1=parallel, 2=do, 3=fallback).
 fn kind_label(node_kind: u32) -> &'static str {
     match node_kind {
         0 => "sequence",
         1 => "parallel",
         2 => "do",
+        3 => "fallback",
         _ => "unknown",
     }
 }

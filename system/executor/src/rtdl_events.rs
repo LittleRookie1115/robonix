@@ -10,7 +10,9 @@ use tokio::sync::mpsc::Sender;
 use tonic::Status;
 
 const RTDL_SEQUENCE: u32 = 0;
-const RTDL_PARALLEL: u32 = 1;
+pub(crate) const RTDL_PARALLEL: u32 = 1;
+/// Operator that runs its children in order until one succeeds.
+pub(crate) const RTDL_FALLBACK: u32 = 3;
 
 /// Plan and node metadata copied into RTDL progress events and verification requests.
 #[derive(Clone)]
@@ -117,6 +119,7 @@ pub(crate) async fn send_operator_state(
     let op = match node.node_kind {
         RTDL_SEQUENCE => "sequence",
         RTDL_PARALLEL => "parallel",
+        RTDL_FALLBACK => "fallback",
         _ => "operator",
     };
     let detail = format!(

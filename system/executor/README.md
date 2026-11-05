@@ -45,7 +45,13 @@ All gRPC contracts are under `robonix/system/executor/`:
 Both execution RPCs share one scheduler:
 
 - `sequence` runs children in order and skips later children after a failure;
-  `parallel` runs branches concurrently without canceling siblings on failure.
+  `parallel` runs branches concurrently without canceling siblings on failure;
+  `fallback` runs children in order until one succeeds, skips the rest, and
+  fails only when every child fails.
+- An argument value `{"$ref": "<op_id>#<JSON pointer>"}` is replaced at
+  dispatch with that part of an earlier succeeded node's output (non-JSON
+  output is one string; no pointer means all of it). An unresolvable reference
+  fails the node without dispatching it.
 - Input requires a nonempty plan ID, unique op/call IDs, nonempty node
   descriptions, object-valued call arguments, at most 256 nodes and 32 levels.
   Complete plans must form one tree; active plan IDs cannot be reused.
@@ -110,6 +116,9 @@ Under `robonix/system/executor/builtin/`:
 - `read_capability_doc`: read a registered provider's `CAPABILITY.md` followed
   by the full descriptions of its capabilities. Args: `provider_id` (required).
   Providers without a `CAPABILITY.md` still return their capability descriptions.
+- `check`: succeed when `left op right` holds and fail otherwise, so a
+  `fallback` can branch on an earlier output. `op` is `==`, `!=`, `<`, `<=`,
+  `>`, `>=`, `empty` or `not_empty`.
 - `cancel_plan`, `get_all_plans`, `get_plan_status`: compatibility plan controls;
   Pilot uses `control_plan` and `list_active_plans` directly.
 

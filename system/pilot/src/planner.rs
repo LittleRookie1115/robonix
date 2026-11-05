@@ -59,6 +59,7 @@ pub(crate) type CapabilityTargetMap = HashMap<String, CapabilityTarget>;
 pub(crate) const RTDL_SEQUENCE: u32 = 0;
 pub(crate) const RTDL_PARALLEL: u32 = 1;
 pub(crate) const RTDL_DO: u32 = 2;
+pub(crate) const RTDL_FALLBACK: u32 = 3;
 
 pub(crate) struct DisplayCapability<'a> {
     pub(crate) display_name: String,
@@ -330,11 +331,16 @@ struct TreeMeta {
     /// cancellable in-flight work — a cancel is not itself a task tree, and
     /// listing it makes the model cancel its own term_signals in a loop.
     control_only: bool,
-    /// Canonical provider/contract/args signatures for calls in this tree.
-    /// The harness rejects a second tree containing an identical call while
-    /// the first is still in flight; execution latency must not duplicate a
-    /// physical or external command.
-    call_signatures: HashSet<String>,
+    /// Canonical provider/contract/args signatures of this tree's calls that
+    /// have not reached a terminal state, keyed by node index. The harness
+    /// rejects a second tree containing an identical call while the first is
+    /// still in flight; execution latency must not duplicate a physical or
+    /// external command. A finished call leaves at once, so the model can
+    /// retry a failed call while its tree's other branches still run.
+    call_signatures: HashMap<u32, String>,
+    /// Nodes below a fallback. Their failures are the fallback's to handle, so
+    /// they start no planning round; the fallback's own failure does.
+    absorbed: HashSet<u32>,
     /// Ordered executable leaves from the original RTDL graph. Keeping these
     /// visible lets the model target any semantic boundary in one control call
     /// instead of querying live state first or guessing what "current" means.
@@ -463,9 +469,18 @@ async fn handle_interrupt(
             // without blocking on still-running sibling branches. Successes
             // still batch at tree completion, which avoids per-node re-plan
             // storms.
+            if is_terminal_executor_state(ns.state)
+                && let Some(meta) = forest.trees.get_mut(&plan_id)
+            {
+                meta.call_signatures.remove(&ns.node_index);
+            }
             let replan = is_terminal_executor_state(ns.state)
                 && ns.state != RtdlNodeStateEnum::Succeeded as u32
                 && !forest.kill_pending.contains(&plan_id)
+                && !forest
+                    .trees
+                    .get(&plan_id)
+                    .is_some_and(|meta| meta.absorbed.contains(&ns.node_index))
                 && tasks.any_open();
             log_node_state(&plan_id, &ns);
             // Moving `ns` last avoids cloning its (possibly large) leaf_result.
@@ -586,7 +601,10 @@ async fn drive_plan(
                             // it so the supervisor suppresses the post-cancel
                             // replan that would otherwise feed a cancel storm.
                             canceled |= ns.node_index == 0;
-                        } else if ns.state != RtdlNodeStateEnum::Succeeded as u32 {
+                        } else if ns.node_index == 0
+                            && ns.state != RtdlNodeStateEnum::Succeeded as u32
+                        {
+                            // Only the root decides: a fallback may absorb a failed child.
                             any_failed = true;
                         }
                         upsert_terminal_result(&mut results, ns);
@@ -780,6 +798,23 @@ fn is_control_only(plan: &Plan) -> bool {
         }
     }
     has_do
+}
+
+/// Nodes whose failure their enclosing fallback handles.
+pub(crate) fn fallback_descendants(plan: &Plan) -> HashSet<u32> {
+    let mut below = HashSet::new();
+    let mut pending: Vec<u32> = plan
+        .nodes
+        .iter()
+        .filter(|node| node.node_kind == RTDL_FALLBACK)
+        .flat_map(|node| node.children.iter().copied())
+        .collect();
+    while let Some(index) = pending.pop() {
+        if below.insert(index) {
+            pending.extend(&plan.nodes[index as usize].children);
+        }
+    }
+    below
 }
 
 fn plan_steps(plan: &Plan) -> Vec<TreeStep> {
@@ -1177,6 +1212,7 @@ async fn publish_stream(
             description,
             control_only: is_control_only(plan),
             call_signatures: plan_call_signatures(plan),
+            absorbed: fallback_descendants(plan),
             steps: plan_steps(plan),
         },
     );
@@ -1583,10 +1619,11 @@ pub async fn run_turn(
         let forbidden: HashSet<String> = forest
             .trees
             .values()
-            .flat_map(|tree| tree.call_signatures.iter().cloned())
+            .flat_map(|tree| tree.call_signatures.values().cloned())
             .collect();
         let mut stream_error: Option<anyhow::Error> = None;
         let mut invalid_output = false;
+        let mut node_failed = false;
         let mut reasoning_bytes = 0_usize;
         let idle = tokio::time::sleep(vlm_idle_timeout());
         tokio::pin!(idle);
@@ -1617,7 +1654,7 @@ pub async fn run_turn(
                 event = live.next(), if live.output.is_some() => {
                     match event {
                         Ok(Some(event)) => {
-                            if live.remember(event) { stream_error = Some(anyhow::anyhow!("Executor node failed during generation")); break; }
+                            if live.remember(event) { node_failed = true; stream_error = Some(anyhow::anyhow!("Executor node failed during generation")); break; }
                         }
                         Ok(None) => { live.transport_failed = true; stream_error = Some(anyhow::anyhow!("Executor EOF during generation")); break; }
                         Err(error) => { live.transport_failed = true; stream_error = Some(error.into()); break; }
@@ -1647,6 +1684,7 @@ pub async fn run_turn(
                             match submission {
                                 Err(error) => { live.transport_failed = true; stream_error = Some(error); break; }
                                 Ok(Some(crate::stream_execution::SubmissionInterrupt::Failed)) => {
+                                    node_failed = true;
                                     stream_error = Some(anyhow::anyhow!("Executor node failed during submission")); break;
                                 }
                                 Ok(Some(crate::stream_execution::SubmissionInterrupt::Stale)) => {
@@ -1700,13 +1738,24 @@ pub async fn run_turn(
             Ok(parsed) => parsed,
             Err(error) => {
                 let cleanup = live.cancel(&mut executor.control).await;
-                let retry = invalid_output
-                    && cleanup.is_ok()
+                let settled = cleanup.is_ok()
                     && (live.plan.plan_id.is_empty() || (live.complete && !live.transport_failed))
-                    && output_retries < 2
                     && requests < max_rounds;
                 publish_stream(live, forest, history, tx, &session_id).await;
-                if retry {
+                // A failed step makes the rest of the reply stale, not the request
+                // unserviceable: replan from its result.
+                if node_failed && settled {
+                    history.push(Message::user(
+                        "A step of this plan failed while you were still writing it, so Pilot \
+                         cancelled the rest of the plan; completed actions were not undone. \
+                         Use the recorded execution results and current state to replan \
+                         the remaining work.",
+                    ));
+                    warn!("[pilot/rtdl] replanning: {error:#}");
+                    should_plan = true;
+                    continue 'supervisor;
+                }
+                if invalid_output && settled && output_retries < 2 {
                     output_retries += 1;
                     if parser.text().trim().is_empty() {
                         reply_shape = ReplyShape::RtdlJsonObject;
@@ -1999,8 +2048,10 @@ Reply with exactly one JSON object and no surrounding prose, with its fields in 
 Nodes are exactly one of:
 - {"op":"sequence","op_id":0,"description":"...","children":[...]}
 - {"op":"parallel","op_id":0,"description":"...","children":[...]}
+- {"op":"fallback","op_id":0,"description":"...","children":[...]}
 - {"op":"do","op_id":0,"description":"...","cap":"<exact capability_name>","args":{...}}
-Write op_id=0; Pilot assigns the real ID. Do not add node fields. Compose a task's known dependent steps into one sequence and its independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence.
+op_id is 0, or a small integer unique in this reply when a later do node's args read this node's output as {"$ref":"<integer>#<JSON pointer>"}, e.g. {"$ref":"2#/objects/0/x"}; no # means the whole output. Pilot assigns real IDs. Do not add node fields.
+A fallback runs its children in order until one succeeds; a failure inside it reaches you only if every child fails. To branch on a value, start a fallback child sequence with the executor's check capability, which fails when its comparison is false. Compose a task's known dependent steps into one sequence and its independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence.
 
 Plan control is the entire rtdl value, never a nested node or capability: cancel_plan using an exact listed plan_id, or cancel_all, and only for plans listed in In-flight trees; with none listed, return an empty sequence. Never repeat a completed/cancelled control operation and never cancel an unrelated tree after another tree fails.
 
@@ -2038,11 +2089,11 @@ fn plan_call_count(plan: &Plan) -> usize {
         .count()
 }
 
-fn plan_call_signatures(plan: &Plan) -> HashSet<String> {
+fn plan_call_signatures(plan: &Plan) -> HashMap<u32, String> {
     plan.nodes
         .iter()
-        .filter_map(|node| node.call.as_ref())
-        .map(call_signature)
+        .enumerate()
+        .filter_map(|(index, node)| Some((index as u32, call_signature(node.call.as_ref()?))))
         .collect()
 }
 
@@ -2122,6 +2173,7 @@ fn rtdl_node_kind_name(kind: u32) -> String {
         RTDL_SEQUENCE => "sequence".to_string(),
         RTDL_PARALLEL => "parallel".to_string(),
         RTDL_DO => "do".to_string(),
+        RTDL_FALLBACK => "fallback".to_string(),
         _ => format!("unknown({kind})"),
     }
 }
@@ -2534,13 +2586,14 @@ for a running plan. Concretely:
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityTargetMap, CatalogView, HistoryBudget, MetaPlanOp, RTDL_DO, RTDL_PARALLEL,
-        RTDL_PROTOCOL_REMINDER, RTDL_SEQUENCE, RUN_TAG, TaskTable, TreeMeta, TreeStep, UsageTotals,
-        append_request_context, append_steer, assemble_planning_messages,
-        build_capability_target_map, build_display_capabilities, build_forest_block,
-        compact_tool_result, configured_vlm_idle_timeout, executor_active_snapshot,
-        feed_results_into_history, format_plan_summary, invalid_cancel_target, is_control_only,
-        is_legacy_plan_control_contract, is_terminal_executor_state, parse_meta_plan_op,
+        CapabilityTargetMap, CatalogView, HistoryBudget, MetaPlanOp, RTDL_DO, RTDL_FALLBACK,
+        RTDL_PARALLEL, RTDL_PROTOCOL_REMINDER, RTDL_SEQUENCE, RUN_TAG, SessionForest, TaskTable,
+        TreeInterrupt, TreeMeta, TreeStep, UsageTotals, append_request_context, append_steer,
+        assemble_planning_messages, build_capability_target_map, build_display_capabilities,
+        build_forest_block, call_signature, compact_tool_result, configured_vlm_idle_timeout,
+        executor_active_snapshot, feed_results_into_history, format_plan_summary, handle_interrupt,
+        invalid_cancel_target, is_control_only, is_legacy_plan_control_contract,
+        is_terminal_executor_state, parse_meta_plan_op, plan_call_signatures,
         record_dispatched_plan, rtdl_node_kind_name, rtdl_state_name,
         should_replan_after_plan_done, skip_memory_prefetch, task_is_session_end,
         upsert_terminal_result,
@@ -2750,12 +2803,16 @@ mod tests {
 
     #[test]
     fn later_round_protocol_is_compact_but_keeps_admission_rules() {
-        // The task fields' names are spelled out, which costs a few characters.
-        assert!(RTDL_PROTOCOL_REMINDER.len() < 2_100);
+        // The task fields' names are spelled out, and fallback, check and $ref
+        // cost about 500 characters.
+        assert!(RTDL_PROTOCOL_REMINDER.len() < 2_600);
         for required in [
             "capability_name",
             "sequence",
             "parallel",
+            "fallback",
+            r#"{"$ref":"#,
+            "check capability",
             "cancel_plan",
             "plan_id/call_id",
             // The task fields and their order must reach the model every round.
@@ -3066,7 +3123,8 @@ mod tests {
                 TreeMeta {
                     description: description.into(),
                     control_only: false,
-                    call_signatures: HashSet::new(),
+                    call_signatures: HashMap::new(),
+                    absorbed: HashSet::new(),
                     steps: vec![TreeStep {
                         op_id: format!("op-{plan_id}"),
                         description: description.into(),
@@ -3121,7 +3179,8 @@ mod tests {
             TreeMeta {
                 description: "ordered multi-step task".into(),
                 control_only: false,
-                call_signatures: HashSet::new(),
+                call_signatures: HashMap::new(),
+                absorbed: HashSet::new(),
                 steps: vec![
                     TreeStep {
                         op_id: "op-restaurant".into(),
@@ -3224,7 +3283,8 @@ mod tests {
             TreeMeta {
                 description: "drive".into(),
                 control_only: false,
-                call_signatures: HashSet::new(),
+                call_signatures: HashMap::new(),
+                absorbed: HashSet::new(),
                 steps: Vec::new(),
             },
         );
@@ -3238,6 +3298,59 @@ mod tests {
             invalid_cancel_target(&["8".to_string()], &forest, &HashSet::new()),
             Some("8".to_string())
         );
+    }
+
+    /// A failed call must not block its own retry while the rest of its tree
+    /// is still running or its completion is not yet taken in.
+    #[tokio::test]
+    async fn terminal_node_releases_its_call_signature() {
+        let navigate = |args: &str| CapabilityCall {
+            provider_id: "nav2".into(),
+            contract_id: "robonix/service/navigation/navigate".into(),
+            args_json: args.into(),
+            ..Default::default()
+        };
+        let plan = Plan {
+            plan_id: "p".into(),
+            nodes: [r#"{"x":1}"#, r#"{"x":2}"#]
+                .map(|args| RtdlNode {
+                    call: Some(navigate(args)),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        };
+        let mut forest = SessionForest::default();
+        forest.trees.insert(
+            "p".into(),
+            TreeMeta {
+                description: String::new(),
+                control_only: false,
+                call_signatures: plan_call_signatures(&plan),
+                absorbed: HashSet::new(),
+                steps: Vec::new(),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        handle_interrupt(
+            TreeInterrupt::NodeState {
+                plan_id: "p".into(),
+                node_state: Box::new(RtdlNodeState {
+                    node_index: 0,
+                    state: RtdlNodeStateEnum::Failed as u32,
+                    ..Default::default()
+                }),
+            },
+            &mut forest,
+            &mut Vec::new(),
+            &mut TaskTable::default(),
+            0,
+            "s",
+            &tx,
+        )
+        .await;
+        let in_flight: Vec<_> = forest.trees["p"].call_signatures.values().collect();
+        assert_eq!(in_flight, [&call_signature(&navigate(r#"{"x":2}"#))]);
     }
 
     fn task(ctx: &str) -> Task {
@@ -3336,6 +3449,7 @@ mod tests {
     fn rtdl_node_kind_names_are_human_readable() {
         assert_eq!(rtdl_node_kind_name(RTDL_SEQUENCE), "sequence");
         assert_eq!(rtdl_node_kind_name(RTDL_PARALLEL), "parallel");
+        assert_eq!(rtdl_node_kind_name(RTDL_FALLBACK), "fallback");
         assert_eq!(rtdl_node_kind_name(RTDL_DO), "do");
         assert_eq!(rtdl_node_kind_name(99), "unknown(99)");
     }
@@ -3417,6 +3531,32 @@ mod tests {
         assert_eq!(plan.nodes[0].children, vec![1, 2]);
         assert_eq!(plan.nodes[1].call.as_ref().unwrap().call_id, "p:0");
         assert_eq!(plan.nodes[2].call.as_ref().unwrap().call_id, "p:1");
+    }
+
+    #[test]
+    fn fallback_children_are_absorbed_but_the_fallback_is_not() {
+        let mut targets = CapabilityTargetMap::new();
+        targets.insert(
+            "go".to_string(),
+            ("nav".to_string(), "robonix/go".to_string()),
+        );
+        let rtdl = json!({
+            "op": "sequence",
+            "children": [
+                { "op": "fallback", "children": [
+                    { "op": "do", "cap": "go", "args": { "to": "a" } },
+                    { "op": "sequence", "children": [
+                        { "op": "do", "cap": "go", "args": { "to": "b" } }
+                    ] }
+                ] },
+                { "op": "do", "cap": "go", "args": { "to": "c" } }
+            ]
+        });
+        let plan = expand_rtdl_to_plan(&rtdl, &targets, "p".into(), "s".into(), 1, "").unwrap();
+
+        assert_eq!(plan.nodes[1].node_kind, RTDL_FALLBACK);
+        assert_eq!(plan.nodes[1].children, vec![2, 3]);
+        assert_eq!(super::fallback_descendants(&plan), HashSet::from([2, 3, 4]));
     }
 
     #[test]

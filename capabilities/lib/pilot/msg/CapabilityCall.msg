@@ -2,6 +2,8 @@
 # executor looks `provider_id` up in atlas at dispatch time, gets the endpoint,
 # and routes via the cap's declared transport (currently MCP only for
 # LLM-callable contracts).
+# Any args_json value written as {"$ref": "<op_id>#<JSON pointer>"} is replaced
+# before dispatch with that part of an earlier succeeded node's output in the plan.
 string call_id
 string provider_id
 string contract_id

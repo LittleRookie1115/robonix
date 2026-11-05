@@ -3,12 +3,13 @@
 use crate::pb::executor::ExecuteStreamInput;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode};
 use crate::planner::{
-    self, CapabilityTargetMap, MetaPlanOp, RTDL_DO, RTDL_PARALLEL, RTDL_SEQUENCE, RtdlEnvelope,
+    self, CapabilityTargetMap, MetaPlanOp, RTDL_DO, RTDL_FALLBACK, RTDL_PARALLEL, RTDL_SEQUENCE,
+    RtdlEnvelope,
 };
 use crate::tasks::{self, TaskFields};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -232,6 +233,8 @@ struct Candidate {
     parent: Option<usize>,
     /// Whether this node's complete JSON object has arrived.
     closed: bool,
+    /// Nonzero op_id the model gave a do node so later `$ref` arguments can name it.
+    label: Option<u64>,
 }
 
 /// One model response, with a single immutable-identity arena and pending wire messages.
@@ -248,6 +251,8 @@ pub(crate) struct RtdlIncrementalParser {
     pub(crate) task_fields: TaskFields,
     /// Accepted operators already closed on the incremental input.
     closed: Vec<bool>,
+    /// Real op_id of each labelled do node already admitted, keyed by the model's label.
+    labels: HashMap<u64, String>,
     /// Newly admitted wire messages awaiting submission to Executor.
     pending: Vec<ExecuteStreamInput>,
     /// Whether the structural scanner is inside a JSON string.
@@ -289,6 +294,7 @@ impl RtdlIncrementalParser {
             },
             task_fields: TaskFields::default(),
             closed: vec![],
+            labels: HashMap::new(),
             pending: vec![],
             in_string: false,
             escaped: false,
@@ -507,6 +513,13 @@ impl RtdlIncrementalParser {
             let call_index = self.plan.nodes.iter().filter(|n| n.call.is_some()).count();
             if let Some(call) = &mut node.call {
                 call.call_id = format!("{}:{call_index}", self.plan.plan_id);
+                call.args_json = self.relabel_refs(&call.args_json)?;
+            }
+            if let Some(label) = candidate.label {
+                ensure!(
+                    self.labels.insert(label, node.op_id.clone()).is_none(),
+                    "op_id {label} labels two do nodes"
+                );
             }
             if submit {
                 self.pending.push(ExecuteStreamInput {
@@ -576,7 +589,7 @@ impl RtdlIncrementalParser {
             return Ok(true);
         }
         ensure!(
-            ["sequence", "parallel", "do"].contains(&op),
+            ["sequence", "parallel", "fallback", "do"].contains(&op),
             "unknown RTDL operator `{op}`"
         );
         for key in fields.keys() {
@@ -617,6 +630,11 @@ impl RtdlIncrementalParser {
                 )?,
                 parent,
                 closed: true,
+                label: fields
+                    .get("op_id")
+                    .and_then(Partial::value)
+                    .and_then(|id| id.as_u64())
+                    .filter(|id| *id != 0),
             });
             return Ok(true);
         }
@@ -634,16 +652,17 @@ impl RtdlIncrementalParser {
         );
         out.push(Candidate {
             node: RtdlNode {
-                node_kind: if op == "sequence" {
-                    RTDL_SEQUENCE
-                } else {
-                    RTDL_PARALLEL
+                node_kind: match op {
+                    "sequence" => RTDL_SEQUENCE,
+                    "parallel" => RTDL_PARALLEL,
+                    _ => RTDL_FALLBACK,
                 },
                 description,
                 ..Default::default()
             },
             parent,
             closed: false,
+            label: None,
         });
         for child in children {
             if !self.walk(child, Some(index), depth + 1, label, out)? {
@@ -652,6 +671,16 @@ impl RtdlIncrementalParser {
         }
         out[index].closed = *closed;
         Ok(*closed)
+    }
+
+    /// Point each `{"$ref":"<label>#<pointer>"}` argument at the labelled node's real op_id.
+    fn relabel_refs(&self, args_json: &str) -> Result<String> {
+        if !args_json.contains("\"$ref\"") {
+            return Ok(args_json.to_string());
+        }
+        let mut args: Value = serde_json::from_str(args_json)?;
+        relabel(&mut args, &self.labels)?;
+        Ok(serde_json::to_string(&args)?)
     }
 
     /// Decode a complete call without assigning identities or appending to an arena.
@@ -687,6 +716,33 @@ impl RtdlIncrementalParser {
             ..Default::default()
         })
     }
+}
+
+fn relabel(value: &mut Value, labels: &HashMap<u64, String>) -> Result<()> {
+    match value {
+        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
+            let Some(reference) = map["$ref"].as_str() else {
+                bail!("$ref must be a string")
+            };
+            let (label, pointer) = reference.split_once('#').unwrap_or((reference, ""));
+            let op_id = label
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|label| labels.get(&label))
+                .ok_or_else(|| anyhow::anyhow!("$ref `{reference}` names no earlier do node"))?;
+            let target = if reference.contains('#') {
+                format!("{op_id}#{pointer}")
+            } else {
+                op_id.clone()
+            };
+            map.insert("$ref".into(), Value::String(target));
+        }
+        Value::Object(map) => map.values_mut().try_for_each(|v| relabel(v, labels))?,
+        Value::Array(items) => items.iter_mut().try_for_each(|v| relabel(v, labels))?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Prefer a trimmed node description, then the root label, then a generated description.
@@ -733,7 +789,6 @@ mod tests {
             7,
         )
     }
-    use std::collections::HashMap;
 
     /// Production finalization requires all envelope fields and validates completed task metadata.
     #[test]
@@ -978,6 +1033,45 @@ mod tests {
                         .unwrap_or_else(|| serde_json::json!({}))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn refs_name_earlier_labelled_do_nodes_by_real_op_id() {
+        let parse = |children: Value| {
+            let mut p = parser();
+            let raw = serde_json::json!({"content": "", "rtdl_description": "root", "message_updates": [], "rtdl_parent_task_id": "T1", "task_updates": [],
+                "rtdl": {"op": "fallback", "children": children}})
+            .to_string();
+            p.push(&raw).and_then(|()| p.finish()).map(|_| p.plan)
+        };
+        let plan = parse(serde_json::json!([
+            {"op": "do", "op_id": 2, "cap": "run", "args": {}},
+            {"op": "do", "op_id": 0, "cap": "run", "args": {"x": [{"$ref": "2#/a/0"}], "all": {"$ref": "2"}}}
+        ]))
+        .unwrap();
+        assert_eq!(plan.nodes[0].node_kind, RTDL_FALLBACK);
+        let first = &plan.nodes[1].op_id;
+        let args: Value =
+            serde_json::from_str(&plan.nodes[2].call.as_ref().unwrap().args_json).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({"x": [{"$ref": format!("{first}#/a/0")}], "all": {"$ref": first}})
+        );
+
+        for children in [
+            serde_json::json!([{"op": "do", "op_id": 1, "cap": "run", "args": {"x": {"$ref": "1#/a"}}}]),
+            serde_json::json!([
+                {"op": "do", "cap": "run", "args": {"x": {"$ref": "3"}}},
+                {"op": "do", "op_id": 3, "cap": "run", "args": {}}
+            ]),
+            serde_json::json!([{"op": "do", "cap": "run", "args": {"x": {"$ref": 1}}}]),
+            serde_json::json!([
+                {"op": "do", "op_id": 1, "cap": "run", "args": {}},
+                {"op": "do", "op_id": 1, "cap": "run", "args": {}}
+            ]),
+        ] {
+            assert!(parse(children.clone()).is_err(), "{children}");
         }
     }
 
