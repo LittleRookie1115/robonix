@@ -205,3 +205,9 @@ advancing while nothing will run, so the reply is rejected
 (`empty_dispatch_problem`) and the model gets one corrective round; if it repeats,
 the turn ends with what the model said. An empty sequence with no task update is
 an answer or a question to the user.
+
+### Speculative planning
+
+A task whose `context_json` sets `"speculate": true` (`rbnx ask --context '{"speculate":true}'`) lets Pilot prepare the next reply while a tree runs. When a round dispatches a tree that is then the only one in flight, Pilot sends up to four background requests, one per outcome the tree can report: it succeeded, or step k of a root `do` or an all-`do` sequence failed. Each request is the next round's history with a user message stating that outcome as an assumption; the outputs are unknown, so the model passes them on with `{"$ref": "<op_id>#<JSON pointer>"}` and decides on them with `check` inside `fallback`, or replies `NEEDS_RESULTS`.
+
+When the tree's report starts the next round, Pilot uses the prepared reply instead of a new request only if the tree ended with the outcome the reply assumed, no user message arrived, history was not compacted, the capability catalog, Soma data and provider docs did not change, no other tree runs, and the reply parses. A failed step starts the round before its tree's completion arrives, so Pilot waits up to 2 s for it. If the prepared reply is still being written, Pilot sends the real request alongside it and uses that request if the prepared reply is refused, so refusing one does not delay the round. The prepared reply then goes through the normal parse and submit path, and a `$ref` naming a finished step's op_id is bound to that step's output. Nothing speculative is dispatched before the real outcome is known. Each speculation logs `[pilot/segue]` records: `start`, `ready` per request (latency and tokens), and `commit` or `discard` with the reason.

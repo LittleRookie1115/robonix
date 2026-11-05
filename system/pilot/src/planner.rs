@@ -20,6 +20,7 @@ use crate::prompt::{
     render_capability_docs, render_context_sections, render_full_catalog,
 };
 use crate::service::{self, PilotStreamBody, SessionState};
+use crate::speculation::{self, Speculation};
 use crate::state_context;
 use crate::tasks::{self, Applied, TaskFields, TaskTable};
 use crate::transcript::Transcript;
@@ -36,6 +37,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tonic::Request;
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -287,6 +289,30 @@ fn task_is_session_end(task: &Task) -> bool {
                 .and_then(|x| x.as_bool())
         })
         .unwrap_or(false)
+}
+
+/// `context_json`: `{"speculate": true}` — prepare replies while trees run.
+fn task_speculates(task: &Task) -> bool {
+    serde_json::from_str::<serde_json::Value>(&task.context_json)
+        .ok()
+        .and_then(|v| v.get("speculate").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Let a speculation see how its tree ended.
+fn observe(speculation: &mut Option<Speculation>, event: &TreeInterrupt) {
+    if let (
+        Some(spec),
+        TreeInterrupt::Completion {
+            plan_id,
+            results,
+            any_failed,
+            canceled,
+        },
+    ) = (speculation, event)
+    {
+        spec.ended(plan_id, results, *any_failed, *canceled);
+    }
 }
 
 /// `context_json.modality` — set by liaison to "text" / "voice" / "api".
@@ -1368,9 +1394,13 @@ pub async fn run_turn(
     let mut requests = 0usize;
     let mut output_retries = 0usize;
     let mut reply_shape = ReplyShape::RtdlEnvelope;
+    let speculate = task_speculates(task);
+    // Replies prepared for the round that the one running tree's report starts.
+    let mut speculation: Option<Speculation> = None;
 
     'supervisor: loop {
         while let Ok(event) = forest.interrupt_rx.try_recv() {
+            observe(&mut speculation, &event);
             should_plan |=
                 handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
         }
@@ -1435,10 +1465,9 @@ pub async fn run_turn(
                 }
                 ev = forest.interrupt_rx.recv() => {
                     // The session holds a sender, so the channel never closes.
-                    if let Some(event) = ev
-                        && handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await
-                    {
-                        should_plan = true;
+                    if let Some(event) = ev {
+                        observe(&mut speculation, &event);
+                        should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                 }
             }
@@ -1451,6 +1480,34 @@ pub async fn run_turn(
         // Pull any steers that landed while we were busy (e.g. during the
         // previous VLM stream) so this round plans with the latest user input.
         drain_steers(&mut steer_rx, history, tasks);
+        // A failed step starts this round before its tree's completion
+        // arrives, and a prepared reply needs to know how the tree ended.
+        if let Some(spec) = &speculation
+            && tasks.messages.len() == spec.messages_seen
+        {
+            let plan_id = spec.plan_id.clone();
+            let settle = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(settle);
+            while forest.trees.contains_key(&plan_id) {
+                tokio::select! {
+                    biased;
+                    _ = term_signal.changed() => {
+                        return_interrupted!(&forest.trees);
+                    }
+                    steer = steer_rx.recv(), if !steer_rx.is_closed() => {
+                        if let Some(task) = steer {
+                            append_steer(task, history, tasks);
+                        }
+                        break;
+                    }
+                    Some(event) = forest.interrupt_rx.recv() => {
+                        observe(&mut speculation, &event);
+                        handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
+                    }
+                    _ = &mut settle => break,
+                }
+            }
+        }
         transcript.record(history, tasks);
 
         // Re-discover capabilities from atlas every round so providers that
@@ -1507,7 +1564,7 @@ pub async fn run_turn(
         .iter()
         .map(|content| content.len().div_ceil(4))
         .sum();
-        if compact_history(
+        let compacted = compact_history(
             history,
             vlm,
             history_budget,
@@ -1516,8 +1573,8 @@ pub async fn run_turn(
             transcript,
             tasks,
         )
-        .await
-        {
+        .await;
+        if compacted {
             cache_epoch = cache_epoch.saturating_add(1);
             // The summary may have absorbed the last full snapshots; show
             // them again rather than send changes against a missing baseline.
@@ -1568,47 +1625,131 @@ pub async fn run_turn(
                 }),
             )))
             .await;
-        let mut live = crate::stream_execution::StreamExecution::default();
-        let mut request_history = history.clone();
-        append_request_context(&mut request_history, &runtime_context);
-        let board = tasks.board();
-        if !board.is_empty() {
-            request_history.push(Message::user(&board));
-        }
-        let messages = assemble_planning_messages(
-            round,
-            catalog_update.is_empty(),
-            &sections,
-            &request_history,
-        );
-
         let planning_revision = forest.revision.load(Ordering::Acquire);
+        let open_request = |history: &[Message], tasks: &TaskTable| {
+            let mut request_history = history.to_vec();
+            append_request_context(&mut request_history, &runtime_context);
+            let board = tasks.board();
+            if !board.is_empty() {
+                request_history.push(Message::user(&board));
+            }
+            let messages = assemble_planning_messages(
+                round,
+                catalog_update.is_empty(),
+                &sections,
+                &request_history,
+            );
+            let vlm = vlm.clone();
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                // Opening cannot dispatch RTDL nodes, so one retry is safe here.
+                let mut open_retried = false;
+                loop {
+                    match tokio::time::timeout(
+                        vlm_idle_timeout(),
+                        vlm.chat_stream(&messages, &[], Some(vlm.prompt_cache_key()), reply_shape),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    {
+                        Ok(stream) => return Ok(stream),
+                        Err(error) if !open_retried => {
+                            warn!("[pilot/vlm] opening stream failed; retrying once: {error:#}");
+                            open_retried = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }))
+        };
+        // A prepared reply stands in for this request only if it was written
+        // for how the tree really ended and nothing else reached the model since.
+        let mut prepared = None;
+        let mut request = None;
+        if let Some(mut spec) = speculation.take() {
+            let branch = if tasks.messages.len() != spec.messages_seen {
+                Err("user message arrived".to_string())
+            } else if compacted {
+                Err("history compacted".to_string())
+            } else if !(catalog_update.is_empty()
+                && soma_body_update.is_empty()
+                && capability_docs_update.is_empty())
+            {
+                Err("capabilities changed".to_string())
+            } else if !forest.trees.is_empty() || !forest.kill_pending.is_empty() {
+                Err("trees in flight".to_string())
+            } else {
+                spec.take_branch().map_err(str::to_string)
+            };
+            let waiting = std::time::Instant::now();
+            let reply = match branch {
+                Err(reason) => Err(reason),
+                Ok(mut branch) => {
+                    // Refusing a reply still being written must not delay the
+                    // round, so the real request runs alongside it.
+                    if !branch.is_ready() {
+                        request = Some(open_request(history, tasks));
+                    }
+                    let reply = tokio::select! {
+                        biased;
+                        _ = term_signal.changed() => {
+                            return_interrupted!(&forest.trees);
+                        }
+                        steer = steer_rx.recv(), if !steer_rx.is_closed() => {
+                            if let Some(task) = steer {
+                                append_steer(task, history, tasks);
+                            }
+                            request = None;
+                            Err("user message arrived".to_string())
+                        }
+                        reply = branch.reply() => reply.ok_or_else(|| "request failed".to_string()),
+                    };
+                    reply.and_then(|reply| {
+                        if speculation::needs_results(&reply) {
+                            return Err("reply needs results".to_string());
+                        }
+                        let mut dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(
+                            target_map.clone(),
+                            Arc::new(AtomicU64::new(0)),
+                            session_id.clone(),
+                            round,
+                        )
+                        .with_outputs(spec.outputs().clone());
+                        match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
+                            Ok((_, None)) => Ok((reply, branch)),
+                            Ok((_, Some(_))) => Err("reply is a plan-control op".to_string()),
+                            Err(error) => Err(format!("reply rejected: {error:#}")),
+                        }
+                    })
+                }
+            };
+            match reply {
+                Ok((reply, branch)) => {
+                    let outputs = spec.outputs().clone();
+                    spec.commit(&branch, waiting.elapsed());
+                    prepared = Some((reply, outputs));
+                }
+                Err(reason) => spec.discard(&reason),
+            }
+        }
+        let mut live = crate::stream_execution::StreamExecution::default();
+        let (mut stream, outputs) = match prepared {
+            Some((reply, outputs)) => (speculation::replay(reply), outputs),
+            None => (
+                request
+                    .unwrap_or_else(|| open_request(history, tasks))
+                    .await??,
+                HashMap::new(),
+            ),
+        };
         let mut parser = crate::rtdl_stream::RtdlIncrementalParser::new(
             target_map.clone(),
             Arc::clone(&plan_seq),
             session_id.clone(),
             round,
-        );
+        )
+        .with_outputs(outputs);
         let mut streamed_task: Option<(Option<String>, Option<String>)> = None;
-        // Opening cannot dispatch RTDL nodes, so one retry is safe here.
-        let mut open_retried = false;
-        let mut stream = loop {
-            match tokio::time::timeout(
-                vlm_idle_timeout(),
-                vlm.chat_stream(&messages, &[], Some(vlm.prompt_cache_key()), reply_shape),
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result)
-            {
-                Ok(stream) => break stream,
-                Err(error) if !open_retried => {
-                    warn!("[pilot/vlm] opening stream failed; retrying once: {error:#}");
-                    open_retried = true;
-                }
-                Err(error) => return Err(error),
-            }
-        };
         // Retain the sent context even if generation is later interrupted.
         append_request_context(history, &runtime_context);
         catalog_view.commit();
@@ -1958,6 +2099,7 @@ pub async fn run_turn(
                 .await;
         }
 
+        let plan_open = !live.complete && live.output.is_some();
         publish_stream(live, forest, history, tx, &session_id).await;
 
         if hit_cap {
@@ -1978,6 +2120,29 @@ pub async fn run_turn(
         should_plan = owner
             .as_deref()
             .is_some_and(|task| tasks.others_runnable(task));
+        // Only while one tree runs is its report sure to start the next round.
+        if speculate
+            && !should_plan
+            && plan_open
+            && forest.trees.len() == 1
+            && forest.kill_pending.is_empty()
+            && !is_control_only(&graph)
+        {
+            let mut context = history.clone();
+            let board = tasks.board();
+            if !board.is_empty() {
+                context.push(Message::user(&board));
+            }
+            let mut prefix = vec![Message::system(&render_context_sections(&sections))];
+            prefix.extend(history::sanitize_for_vlm(&context));
+            speculation = Some(Speculation::start(
+                vlm,
+                &graph,
+                prefix,
+                tasks.messages.len(),
+                vlm_idle_timeout(),
+            ));
+        }
     }
 
     // ── 8. Mark turn complete ─────────────────────────────────────────────────

@@ -40,6 +40,7 @@ pub async fn execute(
     prompt: &str,
     json: bool,
     session: Option<String>,
+    context: Option<String>,
 ) -> Result<()> {
     let mut atlas = AtlasClient::connect(server)
         .await
@@ -60,7 +61,7 @@ pub async fn execute(
         source: 0, // INTENT_SOURCE_TEXT
         text: prompt.to_string(),
         audio_data: vec![],
-        context_json: String::new(),
+        context_json: context.unwrap_or_default(),
         timestamp_ms: now_ms(),
     };
     let mut stream = client

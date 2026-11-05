@@ -29,6 +29,7 @@ mod prompt;
 mod rtdl_stream;
 mod service;
 mod soma_context;
+mod speculation;
 mod state_context;
 mod stream_execution;
 mod tasks;

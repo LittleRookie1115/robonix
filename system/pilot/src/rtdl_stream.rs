@@ -253,6 +253,9 @@ pub(crate) struct RtdlIncrementalParser {
     closed: Vec<bool>,
     /// Real op_id of each labelled do node already admitted, keyed by the model's label.
     labels: HashMap<u64, String>,
+    /// Raw outputs of leaves of finished trees, by real op_id. A `$ref` naming one
+    /// is replaced by the value, because Executor resolves references only within a plan.
+    outputs: HashMap<String, String>,
     /// Newly admitted wire messages awaiting submission to Executor.
     pending: Vec<ExecuteStreamInput>,
     /// Whether the structural scanner is inside a JSON string.
@@ -295,6 +298,7 @@ impl RtdlIncrementalParser {
             task_fields: TaskFields::default(),
             closed: vec![],
             labels: HashMap::new(),
+            outputs: HashMap::new(),
             pending: vec![],
             in_string: false,
             escaped: false,
@@ -306,6 +310,12 @@ impl RtdlIncrementalParser {
             string_start: 0,
             args_key: false,
         }
+    }
+
+    /// Let `$ref` arguments name these finished leaves by real op_id.
+    pub(crate) fn with_outputs(mut self, outputs: HashMap<String, String>) -> Self {
+        self.outputs = outputs;
+        self
     }
 
     #[cfg(test)]
@@ -679,7 +689,7 @@ impl RtdlIncrementalParser {
             return Ok(args_json.to_string());
         }
         let mut args: Value = serde_json::from_str(args_json)?;
-        relabel(&mut args, &self.labels)?;
+        relabel(&mut args, &self.labels, &self.outputs)?;
         Ok(serde_json::to_string(&args)?)
     }
 
@@ -718,13 +728,25 @@ impl RtdlIncrementalParser {
     }
 }
 
-fn relabel(value: &mut Value, labels: &HashMap<u64, String>) -> Result<()> {
+fn relabel(
+    value: &mut Value,
+    labels: &HashMap<u64, String>,
+    outputs: &HashMap<String, String>,
+) -> Result<()> {
     match value {
         Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
             let Some(reference) = map["$ref"].as_str() else {
                 bail!("$ref must be a string")
             };
             let (label, pointer) = reference.split_once('#').unwrap_or((reference, ""));
+            if let Some(output) = outputs.get(label.trim()) {
+                let output =
+                    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.clone()));
+                *value = output.pointer(pointer).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("$ref `{reference}` points at no output field")
+                })?;
+                return Ok(());
+            }
             let op_id = label
                 .trim()
                 .parse::<u64>()
@@ -738,8 +760,12 @@ fn relabel(value: &mut Value, labels: &HashMap<u64, String>) -> Result<()> {
             };
             map.insert("$ref".into(), Value::String(target));
         }
-        Value::Object(map) => map.values_mut().try_for_each(|v| relabel(v, labels))?,
-        Value::Array(items) => items.iter_mut().try_for_each(|v| relabel(v, labels))?,
+        Value::Object(map) => map
+            .values_mut()
+            .try_for_each(|v| relabel(v, labels, outputs))?,
+        Value::Array(items) => items
+            .iter_mut()
+            .try_for_each(|v| relabel(v, labels, outputs))?,
         _ => {}
     }
     Ok(())
@@ -1073,6 +1099,30 @@ mod tests {
         ] {
             assert!(parse(children.clone()).is_err(), "{children}");
         }
+    }
+
+    /// A finished tree's leaf is outside the new plan, so its output is substituted in place.
+    #[test]
+    fn refs_to_finished_leaves_take_their_output() {
+        let parse = |args: Value| {
+            let mut p = parser().with_outputs(HashMap::from([
+                ("ab12-3".into(), r#"{"pose": {"x": 0.5}}"#.into()),
+                ("ab12-4".into(), "plain text".into()),
+            ]));
+            let raw = serde_json::json!({"content": "", "rtdl_description": "root", "message_updates": [], "rtdl_parent_task_id": "T1", "task_updates": [],
+                "rtdl": {"op": "do", "cap": "run", "args": args}})
+            .to_string();
+            p.push(&raw).and_then(|()| p.finish()).map(|_| p.plan)
+        };
+        let plan = parse(serde_json::json!({
+            "x": {"$ref": "ab12-3#/pose/x"}, "all": {"$ref": "ab12-4"}
+        }))
+        .unwrap();
+        let args: Value =
+            serde_json::from_str(&plan.nodes[0].call.as_ref().unwrap().args_json).unwrap();
+        assert_eq!(args, serde_json::json!({"x": 0.5, "all": "plain text"}));
+        assert!(parse(serde_json::json!({"x": {"$ref": "ab12-3#/pose/y"}})).is_err());
+        assert!(parse(serde_json::json!({"x": {"$ref": "ab12-5#/pose"}})).is_err());
     }
 
     fn assert_nodes(parser: &RtdlIncrementalParser, expected: &[(u32, &[u32], &str)]) {

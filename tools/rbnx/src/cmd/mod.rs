@@ -407,6 +407,9 @@ pub enum Commands {
         /// while an earlier task of the session runs, the prompt steers it.
         #[arg(long)]
         session: Option<String>,
+        /// JSON object sent as the task's context_json, e.g. '{"speculate":true}'.
+        #[arg(long)]
+        context: Option<String>,
     },
     /// Read Scribe JSON-lines log files and render them with optional
     /// tag / level filtering.  Point at a log directory or read the
@@ -538,7 +541,8 @@ pub async fn execute(command: Commands, config: Config) -> Result<()> {
             server,
             json,
             session,
-        } => ask::execute(&server, &prompt, json, session).await,
+            context,
+        } => ask::execute(&server, &prompt, json, session, context).await,
         Commands::Logs {
             log_dir,
             tag,
