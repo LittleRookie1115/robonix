@@ -442,7 +442,12 @@ impl Speculation {
             .ok()
             .and_then(|a| match a["type"].as_str()? {
                 "noul" => Some(("yes", a["noul"].as_f64()?)),
-                "choice" => Some((a["choice"].as_str()?, a["confidence"].as_f64()?)),
+                // Hosted models report a confidence rescaled by the option count; the
+                // thresholds are calibrated on the probability itself.
+                "choice" => {
+                    let key = a["choice"].as_str()?;
+                    Some((key, a["probabilities"][key].as_f64()?))
+                }
                 _ => None,
             });
         let accepted = pick
