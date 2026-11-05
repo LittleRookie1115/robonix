@@ -6,9 +6,9 @@
 //!
 //! With a TypeSafe decision model configured (`TYPESAFE_BASE_URL`), a failure
 //! is prepared for as up to three situations with a reply each, and the
-//! decision model picks the one the real error shows; a prepared reply that
-//! dispatches nothing is used only if the decision model finds it supported by
-//! the step results.
+//! decision model picks the one the real error shows; any other prepared reply
+//! that dispatches nothing is used only if the decision model finds it
+//! supported by the step results.
 
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{Plan, RtdlNode, RtdlNodeState, Task};
@@ -377,7 +377,8 @@ impl Speculation {
         mut dry_run: RtdlIncrementalParser,
     ) -> Result<String, String> {
         let mut reply = branch.reply().await.ok_or("request failed")?;
-        if branch.outcome.has_situations() {
+        let picked = branch.outcome.has_situations();
+        if picked {
             reply = self.situation(&reply, steps).await?;
         }
         if needs_results(&reply) {
@@ -389,7 +390,9 @@ impl Speculation {
             Err(error) => return Err(format!("reply rejected: {error:#}")),
         };
         let dispatches = dry_run.plan.nodes.iter().any(|n| n.node_kind == RTDL_DO);
-        if DECISION_MODEL.is_some() && !dispatches {
+        // A situation's reply was written for the error the decision model just matched;
+        // asking again whether the results support it only adds a second, noisier answer.
+        if DECISION_MODEL.is_some() && !dispatches && !picked {
             let state = json!({"task": self.task, "steps": steps, "final_reply": content});
             let question = json!({"type": "noul", "instructions": DONE});
             self.decide(state, question, self.tau_done).await?;

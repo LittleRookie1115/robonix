@@ -215,7 +215,7 @@ When the tree's report starts the next round, Pilot uses the prepared reply inst
 With a TypeSafe decision model configured, a fast model answers two questions that the conditions above cannot decide:
 
 - **Which failure happened.** A failure branch asks the planning model for one to three situations, each a sentence saying what the failed step's error would show plus the reply for that case. Once the real error is known, the decision model picks the situation it shows, or "none of them". The situation's reply is used only if it is not "none" and its confidence is at least `tau_choice`.
-- **Whether the task is done.** A prepared reply that dispatches no `do` step closes the task. It is used only if the decision model gives probability at least `tau_done` that this turn's step results support the reply and that it finishes the task.
+- **Whether the task is done.** A prepared reply that dispatches no `do` step closes the task. Unless it is the reply of the situation just picked, it is used only if the decision model gives probability at least `tau_done` that this turn's step results support the reply and that it finishes the task.
 
 Otherwise the branch is discarded and the normal request runs. The defaults, `tau_choice` 0.9411 and `tau_done` 0.834, were calibrated for a local Qwen3.5-9B at a 2% error target; a task can set its own in `context_json`, e.g. `{"speculate":true,"tau_done":0.8}`. Each question logs a `decide` record with its state, question, answer, latency and whether it was accepted. Configuration:
 
