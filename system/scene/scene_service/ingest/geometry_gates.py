@@ -30,13 +30,20 @@ class KnownGround:
             return self._cache
         try:
             import numpy as np
+            from scipy.ndimage import distance_transform_edt
 
             info = msg.info
+            res = float(info.resolution)
             grid = np.asarray(msg.data, dtype=np.int16).reshape(int(info.height), int(info.width))
             # Occupied or free are both "the robot has looked here"; -1 is not.
-            self._cache = (grid >= 0,
+            seen = grid >= 0
+            # A planar scan never sees into a counter or the wall behind it, yet things
+            # stand on top: allow 0.3 m, which reaches little past a wall.
+            if res > 0.0:
+                seen = distance_transform_edt(~seen) * res <= 0.3
+            self._cache = (seen,
                            (float(info.origin.position.x), float(info.origin.position.y)),
-                           float(info.resolution))
+                           res)
         except Exception as e:  # noqa: BLE001
             log.warning("cannot read the occupancy grid: %s", e)
             self._cache = None
