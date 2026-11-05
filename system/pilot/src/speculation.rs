@@ -6,9 +6,10 @@
 //!
 //! With a TypeSafe decision model configured (`TYPESAFE_BASE_URL`), a failure
 //! is prepared for as up to three situations with a reply each, and the
-//! decision model picks the one the real error shows; any other prepared reply
-//! that dispatches nothing is used only if the decision model finds it
-//! supported by the step results.
+//! decision model picks the one the real error shows, unless one situation with
+//! an empty `when` covers any failure; any other prepared reply that dispatches
+//! nothing is used only if the decision model finds it supported by the step
+//! results. The questions start as soon as the tree ends.
 
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{Plan, RtdlNode, RtdlNodeState, Task};
@@ -120,8 +121,9 @@ impl Outcome {
 pub(crate) struct Branch {
     /// The outcome the reply was written for.
     outcome: Outcome,
-    /// The reply text, once generated.
-    reply: JoinHandle<Result<String>>,
+    /// The reply text once generated, or once settled by [`Speculation::settle`];
+    /// otherwise why there is none.
+    reply: JoinHandle<Result<String, String>>,
 }
 
 impl Drop for Branch {
@@ -131,14 +133,25 @@ impl Drop for Branch {
 }
 
 impl Branch {
-    /// Whether the request has finished, so waiting for its reply costs nothing.
-    pub(crate) fn is_ready(&self) -> bool {
-        self.reply.is_finished()
+    /// Wait for the reply, or why there is none.
+    async fn reply(&mut self) -> Result<String, String> {
+        (&mut self.reply)
+            .await
+            .unwrap_or_else(|_| Err("request failed".into()))
     }
 
-    /// Wait for the reply. A request that failed or was aborted yields none.
-    pub(crate) async fn reply(&mut self) -> Option<String> {
-        (&mut self.reply).await.ok()?.ok()
+    /// The settled reply to use in place of the planning request, or why there
+    /// is none. `dry_run` admits it against the live catalog without dispatching it.
+    pub(crate) async fn resolve(
+        &mut self,
+        mut dry_run: RtdlIncrementalParser,
+    ) -> Result<String, String> {
+        let reply = self.reply().await?;
+        match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
+            Ok((_, None)) => Ok(reply),
+            Ok((_, Some(_))) => Err("reply is a plan-control op".into()),
+            Err(error) => Err(format!("reply rejected: {error:#}")),
+        }
     }
 }
 
@@ -225,10 +238,11 @@ impl Speculation {
                 let reply = tokio::spawn(async move {
                     generate(vlm, messages, shape, &plan_id, &label, idle_timeout)
                         .await
-                        .inspect_err(|error| {
+                        .map_err(|error| {
                             warn!(
                                 "[pilot/segue] plan_id={plan_id} {label} request failed: {error:#}"
-                            )
+                            );
+                            "request failed".to_string()
                         })
                 });
                 Branch { outcome, reply }
@@ -343,7 +357,7 @@ impl Speculation {
     }
 
     /// Take the branch written for the outcome the tree actually had.
-    pub(crate) fn take_branch(&mut self) -> Result<Branch, &'static str> {
+    fn take_branch(&mut self) -> Result<Branch, &'static str> {
         let outcome = match &self.ended {
             None => return Err("tree has not ended"),
             Some(None) => return Err("outcome not speculated"),
@@ -367,111 +381,40 @@ impl Speculation {
         &self.report
     }
 
-    /// The branch's reply to use in place of the planning request, or why there
-    /// is none. `steps` holds every step the turn has reported, and `dry_run`
-    /// admits the reply against the live catalog without dispatching it.
-    pub(crate) async fn resolve(
-        &self,
-        branch: &mut Branch,
-        steps: &[Value],
-        mut dry_run: RtdlIncrementalParser,
-    ) -> Result<String, String> {
-        let mut reply = branch.reply().await.ok_or("request failed")?;
-        let picked = branch.outcome.has_situations();
-        if picked {
-            reply = self.situation(&reply, steps).await?;
-        }
-        if needs_results(&reply) {
-            return Err("reply needs results".into());
-        }
-        let content = match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
-            Ok((envelope, None)) => envelope.content,
-            Ok((_, Some(_))) => return Err("reply is a plan-control op".into()),
-            Err(error) => return Err(format!("reply rejected: {error:#}")),
-        };
-        let dispatches = dry_run.plan.nodes.iter().any(|n| n.node_kind == RTDL_DO);
-        // A situation's reply was written for the error the decision model just matched;
-        // asking again whether the results support it only adds a second, noisier answer.
-        if DECISION_MODEL.is_some() && !dispatches && !picked {
-            let state = json!({"task": self.task, "steps": steps, "final_reply": content});
-            let question = json!({"type": "noul", "instructions": DONE});
-            self.decide(state, question, self.tau_done).await?;
-        }
-        Ok(reply)
-    }
-
-    /// The reply prepared for the failure situation the decision model finds
-    /// in the step results.
-    async fn situation(&self, reply: &str, steps: &[Value]) -> Result<String, String> {
-        let mut reply: Value =
-            serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
-        let situations = reply
-            .get_mut("situations")
-            .and_then(Value::as_array_mut)
-            .filter(|situations| !situations.is_empty())
-            .ok_or("situations: none given")?;
-        let mut criteria: serde_json::Map<String, Value> = situations
-            .iter()
-            .enumerate()
-            .map(|(index, situation)| (index.to_string(), situation["when"].clone()))
-            .collect();
-        criteria.insert("none".into(), NONE_OF_THEM.into());
-        let state = json!({"task": self.task, "steps": steps});
-        let question = json!({"type": "choice", "instructions": CHOICE, "criteria": criteria});
-        let pick = self.decide(state, question, self.tau_choice).await?;
-        let situation = pick
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| situations.get_mut(index))
-            .ok_or_else(|| format!("decision model picked unknown situation {pick}"))?;
-        Ok(situation["reply"].take().to_string())
-    }
-
-    /// Ask the decision model one question, log it as a `decide` event, and
-    /// return the option it picked if that is not "none" and has at least
-    /// probability `tau`. A yes/no question picks "yes" with p(yes).
-    async fn decide(&self, state: Value, question: Value, tau: f64) -> Result<String, String> {
-        let model = DECISION_MODEL.as_ref().ok_or("no decision model")?;
-        let asked = Instant::now();
-        let answer = model
-            .ask(&state, &question)
-            .await
-            .map_err(|error| format!("decision model failed: {error:#}"));
-        let pick = answer
-            .as_ref()
-            .ok()
-            .and_then(|a| match a["type"].as_str()? {
-                "noul" => Some(("yes", a["noul"].as_f64()?)),
-                // Hosted models report a confidence rescaled by the option count; the
-                // thresholds are calibrated on the probability itself.
-                "choice" => {
-                    let key = a["choice"].as_str()?;
-                    Some((key, a["probabilities"][key].as_f64()?))
+    /// Take the branch for the outcome the tree actually had and settle its
+    /// reply in the background, so the decision model answers while the round
+    /// gathers its context. `steps` holds every step the turn has reported.
+    /// Also returns whether the planning model had finished writing the reply.
+    pub(crate) fn settle(&mut self, steps: Vec<Value>) -> Result<(Branch, bool), &'static str> {
+        let mut written = self.take_branch()?;
+        let ready = written.reply.is_finished();
+        let outcome = written.outcome.clone();
+        let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
+        let (tau_choice, tau_done) = (self.tau_choice, self.tau_done);
+        let reply = tokio::spawn(async move {
+            let mut reply = written.reply().await?;
+            let mut state = json!({"task": task, "steps": steps});
+            let mut picked = false;
+            if written.outcome.has_situations() {
+                (reply, picked) = situation(&plan_id, &reply, state.clone(), tau_choice).await?;
+            }
+            if needs_results(&reply) {
+                return Err("reply needs results".into());
+            }
+            // A situation's reply was written for the error the decision model just matched;
+            // asking again whether the results support it only adds a second, noisier answer.
+            if DECISION_MODEL.is_some() && !picked {
+                let mut envelope: Value =
+                    serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+                if !dispatches(&envelope["rtdl"]) {
+                    state["final_reply"] = envelope["content"].take();
+                    let question = json!({"type": "noul", "instructions": DONE});
+                    decide(&plan_id, state, question, tau_done).await?;
                 }
-                _ => None,
-            });
-        let accepted = pick
-            .filter(|&(key, p)| key != "none" && p >= tau)
-            .map(|(key, _)| key.to_string());
-        info!(
-            "[pilot/segue] {}",
-            json!({
-                "event": "decide",
-                "plan_id": self.plan_id,
-                "latency_ms": asked.elapsed().as_millis() as u64,
-                "tau": tau,
-                "accept": accepted.is_some(),
-                "answer": answer.as_ref().ok(),
-                "error": answer.as_ref().err(),
-                "state": state,
-                "question": question,
-            })
-        );
-        accepted.ok_or_else(|| match (&answer, pick) {
-            (Err(error), _) => error.clone(),
-            (Ok(_), None) => "decision model answer unreadable".into(),
-            (Ok(_), Some((key, p))) => format!("decision model: {key} p={p:.3}, tau={tau}"),
-        })
+            }
+            Ok(reply)
+        });
+        Ok((Branch { outcome, reply }, ready))
     }
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
@@ -504,6 +447,99 @@ impl Speculation {
     }
 }
 
+/// The reply prepared for the failure situation the decision model finds in
+/// `state`, and whether it picked one: a lone situation with an empty `when`
+/// was written for any failure and needs no pick.
+async fn situation(
+    plan_id: &str,
+    reply: &str,
+    state: Value,
+    tau: f64,
+) -> Result<(String, bool), String> {
+    let mut reply: Value = serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
+    let situations = reply
+        .get_mut("situations")
+        .and_then(Value::as_array_mut)
+        .filter(|situations| !situations.is_empty())
+        .ok_or("situations: none given")?;
+    if let [only] = situations.as_mut_slice()
+        && only["when"]
+            .as_str()
+            .is_some_and(|when| when.trim().is_empty())
+    {
+        return Ok((only["reply"].take().to_string(), false));
+    }
+    let mut criteria: serde_json::Map<String, Value> = situations
+        .iter()
+        .enumerate()
+        .map(|(index, situation)| (index.to_string(), situation["when"].clone()))
+        .collect();
+    criteria.insert("none".into(), NONE_OF_THEM.into());
+    let question = json!({"type": "choice", "instructions": CHOICE, "criteria": criteria});
+    let pick = decide(plan_id, state, question, tau).await?;
+    let situation = pick
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| situations.get_mut(index))
+        .ok_or_else(|| format!("decision model picked unknown situation {pick}"))?;
+    Ok((situation["reply"].take().to_string(), true))
+}
+
+/// Ask the decision model one question, log it as a `decide` event, and
+/// return the option it picked if that is not "none" and has at least
+/// probability `tau`. A yes/no question picks "yes" with p(yes).
+async fn decide(plan_id: &str, state: Value, question: Value, tau: f64) -> Result<String, String> {
+    let model = DECISION_MODEL.as_ref().ok_or("no decision model")?;
+    let asked = Instant::now();
+    let answer = model
+        .ask(&state, &question)
+        .await
+        .map_err(|error| format!("decision model failed: {error:#}"));
+    let pick = answer
+        .as_ref()
+        .ok()
+        .and_then(|a| match a["type"].as_str()? {
+            "noul" => Some(("yes", a["noul"].as_f64()?)),
+            // Hosted models report a confidence rescaled by the option count; the
+            // thresholds are calibrated on the probability itself.
+            "choice" => {
+                let key = a["choice"].as_str()?;
+                Some((key, a["probabilities"][key].as_f64()?))
+            }
+            _ => None,
+        });
+    let accepted = pick
+        .filter(|&(key, p)| key != "none" && p >= tau)
+        .map(|(key, _)| key.to_string());
+    info!(
+        "[pilot/segue] {}",
+        json!({
+            "event": "decide",
+            "plan_id": plan_id,
+            "latency_ms": asked.elapsed().as_millis() as u64,
+            "tau": tau,
+            "accept": accepted.is_some(),
+            "answer": answer.as_ref().ok(),
+            "error": answer.as_ref().err(),
+            "state": state,
+            "question": question,
+        })
+    );
+    accepted.ok_or_else(|| match (&answer, pick) {
+        (Err(error), _) => error.clone(),
+        (Ok(_), None) => "decision model answer unreadable".into(),
+        (Ok(_), Some((key, p))) => format!("decision model: {key} p={p:.3}, tau={tau}"),
+    })
+}
+
+/// Whether a prepared reply's RTDL tree dispatches any step.
+fn dispatches(node: &Value) -> bool {
+    node["op"] == "do"
+        || node["children"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(dispatches))
+}
+
 /// Whether a prepared reply declined to plan without the real outputs.
 fn needs_results(reply: &str) -> bool {
     reply.contains(NEEDS_RESULTS)
@@ -533,7 +569,8 @@ fn hypothesis(plan: &Plan, outcome: &Outcome) -> String {
         "Name one to three situations that could have caused this failure and call for different \
          next moves. Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: `when` says in one \
          sentence what the failed step's error message would show in that situation, and `reply` \
-         is the complete reply you would give once that failure is reported."
+         is the complete reply you would give once that failure is reported. If the next move \
+         is the same whatever the error shows, give one situation with `when` empty."
     } else {
         "Write the reply you would give once this outcome is reported."
     };
@@ -699,7 +736,7 @@ mod tests {
             let results: Vec<_> = states.into_iter().map(|(i, s)| state(i, s)).collect();
             spec.ended("p", &results, any_failed, false);
             let mut branch = spec.take_branch().unwrap();
-            assert_eq!(branch.reply().await.as_deref(), Some(expected));
+            assert_eq!(branch.reply().await.as_deref(), Ok(expected));
             let mut outputs: Vec<_> = spec.outputs().keys().map(String::as_str).collect();
             outputs.sort();
             assert_eq!(outputs, finished);
@@ -745,5 +782,24 @@ mod tests {
         let results = [state(0, Failed), state(1, Succeeded), state(2, Canceled)];
         spec.ended("p", &results, true, false);
         assert_eq!(spec.take_branch().err(), Some("outcome not speculated"));
+    }
+
+    #[tokio::test]
+    async fn a_lone_situation_without_when_is_used_without_asking() {
+        let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
+        let settled = super::situation("p", reply, serde_json::json!({}), 1.0).await;
+        assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), false)));
+    }
+
+    #[test]
+    fn a_tree_dispatches_if_any_node_is_a_do() {
+        use serde_json::json;
+        let nested =
+            json!({"op": "sequence", "children": [{"op": "fallback", "children": [{"op": "do"}]}]});
+        assert!(super::dispatches(&nested));
+        assert!(!super::dispatches(
+            &json!({"op": "sequence", "children": []})
+        ));
+        assert!(!super::dispatches(&serde_json::Value::Null));
     }
 }

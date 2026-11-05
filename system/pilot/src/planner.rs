@@ -1526,6 +1526,18 @@ pub async fn run_turn(
                 }
             }
         }
+        // Settling the prepared reply starts here, so the decision model
+        // answers while the context below is gathered.
+        let pending = speculation.take().map(|mut spec| {
+            let settled = if tasks.messages.len() != spec.messages_seen {
+                Err("user message arrived")
+            } else if !forest.trees.is_empty() || !forest.kill_pending.is_empty() {
+                Err("trees in flight")
+            } else {
+                spec.settle(turn_steps.iter().chain(spec.report()).cloned().collect())
+            };
+            (spec, settled)
+        });
         transcript.record(history, tasks);
 
         // Re-discover capabilities from atlas every round so providers that
@@ -1684,29 +1696,25 @@ pub async fn run_turn(
         // for how the tree really ended and nothing else reached the model since.
         let mut prepared = None;
         let mut request = None;
-        if let Some(mut spec) = speculation.take() {
+        if let Some((spec, settled)) = pending {
             turn_steps.extend_from_slice(spec.report());
-            let branch = if tasks.messages.len() != spec.messages_seen {
-                Err("user message arrived".to_string())
-            } else if compacted {
-                Err("history compacted".to_string())
+            let branch = if compacted {
+                Err("history compacted")
             } else if !(catalog_update.is_empty()
                 && soma_body_update.is_empty()
                 && capability_docs_update.is_empty())
             {
-                Err("capabilities changed".to_string())
-            } else if !forest.trees.is_empty() || !forest.kill_pending.is_empty() {
-                Err("trees in flight".to_string())
+                Err("capabilities changed")
             } else {
-                spec.take_branch().map_err(str::to_string)
+                settled
             };
             let waiting = std::time::Instant::now();
             let reply = match branch {
-                Err(reason) => Err(reason),
-                Ok(mut branch) => {
+                Err(reason) => Err(reason.to_string()),
+                Ok((mut branch, written)) => {
                     // Refusing a reply still being written must not delay the
                     // round, so the real request runs alongside it.
-                    if !branch.is_ready() {
+                    if !written {
                         request = Some(open_request(history, tasks));
                     }
                     let dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(
@@ -1728,7 +1736,7 @@ pub async fn run_turn(
                             request = None;
                             Err("user message arrived".to_string())
                         }
-                        reply = spec.resolve(&mut branch, &turn_steps, dry_run) => reply,
+                        reply = branch.resolve(dry_run) => reply,
                     };
                     reply.map(|reply| (reply, branch))
                 }
