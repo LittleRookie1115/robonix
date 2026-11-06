@@ -44,7 +44,7 @@ _DEFAULT_OPEN_VOCAB = [
 
 _BG_CLASSES = frozenset({"floor", "wall", "ceiling", "carpet"})
 
-# Classes we never want to insert (unstable / outdoor / not useful for indoor robot).
+# Default-vocabulary classes we never want to insert (unstable / outdoor / not useful for indoor robot).
 _IGNORED_CLASSES = frozenset({"person"})
 
 
@@ -928,9 +928,11 @@ class ConceptGraphsDetector:
                      float(confs.max()) if confs.size else 0.0,
                      cls_names[:8])
 
-        # Filter ignored classes BEFORE running SAM (saves work).
+        # Filter ignored classes BEFORE running SAM (saves work). A deployment
+        # that lists its own classes wants every one of them, people too.
+        ignored = set() if os.environ.get("SCENE_OPEN_VOCAB_CLASSES", "").strip() else _IGNORED_CLASSES
         keep = np.array([
-            str(names.get(int(cidx), f"class_{cidx}")).lower() not in _IGNORED_CLASSES
+            str(names.get(int(cidx), f"class_{cidx}")).lower() not in ignored
             for cidx in cls_idx
         ], dtype=bool)
         if not keep.any():

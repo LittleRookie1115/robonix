@@ -42,7 +42,7 @@ system/scene/
 
 The metric pipeline is ConceptGraphs-style per-frame perception with 4 stages:
 
-1. **Detect.** YOLO-World v2 (open-vocab via CLIP text encoder) on the live RGB frame. Class list is a 55-entry indoor-office vocabulary; override at runtime via `SCENE_OPEN_VOCAB_CLASSES=cup,chair,...`.
+1. **Detect.** YOLO-World v2 (open-vocab via CLIP text encoder) on the live RGB frame. Class list is a 55-entry indoor-office vocabulary, which detects `person` but never adds people to the scene; override at runtime via `SCENE_OPEN_VOCAB_CLASSES=cup,chair,...`, which adds every class it lists.
 2. **Segment.** MobileSAM, prompted with each YOLO bbox, produces a per-detection mask.
 3. **Lift to 3D.** Mask-aware depth backprojection through pinhole intrinsics gives a per-detection point cloud in camera-optical frame. The intrinsics `K` come **only** from the atlas-resolved `primitive/camera/intrinsics` contract — the real per-deployment camera. There is no hardcoded-default fallback: guessing `K` scales every point by `fx/fy` and silently misplaces objects, so when no usable intrinsics are wired the detector *waits* (logs `waiting for camera intrinsics`) instead. The world transform comes from the robot's TF tree first: Scene asks for `T(world ← selected_camera_optical)` so the full URDF/static chain and SLAM's `map → odom` correction stay intact. Only when that TF lookup is unavailable does the compatibility path compose `T(world ← body)` from `service/map/pose` (or odom) with `T(body ← camera_optical)` from `primitive/camera/extrinsics`. The selected pose source determines `body`; the extrinsics parent must match that same frame. The world frame name is whatever `header.frame_id` the localizer publishes — never a hardcoded `"map"` once a sample exists.
 4. **Match + merge.** The default `association=voxel_vote` scores shared voxel observations and label text similarity. With `association=cg`, visual features and voxel overlap feed the aggregate score instead. The `cg` path applies these gates:
@@ -670,7 +670,7 @@ Hugging Face mirror endpoint (default `https://hf-mirror.com`); the canonical
 
 | Env | Default | Notes |
 |---|---|---|
-| `SCENE_OPEN_VOCAB_CLASSES` | (55-entry default) | comma-separated YOLO-World class list |
+| `SCENE_OPEN_VOCAB_CLASSES` | (55-entry default) | comma-separated YOLO-World class list; every class listed, `person` too, is added to the scene |
 | `SCENE_CG_FORCE_CPU` | `` | set to `1` to force CPU mode (~3× slower) |
 | `SCENE_PERCEPTION_WAIT_S` | `30` | how long to wait for camera providers before falling back |
 | `SCENE_POSE_MAX_AGE_S` | `2.0` | maximum receipt age in seconds for pose/odometry used in camera-to-world projection; stale samples withhold detections |

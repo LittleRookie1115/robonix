@@ -219,7 +219,8 @@ def test_missing_torch_models_preserve_geometric_service(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("reason", ["decode", "no detections", "ignored classes"])
-def test_empty_frame_diagnostics_are_bounded(reason, caplog):
+def test_empty_frame_diagnostics_are_bounded(reason, caplog, monkeypatch):
+    monkeypatch.delenv("SCENE_OPEN_VOCAB_CLASSES", raising=False)
     rgb = SimpleNamespace(encoding="unsupported" if reason == "decode" else "bgr8",
                           width=2, height=2, data=bytes(12))
     depth = SimpleNamespace(encoding="32FC1", width=2, height=2,
@@ -245,3 +246,22 @@ def test_empty_frame_diagnostics_are_bounded(reason, caplog):
     assert len(calls) == (0 if reason == "decode" else 51)
     assert all("rgb=" in line and "depth=" in line for line in evidence)
     assert detector._map_objects == []
+
+
+def test_listed_classes_keep_people(monkeypatch):
+    monkeypatch.setenv("SCENE_OPEN_VOCAB_CLASSES", "person")
+    rgb = SimpleNamespace(encoding="bgr8", width=2, height=2, data=bytes(12))
+    depth = SimpleNamespace(encoding="32FC1", width=2, height=2,
+                            data=np.ones((2, 2), np.float32).tobytes())
+    segmented = []
+    detector = cg.ConceptGraphsDetector(
+        rgb_fetcher_msg=lambda: rgb, depth_fetcher_msg=lambda: depth,
+        camera_info_fetcher=lambda: SimpleNamespace(fx=1., fy=1.),
+        on_detections=None, registry=None)
+    detector._engines = SimpleNamespace(
+        detect=lambda image, confidence: np.array([[0., 0., 1., 1., .9, 0.]]),
+        segment=lambda image, xyxy: segmented.append(len(xyxy)) or np.empty((0, 2, 2)))
+    detector._map_objects = []
+    detector._classes = ["person"]
+    detector._tick_locked()
+    assert segmented == [1]
