@@ -323,7 +323,13 @@ impl Speculation {
                 });
                 if r.state == succeeded {
                     step["status"] = "succeeded".into();
-                    step["output"] = parse(&leaf.output);
+                    // The decision model reads text only, and one image's base64
+                    // alone exceeds its input limit.
+                    step["output"] = if crate::history::is_image_output(&leaf.output) {
+                        "[image, not shown]".into()
+                    } else {
+                        parse(&leaf.output)
+                    };
                 } else {
                     step["status"] = "failed".into();
                     step["error"] = if leaf.error.is_empty() {
@@ -766,6 +772,18 @@ mod tests {
                  "status": "failed", "error": "step 2 failed"},
             ])
         );
+    }
+
+    #[test]
+    fn the_report_leaves_image_data_out() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut spec = three_steps();
+        let mut snapshot = state(1, RtdlNodeStateEnum::Succeeded);
+        snapshot.leaf_result.as_mut().unwrap().output =
+            r#"{"width": 640, "height": 480, "encoding": "jpeg", "data": "/9j/4AAQ"}"#.into();
+        spec.ended("p", &[snapshot], false, false);
+        assert_eq!(spec.report()[0]["output"], "[image, not shown]");
     }
 
     #[test]
