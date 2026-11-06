@@ -17,7 +17,7 @@ if TYPE_CHECKING:  # pragma: no cover
 from .scene_graph.store import SceneGraphStore
 from .scene_graph.types import SceneGraphSnapshot
 from .geometry import point_in_polygon, polygon_centroid
-from .goal_planner import object_goal, room_goal, room_yaw_candidates
+from .goal_planner import object_goal, pose_clear, room_goal, room_yaw_candidates
 from .robot_geometry import RobotGeometryState
 
 if TYPE_CHECKING:
@@ -353,10 +353,10 @@ def _reference_forms(value: str) -> set[str]:
 
 
 def _resolve_region_target(reference: str) -> tuple["Annotation | None", list["Annotation"]]:
-    """Resolve stable ID first, then an exact unique region name/short alias.
+    """Resolve stable ID first, then an exact unique region or POI name/short alias.
     """
     exact = _find_annotation_target(reference)
-    if exact is not None and exact.kind == "region":
+    if exact is not None:
         return exact, []
     if _ANNO_STORE is None:
         return None, []
@@ -364,7 +364,7 @@ def _resolve_region_target(reference: str) -> tuple["Annotation | None", list["A
     needles = _reference_forms(reference)
     matches = [
         region for region in _ANNO_STORE.list()
-        if region.kind == "region" and (needles & _reference_forms(region.name))
+        if needles & _reference_forms(region.name)
     ]
     if len(matches) == 1:
         return matches[0], []
@@ -374,7 +374,7 @@ def _resolve_region_target(reference: str) -> tuple["Annotation | None", list["A
 def _region_id_hint() -> str:
     if _ANNO_STORE is None:
         return "no regions are currently registered"
-    regions = [a for a in _ANNO_STORE.list() if a.kind == "region"]
+    regions = _ANNO_STORE.list()
     if not regions:
         return "no regions are currently registered"
     candidates = ", ".join(
@@ -574,7 +574,7 @@ async def find(req: Find_Request) -> Find_Response:
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/list_regions")
 async def list_regions(_req: ListRegions_Request) -> ListRegions_Response:
-    """Return every registered region with its stable goal_region ID.
+    """Return every registered region and POI with its stable goal_region ID.
 
     Perceived physical objects are intentionally excluded. Stale annotations
     remain visible and are marked explicitly so callers never infer absence
@@ -584,11 +584,7 @@ async def list_regions(_req: ListRegions_Request) -> ListRegions_Response:
     if _ANNO_STORE is None:
         raise RuntimeError("scene annotation store is unavailable")
     return ListRegions_Response(
-        regions=[
-            _annotation_to_region(annotation)
-            for annotation in _ANNO_STORE.list()
-            if annotation.kind == "region"
-        ],
+        regions=[_annotation_to_region(annotation) for annotation in _ANNO_STORE.list()],
         map_id=_ANNO_STORE.map_id,
         stamp_unix=time.time(),
     )
@@ -800,9 +796,10 @@ def _nav_costmap(frame: str):
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_region")
 async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
-    """Resolve a region annotation to a safe map-frame pose inside its polygon.
+    """Resolve a region annotation to a safe map-frame pose inside its polygon,
+    or a POI to its own pose.
 
-    Use this for named regions before navigation/navigate.
+    Use this for named regions and POIs before navigation/navigate.
     The result never falls outside the region polygon.
     Contract: robonix/system/scene/goal_region.
     """
@@ -873,6 +870,17 @@ async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
             y=0.0,
             yaw=0.0,
             reason="occupancy_grid frame is unknown",
+        )
+    if region.kind == "poi":
+        (x, y), yaw = region.points[0], float(region.theta or 0.0)
+        if not pose_clear(msg, footprint, x, y, yaw):
+            return GoalRegion_Response(
+                reachable=False, x=0.0, y=0.0, yaw=0.0,
+                reason=f"the robot does not fit at POI '{region.name}' ({stable_region_id})",
+            )
+        return GoalRegion_Response(
+            reachable=True, x=float(x), y=float(y), yaw=yaw,
+            reason=f"pose of POI '{region.name}' ({stable_region_id})",
         )
     found = room_goal(
         msg,

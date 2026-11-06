@@ -302,6 +302,21 @@ def room_goal(
     return None
 
 
+def pose_clear(grid_msg, footprint: RobotFootprint, x: float, y: float, yaw: float) -> bool:
+    """Whether the footprint at this pose lies on known free cells only."""
+    width, height, resolution, origin_x, origin_y = _grid_metadata(grid_msg)
+    grid = _grid_array(grid_msg, width=width, height=height)
+    return _footprint_clear(
+        (grid < 0) | (grid > 50),
+        width=width,
+        height=height,
+        resolution=resolution,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        polygon=transformed_footprint(footprint, x, y, yaw),
+    )
+
+
 def _ring_cells(center_x: int, center_y: int, radius: int) -> Iterable[tuple[int, int]]:
     if radius == 0:
         yield center_x, center_y
