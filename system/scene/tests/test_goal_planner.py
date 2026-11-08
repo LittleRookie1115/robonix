@@ -95,6 +95,18 @@ def test_room_goal_stops_after_first_centroid_safe_pose(monkeypatch):
     assert footprint_checks == 1
 
 
+def test_room_goal_keeps_off_a_table_the_lidar_sees_only_the_legs_of():
+    """Four legs around the room's centroid: the pose must not go under the top."""
+    data = np.zeros((60, 60), dtype=np.int8)
+    for x, y in ((1.1, 1.1), (1.9, 1.1), (1.1, 1.9), (1.9, 1.9)):
+        data[round((y + 1.5) / 0.1), round((x + 1.5) / 0.1)] = 100
+    grid = _grid(width=60, height=60)
+    grid.data = data.tobytes()
+    room = [(-1.5, -1.5), (4.5, -1.5), (4.5, 4.5), (-1.5, 4.5)]
+    x, y, _yaw = room_goal(grid, room, _footprint(0.1, 0.1), yaw_candidates=(0.0,))
+    assert max(abs(x - 1.5), abs(y - 1.5)) > 0.6
+
+
 def test_object_goal_uses_complete_polygon():
     """A returned object approach pose keeps the real footprint in bounds."""
     grid = _grid(width=12, height=12)

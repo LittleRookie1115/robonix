@@ -149,6 +149,51 @@ def test_confirm_bump_and_cross_map_drift():
     print("  [PASS] test_confirm_bump_and_cross_map_drift")
 
 
+def test_relocalizing_on_a_saved_map_keeps_annotations_fresh():
+    """A bump while localizing on the same saved map flushes objects but keeps
+    named places fresh, across a restart too."""
+    service_mod = _service_mod()
+    if service_mod is None:
+        return
+
+    async def scenario(tmp):
+        registry = ObjectRegistry()
+        async with registry.lock():
+            registry._objects["o1"] = _obj("o1")
+        anno = AnnotationStore(os.path.join(tmp, "anno"), map_id="m1")
+        anno.create(kind="room", name="kitchen", points=ROOM_PTS)
+        hub = FakeHub()
+        live = {"map_id": "m1", "mode": "localization", "generation": 1,
+                "source": "ui_load"}
+        task = asyncio.create_task(service_mod._lifecycle_watch(
+            hub, MapBinding(map_id="m1", source="ui_load"), anno,
+            registry=registry, live_binding=live, interval_s=0.01,
+        ))
+        try:
+            hub.set("m1", 2, mode="localization")
+            await _settle()
+            assert live["generation"] == 2, live
+            assert registry._objects == {}, registry._objects
+            assert not anno.list()[0].stale
+            reloaded = AnnotationStore(
+                os.path.join(tmp, "anno"), map_id="m1", generation=2
+            )
+            assert not reloaded.list()[0].stale
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(scenario(tmp))
+        finally:
+            loop.close()
+
+
 def test_facade_load_is_not_drift():
     """A Load through the web facade updates the SAME live-binding dict the
     watcher polls — the watcher must treat it as the new expectation, not
