@@ -1711,10 +1711,10 @@ pub async fn run_turn(
             let waiting = std::time::Instant::now();
             let reply = match branch {
                 Err(reason) => Err(reason.to_string()),
-                Ok((mut branch, written)) => {
-                    // Refusing a reply still being written must not delay the
-                    // round, so the real request runs alongside it.
-                    if !written {
+                Ok(mut branch) => {
+                    // Refusing a reply still being written or asked about must
+                    // not delay the round, so the real request runs alongside it.
+                    if !branch.is_settled() {
                         request = Some(open_request(history, tasks));
                     }
                     let dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(

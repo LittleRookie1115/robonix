@@ -79,11 +79,12 @@ impl DecisionModel {
     /// Ask one question about `state` and return its answer object.
     async fn ask(&self, state: &Value, question: &Value) -> Result<Value> {
         let body = json!({"model": self.model, "state": state, "questions": {"q": question}});
-        // An answer slower than this costs more than the planning request it would replace.
+        // The planning request runs alongside the question, so a late answer
+        // costs nothing; past this, that request has usually answered first.
         let mut request = self
             .http
             .post(&self.url)
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
             .json(&body);
         if let Some(key) = &self.key {
             request = request.bearer_auth(key);
@@ -138,6 +139,11 @@ impl Branch {
         (&mut self.reply)
             .await
             .unwrap_or_else(|_| Err("request failed".into()))
+    }
+
+    /// Whether the reply is settled, so waiting for it costs nothing.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.reply.is_finished()
     }
 
     /// The settled reply to use in place of the planning request, or why there
@@ -390,10 +396,8 @@ impl Speculation {
     /// Take the branch for the outcome the tree actually had and settle its
     /// reply in the background, so the decision model answers while the round
     /// gathers its context. `steps` holds every step the turn has reported.
-    /// Also returns whether the planning model had finished writing the reply.
-    pub(crate) fn settle(&mut self, steps: Vec<Value>) -> Result<(Branch, bool), &'static str> {
+    pub(crate) fn settle(&mut self, steps: Vec<Value>) -> Result<Branch, &'static str> {
         let mut written = self.take_branch()?;
-        let ready = written.reply.is_finished();
         let outcome = written.outcome.clone();
         let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
         let (tau_choice, tau_done) = (self.tau_choice, self.tau_done);
@@ -420,7 +424,7 @@ impl Speculation {
             }
             Ok(reply)
         });
-        Ok((Branch { outcome, reply }, ready))
+        Ok(Branch { outcome, reply })
     }
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
