@@ -750,7 +750,9 @@ by the container entrypoint or Native start script); Native builds the overlay
 with its selected Python interpreter and checks ROS message type support.
 Without the overlay, Scene falls back to static binding
 with a warning. At runtime the lifecycle watcher clears derived objects after
-a map-frame epoch change and marks annotations stale. If mapping switches to
+a map-frame epoch change and marks annotations stale, except when the change
+is a relocalization on the saved map already localized on: that map's frame
+has not moved, so annotations stay valid. If mapping switches to
 a different named map outside Scene, it clears mis-anchored objects and blocks
 Save until an explicit Load restores a coherent binding.
 
@@ -799,7 +801,7 @@ below).
 | `robonix/system/scene/list_regions`            | `list_regions`   | Regions and POIs, with stable IDs accepted by `goal_region`, geometry (a POI's point and heading), and staleness metadata. |
 | `robonix/system/scene/get_robot_context`       | `get_robot_context` | One coherent robot pose, room/area containment, and nearby-object snapshot. |
 | `robonix/system/scene/goal_near`               | `goal_near`      | Footprint-safe approach pose near a registered object. Pass to `navigation/navigate`. |
-| `robonix/system/scene/goal_region`             | `goal_region`    | Footprint-safe pose inside a region annotation, or a POI's own pose when the footprint fits there. |
+| `robonix/system/scene/goal_region`             | `goal_region`    | Footprint-safe pose on the region's most open known-free floor (the lidar misses table tops, so the middle of a room is often under one), or a POI's own pose when the footprint fits there. |
 | `robonix/system/scene/goal_room`               | `goal_room`      | Deprecated alias of `goal_region`. |
 | `robonix/system/scene/find`                    | `find`           | Resolve a description to candidate objects, or say they are ambiguous and what would tell them apart. |
 | `robonix/system/scene/get_scene_graph`         | `get_scene_graph` | Current semantic graph nodes and relation edges. |

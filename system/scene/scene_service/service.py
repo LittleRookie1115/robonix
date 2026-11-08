@@ -1431,19 +1431,39 @@ async def _lifecycle_watch(
                     or live_gen == ref_gen
                 ):
                     return
+                # Relocalizing on a saved map finds the robot again in that
+                # map's own frame, which has not moved, so its named places
+                # hold; objects seen while the robot was lost do not.
+                relocalized = (
+                    live_binding.get("mode") == "localization"
+                    and str(msg.mode) == "localization"
+                )
                 log.warning(
                     "[scene] map %s frame epoch changed under scene (gen "
                     "%s→%d, mode=%s) — flushing derived objects "
-                    "(re-observation rebuilds them in the new frame); room "
-                    "annotations are flagged stale for confirmation",
+                    "(re-observation rebuilds them in the new frame)%s",
                     live_id,
                     ref_gen,
                     live_gen,
                     str(msg.mode),
+                    "" if relocalized else (
+                        "; room annotations are flagged stale for confirmation"
+                    ),
                 )
                 if not await _flush_registry("after epoch bump"):
                     return
-                if anno_store is not None:
+                if anno_store is not None and relocalized:
+                    try:
+                        anno_store.rebind(
+                            live_id, generation=live_gen, carry_current=True
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.error(
+                            "[scene-anno] generation update failed (a "
+                            "restart will flag annotations stale): %s",
+                            e,
+                        )
+                elif anno_store is not None:
                     try:
                         n = anno_store.mark_all_stale(
                             f"map generation {ref_gen}→{live_gen}",

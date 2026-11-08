@@ -2,7 +2,6 @@
 """Robot-footprint-aware occupancy planning for Scene spatial goals."""
 from __future__ import annotations
 
-import heapq
 import math
 from collections.abc import Iterable, Sequence
 
@@ -195,56 +194,6 @@ def _footprint_clear(
     return True
 
 
-def _cells_nearest_to(
-    *,
-    min_gx: int,
-    max_gx: int,
-    min_gy: int,
-    max_gy: int,
-    resolution: float,
-    origin_x: float,
-    origin_y: float,
-    target_x: float,
-    target_y: float,
-) -> Iterable[tuple[float, float]]:
-    """Yield bounding-box cell centres nearest the target first.
-
-    The priority flood only retains the explored frontier, so a safe pose near
-    the room centroid can be returned without sorting or testing the full room.
-    """
-    start_gx = min(
-        max(math.floor((target_x - origin_x) / resolution), min_gx),
-        max_gx,
-    )
-    start_gy = min(
-        max(math.floor((target_y - origin_y) / resolution), min_gy),
-        max_gy,
-    )
-    pending: list[tuple[float, float, float, int, int]] = []
-    visited: set[tuple[int, int]] = set()
-
-    def push(gx: int, gy: int) -> None:
-        """Add one in-bounds cell to the distance-ordered frontier."""
-        if not (min_gx <= gx <= max_gx and min_gy <= gy <= max_gy):
-            return
-        if (gx, gy) in visited:
-            return
-        visited.add((gx, gy))
-        x = origin_x + (gx + 0.5) * resolution
-        y = origin_y + (gy + 0.5) * resolution
-        distance_sq = (x - target_x) ** 2 + (y - target_y) ** 2
-        heapq.heappush(pending, (distance_sq, x, y, gx, gy))
-
-    push(start_gx, start_gy)
-    while pending:
-        _distance_sq, x, y, gx, gy = heapq.heappop(pending)
-        yield x, y
-        push(gx - 1, gy)
-        push(gx + 1, gy)
-        push(gx, gy - 1)
-        push(gx, gy + 1)
-
-
 def room_goal(
     grid_msg,
     room_points: Sequence[Point],
@@ -252,13 +201,23 @@ def room_goal(
     *,
     yaw_candidates: Sequence[float],
 ) -> tuple[float, float, float] | None:
-    """Choose the centroid-nearest known-free pose fitting the real footprint."""
+    """Choose the known-free pose fitting the real footprint that lies farthest
+    from anything not known free, the centroid-nearest one among equals.
+
+    A lidar sees a table's legs but not its top, so the middle of a room is
+    often under a table; the most open floor is not.
+    """
+    import numpy as np
+    from scipy import ndimage
+
     room = [(float(x), float(y)) for x, y in room_points]
     if len(room) < 3:
         return None
     width, height, resolution, origin_x, origin_y = _grid_metadata(grid_msg)
     grid = _grid_array(grid_msg, width=width, height=height)
     blocked = (grid < 0) | (grid > 50)
+    # The padding makes the grid's edge count as blocked.
+    clearance = ndimage.distance_transform_edt(np.pad(~blocked, 1))[1:-1, 1:-1]
     centroid_x, centroid_y = polygon_centroid(room)
     min_gx = max(0, math.floor((min(x for x, _ in room) - origin_x) / resolution))
     max_gx = min(
@@ -273,18 +232,14 @@ def room_goal(
     headings = tuple(float(yaw) for yaw in yaw_candidates)
     if not headings or any(not math.isfinite(yaw) for yaw in headings):
         return None
-    cells = _cells_nearest_to(
-        min_gx=min_gx,
-        max_gx=max_gx,
-        min_gy=min_gy,
-        max_gy=max_gy,
-        resolution=resolution,
-        origin_x=origin_x,
-        origin_y=origin_y,
-        target_x=centroid_x,
-        target_y=centroid_y,
-    )
-    for x, y in cells:
+    gy, gx = np.mgrid[min_gy : max_gy + 1, min_gx : max_gx + 1]
+    xs = (origin_x + (gx + 0.5) * resolution).ravel()
+    ys = (origin_y + (gy + 0.5) * resolution).ravel()
+    open_cells = clearance[min_gy : max_gy + 1, min_gx : max_gx + 1].ravel()
+    for i in np.lexsort(((xs - centroid_x) ** 2 + (ys - centroid_y) ** 2, -open_cells)):
+        if not open_cells[i]:
+            break
+        x, y = float(xs[i]), float(ys[i])
         for yaw in headings:
             candidate = transformed_footprint(footprint, x, y, yaw)
             if not polygon_inside_polygon(candidate, room):
