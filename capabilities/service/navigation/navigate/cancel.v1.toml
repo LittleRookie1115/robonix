@@ -6,6 +6,9 @@ version = "1"
 kind    = "service"
 idl     = "navigation/srv/CancelNavigation.srv"
 description = "Cancel a previously accepted navigation run."
+# Executor calls this when the plan running navigate is cancelled; a planner
+# stops navigation by cancelling that plan.
+llm_callable = false
 
 [mode]
 type = "rpc"

@@ -7,6 +7,9 @@ version = "1"
 kind    = "service"
 idl     = "navigation/srv/GetNavigationStatus.srv"
 description = "Read status for a previously accepted navigation run."
+# Executor polls this while navigate runs and returns the final status as
+# navigate's own result, so a planner never has a run to ask about.
+llm_callable = false
 
 [mode]
 type = "rpc"
