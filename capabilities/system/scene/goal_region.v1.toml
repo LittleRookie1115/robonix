@@ -1,11 +1,11 @@
 # Find a navigation-safe pose inside a registered region, or at a POI.
-# Returns map-frame (x, y, yaw); pass to navigation/navigate after.
+# Returns map-frame (x, y, yaw) and the same pose as `goal` for navigation/navigate.
 [contract]
 id      = "robonix/system/scene/goal_region"
 version = "1"
 kind    = "service"
 idl     = "semantic_map/srv/GoalRegion.srv"
-description = "Resolve a region annotation to a navigation-safe pose inside its polygon, or a POI to its own pose and heading. Use this for named rooms, regions or POIs before navigation/navigate."
+description = "Resolve a region annotation, by stable ID or unique name, to a navigation-safe pose inside its polygon, or a POI to its own pose and heading. `goal` is that pose as navigation/navigate's goal; it is set only when `reachable` is true, so check `reachable` before navigating to it."
 
 [mode]
 type = "rpc"

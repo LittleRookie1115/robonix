@@ -800,8 +800,8 @@ below).
 | `robonix/system/scene/list_objects`            | `list_objects`   | Flat list of every currently-tracked object (id, label, x,y,z, last_seen). LLM filters client-side. |
 | `robonix/system/scene/list_regions`            | `list_regions`   | Regions and POIs, with stable IDs accepted by `goal_region`, geometry (a POI's point and heading), and staleness metadata. |
 | `robonix/system/scene/get_robot_context`       | `get_robot_context` | One coherent robot pose, room/area containment, and nearby-object snapshot. |
-| `robonix/system/scene/goal_near`               | `goal_near`      | Footprint-safe approach pose near a registered object. Pass to `navigation/navigate`. |
-| `robonix/system/scene/goal_region`             | `goal_region`    | Footprint-safe pose on the region's most open known-free floor (the lidar misses table tops, so the middle of a room is often under one), or a POI's own pose when the footprint fits there. |
+| `robonix/system/scene/goal_near`               | `goal_near`      | Footprint-safe approach pose near a registered object, as (x, y, yaw) and as `goal`, a `PoseStamped` to pass to `navigation/navigate` by `$ref`. `goal` is set only when `reachable` is true. |
+| `robonix/system/scene/goal_region`             | `goal_region`    | Footprint-safe pose on the region's most open known-free floor (the lidar misses table tops, so the middle of a room is often under one), or a POI's own pose when the footprint fits there. Takes a stable ID or a unique name, and returns the pose with `goal` like `goal_near`. |
 | `robonix/system/scene/goal_room`               | `goal_room`      | Deprecated alias of `goal_region`. |
 | `robonix/system/scene/find`                    | `find`           | Resolve a description to candidate objects, or say they are ambiguous and what would tell them apart. |
 | `robonix/system/scene/get_scene_graph`         | `get_scene_graph` | Current semantic graph nodes and relation edges. |

@@ -75,11 +75,19 @@ def approach(x: float, y: float, standoff: float = 0.6) -> dict:
     return {"x": round(x - standoff * x / d, 3), "y": round(y - standoff * y / d, 3), "yaw": round(yaw, 3)}
 
 
+def goal(x: float, y: float, yaw: float) -> dict:
+    """mcp_tools._pose_goal."""
+    return {"reachable": True, "x": x, "y": y, "yaw": yaw, "reason": "",
+            "goal": {"header": {"stamp": {"sec": 0, "nanosec": 0}, "frame_id": "map"},
+                     "pose": {"position": {"x": x, "y": y, "z": 0.0},
+                              "orientation": {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2), "w": math.cos(yaw / 2)}}}}
+
+
 def goal_near(object_id: str, **_) -> dict:
     o = OBJECTS.get(object_id)
     if o is None:
         raise ValueError(f"unknown object_id {object_id!r}")
-    return {"reachable": True, **approach(o["x"], o["y"]), "reason": ""}
+    return goal(**approach(o["x"], o["y"]))
 
 
 def goal_region(region_id: str, **_) -> dict:
@@ -88,7 +96,7 @@ def goal_region(region_id: str, **_) -> dict:
         raise ValueError(f"unknown region_id {region_id!r}; available regions: "
                          + ", ".join(f"{x['name']!r} (id={x['id']})" for x in SCENE["regions"]))
     xs, ys = [p[0] for p in r["points"]], [p[1] for p in r["points"]]
-    return {"reachable": True, "x": sum(xs) / len(xs), "y": sum(ys) / len(ys), "yaw": 0.0, "reason": ""}
+    return goal(sum(xs) / len(xs), sum(ys) / len(ys), 0.0)
 
 
 def object_context(object_id: str, **_) -> dict:

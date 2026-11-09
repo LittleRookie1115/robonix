@@ -1,4 +1,5 @@
 import asyncio
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -127,7 +128,12 @@ def test_goal_region_returns_a_poi_pose_only_where_the_robot_fits():
 
     spot = goal("charging spot")
     assert (spot.reachable, spot.x, spot.y, spot.yaw) == (True, 1.0, 1.0, 1.5)
+    pose = spot.goal.pose
+    assert spot.goal.header.frame_id == "map"
+    assert (pose.position.x, pose.position.y) == (1.0, 1.0)
+    assert 2.0 * math.atan2(pose.orientation.z, pose.orientation.w) == pytest.approx(1.5)
     assert goal("scene.poi.anno.poi").reachable is True
     blocked = goal("by the wall")
     assert blocked.reachable is False
     assert "does not fit" in blocked.reason
+    assert blocked.goal.header.frame_id == ""

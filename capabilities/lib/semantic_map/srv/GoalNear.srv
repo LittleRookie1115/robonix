@@ -14,4 +14,7 @@ bool reachable
 float64 x
 float64 y
 float64 yaw
+# Same pose as (x, y, yaw), ready for navigation/navigate's `goal`.
+# Valid only when reachable is true; otherwise left empty.
+geometry_msgs/PoseStamped goal
 string reason

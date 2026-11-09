@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 # Resolved at import time. PYTHONPATH is set by package_manifest.yaml's
 # `start:` block to include rbnx-build/codegen/{proto_gen,robonix_mcp_types}.
+import geometry_msgs_mcp  # type: ignore
 import semantic_map_mcp  # type: ignore
 from semantic_map_mcp import (  # type: ignore
     GoalNear_Request,
@@ -663,7 +664,8 @@ async def get_robot_context(_req: GetRobotContext_Request) -> GetRobotContext_Re
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_near")
 async def goal_near(req: GoalNear_Request) -> GoalNear_Response:
     """Find a navigation-safe approach pose near a physical scene object.
-    Returns map-frame (x, y, yaw); pass to navigation/navigate.
+    `goal` is that pose as navigation/navigate's goal; it is set only when
+    `reachable` is true, so check `reachable` before navigating to it.
 
     Region annotations are deliberately not accepted. Resolve those through
     goal_region so the returned pose is constrained to the region polygon.
@@ -775,8 +777,20 @@ async def goal_near(req: GoalNear_Request) -> GoalNear_Response:
     gx, gy, yaw = found
     return GoalNear_Response(
         reachable=True, x=float(gx), y=float(gy), yaw=float(yaw),
+        goal=_pose_goal(grid_frame, gx, gy, yaw),
         reason=f"approach pose for '{target.label}' ({req.object_id})",
     )
+
+
+def _pose_goal(frame: str, x: float, y: float, yaw: float):
+    """Planar pose as navigation/navigate's goal, so a plan can pass it by $ref."""
+    goal = geometry_msgs_mcp.PoseStamped()
+    goal.header.frame_id = frame
+    goal.pose.position.x = float(x)
+    goal.pose.position.y = float(y)
+    goal.pose.orientation.z = math.sin(float(yaw) / 2.0)
+    goal.pose.orientation.w = math.cos(float(yaw) / 2.0)
+    return goal
 
 
 def _nav_costmap(frame: str):
@@ -796,10 +810,11 @@ def _nav_costmap(frame: str):
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_region")
 async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
-    """Resolve a region annotation to a safe map-frame pose inside its polygon,
-    or a POI to its own pose.
+    """Resolve a region, by stable ID or unique name, to a safe map-frame pose
+    inside its polygon, or a POI to its own pose. `goal` is that pose as
+    navigation/navigate's goal; it is set only when `reachable` is true, so
+    check `reachable` before navigating to it.
 
-    Use this for named regions and POIs before navigation/navigate.
     The result never falls outside the region polygon.
     Contract: robonix/system/scene/goal_region.
     """
@@ -880,6 +895,7 @@ async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
             )
         return GoalRegion_Response(
             reachable=True, x=float(x), y=float(y), yaw=yaw,
+            goal=_pose_goal(grid_frame, x, y, yaw),
             reason=f"pose of POI '{region.name}' ({stable_region_id})",
         )
     found = room_goal(
@@ -904,6 +920,7 @@ async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
         x=float(x),
         y=float(y),
         yaw=room_yaw,
+        goal=_pose_goal(grid_frame, x, y, room_yaw),
         reason=f"safe pose inside region '{region.name}' ({stable_region_id})",
     )
 
