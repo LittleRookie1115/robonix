@@ -390,8 +390,8 @@ pub enum ReplyShape {
     /// The RTDL envelope asked for as any JSON object, for a provider that
     /// answered the schema with nothing.
     RtdlJsonObject,
-    /// One to three failure situations, each with the RTDL envelope prepared
-    /// for it (see `speculation`).
+    /// One to three situations an outcome could show, each with the RTDL
+    /// envelope prepared for it (see `speculation`).
     Situations,
 }
 
@@ -500,7 +500,7 @@ fn rtdl_envelope_schema() -> Value {
     })
 }
 
-/// A list of failure situations, each with its reply as an RTDL envelope. The
+/// A list of situations, each with its reply as an RTDL envelope. The
 /// envelope's `$defs` move to the root, where its `$ref`s resolve.
 fn situations_schema() -> Value {
     let mut reply = rtdl_envelope_schema();

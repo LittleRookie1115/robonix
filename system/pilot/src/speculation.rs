@@ -4,12 +4,13 @@
 //! stands in for the planning request, so the robot does not stop to wait for
 //! it. Nothing speculative is dispatched before the real outcome is known.
 //!
-//! With a TypeSafe decision model configured (`TYPESAFE_BASE_URL`), a failure
-//! is prepared for as up to three situations with a reply each, and the
-//! decision model picks the one the real error shows, unless one situation with
-//! an empty `when` covers any failure; any other prepared reply that dispatches
-//! nothing is used only if the decision model finds it supported by the step
-//! results. The questions start as soon as the tree ends.
+//! With a TypeSafe decision model configured (`TYPESAFE_BASE_URL`), each
+//! outcome is prepared for as up to three situations, each saying what the
+//! failed step's error or the steps' outputs would show, with a reply each. The
+//! decision model picks the one the real results show, unless one situation
+//! with an empty `when` covers the whole outcome; any other prepared reply that
+//! dispatches nothing is used only if the decision model finds it supported by
+//! the step results. The questions start as soon as the tree ends.
 
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{Plan, RtdlNode, RtdlNodeState, Task};
@@ -110,12 +111,6 @@ impl Outcome {
             Self::Failed(op_id) => format!("failed:{op_id}"),
         }
     }
-
-    /// Whether the reply is prepared per failure situation, which only a
-    /// decision model reading the real error can choose between.
-    fn has_situations(&self) -> bool {
-        matches!(self, Self::Failed(_)) && DECISION_MODEL.is_some()
-    }
 }
 
 /// One background request and the outcome it assumed.
@@ -185,8 +180,8 @@ pub(crate) struct Speculation {
     report: Vec<Value>,
     /// The user's words for the task, as the decision model reads them.
     task: String,
-    /// Least confidence the decision model must give a failure situation for
-    /// its reply to be used.
+    /// Least confidence the decision model must give a situation for its reply
+    /// to be used.
     tau_choice: f64,
     /// Least probability the decision model must give that a reply which
     /// dispatches nothing is supported by the results and finishes the task.
@@ -230,16 +225,18 @@ impl Speculation {
                     .map(|(_, op_id)| Outcome::Failed(op_id.clone())),
             )
             .take(MAX_BRANCHES);
+        // Only a decision model reading the real results can choose between situations.
+        let situations = DECISION_MODEL.is_some();
+        let shape = if situations {
+            ReplyShape::Situations
+        } else {
+            ReplyShape::RtdlEnvelope
+        };
         let started = Instant::now();
         let branches = outcomes
             .map(|outcome| {
                 let mut messages = prefix.clone();
-                messages.push(Message::user(&hypothesis(plan, &outcome)));
-                let shape = if outcome.has_situations() {
-                    ReplyShape::Situations
-                } else {
-                    ReplyShape::RtdlEnvelope
-                };
+                messages.push(Message::user(&hypothesis(plan, &outcome, situations)));
                 let (vlm, plan_id, label) = (vlm.clone(), plan.plan_id.clone(), outcome.label());
                 let reply = tokio::spawn(async move {
                     generate(vlm, messages, shape, &plan_id, &label, idle_timeout)
@@ -405,13 +402,13 @@ impl Speculation {
             let mut reply = written.reply().await?;
             let mut state = json!({"task": task, "steps": steps});
             let mut picked = false;
-            if written.outcome.has_situations() {
+            if DECISION_MODEL.is_some() {
                 (reply, picked) = situation(&plan_id, &reply, state.clone(), tau_choice).await?;
             }
             if needs_results(&reply) {
                 return Err("reply needs results".into());
             }
-            // A situation's reply was written for the error the decision model just matched;
+            // A situation's reply was written for the results the decision model just matched;
             // asking again whether the results support it only adds a second, noisier answer.
             if DECISION_MODEL.is_some() && !picked {
                 let mut envelope: Value =
@@ -457,9 +454,9 @@ impl Speculation {
     }
 }
 
-/// The reply prepared for the failure situation the decision model finds in
-/// `state`, and whether it picked one: a lone situation with an empty `when`
-/// was written for any failure and needs no pick.
+/// The reply prepared for the situation the decision model finds in `state`,
+/// and whether it picked one: a lone situation with an empty `when` was
+/// written for the whole outcome and needs no pick.
 async fn situation(
     plan_id: &str,
     reply: &str,
@@ -560,8 +557,9 @@ pub(crate) fn replay(reply: String) -> BoxStream<'static, Result<VlmStreamItem>>
     futures_util::stream::iter([Ok(VlmStreamItem::TextDelta(reply))]).boxed()
 }
 
-/// The user message that states one outcome as already reported.
-fn hypothesis(plan: &Plan, outcome: &Outcome) -> String {
+/// The user message that states one outcome as already reported; with
+/// `situations`, it asks for a reply per situation the outcome could show.
+fn hypothesis(plan: &Plan, outcome: &Outcome, situations: bool) -> String {
     let steps: String = plan
         .nodes
         .iter()
@@ -575,25 +573,41 @@ fn hypothesis(plan: &Plan, outcome: &Outcome) -> String {
              before it succeeded and the steps after it did not run"
         ),
     };
-    let ask = if outcome.has_situations() {
-        "Name one to three situations that could have caused this failure and call for different \
-         next moves. Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: `when` says in one \
-         sentence what the failed step's error message would show in that situation, and `reply` \
-         is the complete reply you would give once that failure is reported. If the next move \
-         is the same whatever the error shows, give one situation with `when` empty."
-    } else {
-        "Write the reply you would give once this outcome is reported."
+    let assume_nothing = "Do not assume any output value, and do not state one in `content`.";
+    let (ask, assume) = match outcome {
+        _ if !situations => (
+            "Write the reply you would give once this outcome is reported.",
+            assume_nothing,
+        ),
+        Outcome::Failed(_) => (
+            "Name one to three situations that could have caused this failure and call for \
+             different next moves. Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: \
+             `when` says in one sentence what the failed step's error message would show in that \
+             situation, and `reply` is the complete reply you would give once that failure is \
+             reported. If the next move is the same whatever the error shows, give one situation \
+             with `when` empty.",
+            assume_nothing,
+        ),
+        Outcome::Succeeded => (
+            "Name one to three situations that the steps' outputs could show and that call for \
+             different next moves. Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: \
+             `when` says in one sentence what the outputs would show in that situation, and \
+             `reply` is the complete reply you would give once those outputs are reported. If \
+             the next move is the same whatever the outputs show, give one situation with `when` \
+             empty.",
+            "Beyond what a situation's `when` says, do not assume any output value, and do not \
+             state one in its reply's `content`.",
+        ),
     };
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume RTDL plan \
          {plan_id} ({description:?}) has just {ended}. Its steps:{steps}\n\
          The steps' outputs are not known yet, and the live state above was captured before \
-         this plan ran. {ask} Do not assume any output value, and do not state one in \
-         `content`. Where the next step depends on an output of these steps, pass it with \
-         {{\"$ref\": \"<op_id>#/<field>\"}} and decide with `check` inside `fallback`. If that \
-         cannot express what the next step needs, reply with `content` exactly \
-         \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real outcome \
-         matches its assumption.",
+         this plan ran. {ask} {assume} Where the next step depends on an output of these \
+         steps, pass it with {{\"$ref\": \"<op_id>#/<field>\"}} and decide with `check` inside \
+         `fallback`. If that cannot express what the next step needs, reply with `content` \
+         exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
+         outcome matches its assumption.",
         plan_id = plan.plan_id,
         description = plan.nodes[0].description,
     )
@@ -649,7 +663,7 @@ async fn generate(
 mod tests {
     use super::{Branch, Outcome, Speculation};
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
-    use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, RtdlNode, RtdlNodeState};
+    use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState};
     use crate::planner::{RTDL_DO, RTDL_SEQUENCE};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -811,6 +825,23 @@ mod tests {
         let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
         let settled = super::situation("p", reply, serde_json::json!({}), 1.0).await;
         assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), false)));
+    }
+
+    #[test]
+    fn with_a_decision_model_every_outcome_asks_for_situations() {
+        let plan = Plan {
+            plan_id: "p".into(),
+            nodes: vec![RtdlNode {
+                node_kind: RTDL_DO,
+                op_id: "p-0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
+            assert!(super::hypothesis(&plan, &outcome, true).contains(r#"{"situations""#));
+            assert!(!super::hypothesis(&plan, &outcome, false).contains("situations"));
+        }
     }
 
     #[test]
