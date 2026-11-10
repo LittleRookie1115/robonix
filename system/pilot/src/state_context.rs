@@ -5,9 +5,11 @@ use crate::pb::executor::rtdl_event::RtdlEventEnum;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode};
 use crate::planner::ExecutorConn;
+use futures_util::future::join_all;
 use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
 use tonic::Request;
 use tonic::transport::Channel;
@@ -16,13 +18,20 @@ use uuid::Uuid;
 const RTDL_DO: u32 = 2;
 const SCENE_CONTEXT: &str = "robonix/system/scene/get_robot_context";
 const SCENE_REGIONS: &str = "robonix/system/scene/list_regions";
+const SCENE_FIND: &str = "robonix/system/scene/find";
+const SCENE_GOAL: &str = "robonix/system/scene/goal_region";
 
+/// The state a planner otherwise spends rounds asking for: where the robot is,
+/// the map's regions with a navigate-ready goal each, and the objects Scene
+/// knows by region. `goals` keeps what goal_region answered this turn, since a
+/// map's regions do not move within one.
 pub async fn collect(
     executor: &ExecutorConn,
     atlas: &mut AtlasClient,
     caps: &[(String, atlas_pb::Capability)],
+    goals: &mut HashMap<String, Value>,
 ) -> String {
-    let query = |contract: &'static str| {
+    let query = |contract: &'static str, args: Value| {
         let provider = caps
             .iter()
             .find(|(_, capability)| capability.contract_id == contract)
@@ -30,14 +39,48 @@ pub async fn collect(
         let graph = executor.graph.clone();
         async move {
             match provider {
-                Some(provider_id) => query_scene(graph, provider_id, contract).await,
+                Some(provider_id) => query_scene(graph, provider_id, contract, args).await,
                 None => {
                     json!({"available": false, "error": format!("{contract} is not registered")})
                 }
             }
         }
     };
-    let (scene, regions) = tokio::join!(query(SCENE_CONTEXT), query(SCENE_REGIONS));
+    let (scene, regions) = tokio::join!(
+        query(SCENE_CONTEXT, json!({})),
+        query(SCENE_REGIONS, json!({}))
+    );
+    let listed = regions["state"]["regions"].as_array();
+    let listed = listed.map(Vec::as_slice).unwrap_or_default();
+    let rooms: Vec<&str> = listed
+        .iter()
+        .filter(|region| region["kind"] == "region")
+        .filter_map(|region| region["name"].as_str())
+        .collect();
+    let unresolved: Vec<&str> = listed
+        .iter()
+        .filter_map(|region| region["id"].as_str())
+        .filter(|id| !goals.contains_key(*id))
+        .collect();
+    // An empty region matches every object, which shows the ones outside all regions.
+    let find = |room: &str| {
+        let args = json!({"label": "", "region": room, "relation": "", "anchor": ""});
+        query(SCENE_FIND, args)
+    };
+    let (everything, by_room, resolved) = tokio::join!(
+        find(""),
+        join_all(rooms.iter().map(|room| find(room))),
+        join_all(
+            unresolved
+                .iter()
+                .map(|id| query(SCENE_GOAL, json!({"region_id": id})))
+        ),
+    );
+    for (id, goal) in unresolved.into_iter().zip(resolved) {
+        if goal["available"] == true {
+            goals.insert(id.to_string(), goal["state"].clone());
+        }
+    }
     let providers = match atlas
         .query_capabilities("", "", atlas_pb::Transport::Unspecified)
         .await
@@ -67,23 +110,30 @@ pub async fn collect(
     format!(
         "\n\n## Current environment and provider state\n\
          Refreshed immediately before this planning round. Scene owns map pose, \
-         room membership, areas, and nearby objects; `regions` are the map's regions \
+         room membership, areas, and nearby objects. `regions` are the map's regions \
          and points of interest as Scene's list_regions returns them, without their \
-         geometry. Atlas state only indicates \
+         geometry; a region's `goal` is what goal_region answered for it this turn, \
+         ready to pass to navigate, and is absent where goal_region found no reachable \
+         pose. `objects` are the ids and labels of every object Scene currently \
+         knows, by the region it is in, as Scene's find returns them. Call \
+         list_regions, goal_region or find only for what this block does not \
+         show. Atlas state only indicates \
          provider availability; current task progress remains in the in-flight RTDL \
          tree block. Missing or stale state means unknown.\n\n{}\n",
         serde_json::to_string(&json!({
             "scene": scene,
-            "regions": named(&regions),
+            "regions": named(&regions, goals),
+            "objects": by_region(&everything, &rooms, &by_room),
             "provider_availability": providers,
         }))
         .unwrap_or_else(|_| "{}".into())
     )
 }
 
-/// What `list_regions` returned, cut to what choosing a destination needs:
-/// a deployment's map can hold many polygons, and every round would resend them.
-fn named(listed: &Value) -> Value {
+/// What `list_regions` returned, cut to what choosing a destination needs,
+/// with each region's goal: a deployment's map can hold many polygons, and
+/// every round would resend them.
+fn named(listed: &Value, goals: &HashMap<String, Value>) -> Value {
     let Some(regions) = listed["state"]["regions"].as_array() else {
         return listed.clone();
     };
@@ -92,15 +142,46 @@ fn named(listed: &Value) -> Value {
         if region["stale"] == true {
             named["stale"] = true.into();
         }
+        if let Some(goal) = region["id"].as_str().and_then(|id| goals.get(id))
+            && goal["reachable"] == true
+        {
+            named["goal"] = goal["goal"].clone();
+        }
         named
     };
     regions.iter().map(named).collect()
+}
+
+/// The ids and labels of the objects `find` returned for each of `rooms`, and
+/// under "elsewhere" those of `everything` in none of them.
+fn by_region(everything: &Value, rooms: &[&str], by_room: &[Value]) -> Value {
+    let objects = |found: &Value| -> Option<Vec<Value>> {
+        let objects = found["state"]["objects"].as_array()?;
+        let known = objects.iter().filter(|object| object["label"] != "robot");
+        Some(
+            known
+                .map(|object| json!({"id": object["id"], "label": object["label"]}))
+                .collect(),
+        )
+    };
+    let Some(mut elsewhere) = objects(everything) else {
+        return everything.clone();
+    };
+    let mut regions = serde_json::Map::new();
+    for (room, found) in rooms.iter().zip(by_room) {
+        let inside = objects(found).unwrap_or_default();
+        elsewhere.retain(|object| !inside.contains(object));
+        regions.insert(room.to_string(), inside.into());
+    }
+    regions.insert("elsewhere".into(), elsewhere.into());
+    regions.into()
 }
 
 async fn query_scene(
     mut graph: RobonixSystemExecutorExecuteClient<Channel>,
     provider_id: String,
     contract: &str,
+    args: Value,
 ) -> Value {
     let plan_id = format!("state-prefetch-{}", Uuid::new_v4());
     let plan = Plan {
@@ -114,7 +195,7 @@ async fn query_scene(
                 call_id: format!("{plan_id}:0"),
                 provider_id,
                 contract_id: contract.into(),
-                args_json: "{}".into(),
+                args_json: args.to_string(),
             }),
             op_id: "scene_snapshot".into(),
             description: format!("Read {contract} before planning"),
@@ -172,32 +253,72 @@ fn lifecycle_name(state: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{lifecycle_name, named};
+    use super::{by_region, lifecycle_name, named};
     use robonix_atlas::pb::LifecycleState;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
-    fn listed_regions_keep_their_identity_and_lose_their_geometry() {
+    fn lifecycle_labels_are_stable() {
+        assert_eq!(lifecycle_name(LifecycleState::StateActive as i32), "active");
+        assert_eq!(lifecycle_name(LifecycleState::StateError as i32), "error");
+    }
+
+    #[test]
+    fn listed_regions_keep_their_identity_and_gain_a_reachable_goal() {
         let listed = json!({"available": true, "state": {"map_id": "m", "regions": [
             {"id": "scene.region.a", "kind": "region", "name": "kitchen",
              "points_xy": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0], "stale": false},
             {"id": "scene.poi.b", "kind": "poi", "name": "sink", "points_xy": [0.5, 0.5],
              "stale": true, "stale_reason": "map epoch changed"},
         ]}});
+        let goals = HashMap::from([
+            (
+                "scene.region.a".to_string(),
+                json!({"reachable": true, "x": 0.5, "goal": {"header": {"frame_id": "map"}}}),
+            ),
+            (
+                "scene.poi.b".to_string(),
+                json!({"reachable": false, "goal": {"header": {"frame_id": ""}}}),
+            ),
+        ]);
         assert_eq!(
-            named(&listed),
+            named(&listed, &goals),
             json!([
-                {"id": "scene.region.a", "kind": "region", "name": "kitchen"},
+                {"id": "scene.region.a", "kind": "region", "name": "kitchen",
+                 "goal": {"header": {"frame_id": "map"}}},
                 {"id": "scene.poi.b", "kind": "poi", "name": "sink", "stale": true},
             ])
         );
         let unavailable = json!({"available": false, "error": "timed out"});
-        assert_eq!(named(&unavailable), unavailable);
+        assert_eq!(named(&unavailable, &goals), unavailable);
     }
 
     #[test]
-    fn lifecycle_labels_are_stable() {
-        assert_eq!(lifecycle_name(LifecycleState::StateActive as i32), "active");
-        assert_eq!(lifecycle_name(LifecycleState::StateError as i32), "error");
+    fn objects_are_listed_under_the_region_find_returned_them_for() {
+        let found =
+            |objects: serde_json::Value| json!({"available": true, "state": {"objects": objects}});
+        let object = |id: &str, label: &str| json!({"id": id, "label": label, "x": 1.0});
+        let everything = found(json!([
+            object("o1", "cup"),
+            object("o2", "robot"),
+            object("o3", "sofa"),
+            object("o4", "bowl")
+        ]));
+        let kitchen = found(json!([object("o4", "bowl"), object("o1", "cup")]));
+        assert_eq!(
+            by_region(
+                &everything,
+                &["kitchen", "bedroom"],
+                &[kitchen, found(json!([]))]
+            ),
+            json!({
+                "kitchen": [{"id": "o4", "label": "bowl"}, {"id": "o1", "label": "cup"}],
+                "bedroom": [],
+                "elsewhere": [{"id": "o3", "label": "sofa"}],
+            })
+        );
+        let unavailable = json!({"available": false, "error": "timed out"});
+        assert_eq!(by_region(&unavailable, &[], &[]), unavailable);
     }
 }

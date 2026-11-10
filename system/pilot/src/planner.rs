@@ -1432,6 +1432,8 @@ pub async fn run_turn(
     let speculate = task_speculates(task);
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
+    // What goal_region answered for each of the map's regions this turn.
+    let mut region_goals = HashMap::new();
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
@@ -1568,7 +1570,8 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        let environment_block = state_context::collect(executor, atlas, &cap_list).await;
+        let environment_block =
+            state_context::collect(executor, atlas, &cap_list, &mut region_goals).await;
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
             .ok()
