@@ -137,3 +137,54 @@ def test_goal_region_returns_a_poi_pose_only_where_the_robot_fits():
     assert blocked.reachable is False
     assert "does not fit" in blocked.reason
     assert blocked.goal.header.frame_id == ""
+
+
+class _LateRegistry:
+    """Nothing for the first two looks, then a cup: perception catching up with a new view."""
+
+    def __init__(self):
+        self.looks = 0
+
+    async def snapshot(self):
+        self.looks += 1
+        if self.looks <= 2:
+            return {}
+        cup = SimpleNamespace(
+            object_id="scene.object.cup", label="cup", caption="", missing=False, attributes={},
+            pose=SimpleNamespace(x=1.0, y=1.0, z=0.8, yaw=0.0, frame_id="map"),
+            bbox=SimpleNamespace(size_x=0.1, size_y=0.1, size_z=0.1, frame_id="map"),
+            observation_count=3, last_seen=0.0)
+        return {cup.object_id: cup}
+
+
+def test_find_waits_for_its_answer_to_settle_only_as_long_as_settle_s_allows(monkeypatch):
+    monkeypatch.setattr(mcp_tools, "_FIND_POLL_S", 0.01)
+    monkeypatch.setattr(mcp_tools, "_FIND_STABLE_S", 0.03)
+    mcp_tools.attach_annotation_store(_Store())
+
+    def find(settle_s, **constraints):
+        registry = _LateRegistry()
+        mcp_tools.attach_state(registry=registry)
+        request = mcp_tools.Find_Request(settle_s=settle_s, **constraints)
+        return asyncio.run(mcp_tools.find(request)), registry.looks
+
+    at_once, looks = find(0.0, label="cup")
+    assert (at_once.objects, at_once.detail, looks) == ([], "no object matches 'cup'", 1)
+    settled, looks = find(1.0, label="cup")
+    # Seen on the third look, and unchanged for the settling time after it.
+    assert [obj.id for obj in settled.objects] == ["scene.object.cup"] and 5 <= looks < 20
+    assert find(0.005, label="cup")[0].objects == []
+
+
+def test_find_takes_a_region_by_its_id_as_well_as_its_name():
+    mcp_tools.attach_annotation_store(_Store())
+
+    def find(region):
+        registry = _LateRegistry()
+        registry.looks = 2
+        mcp_tools.attach_state(registry=registry)
+        found = asyncio.run(mcp_tools.find(mcp_tools.Find_Request(region=region)))
+        return [obj.id for obj in found.objects]
+
+    assert find("room 315") == find("scene.region.anno.315") == ["scene.object.cup"]
+    assert find("scene.poi.anno.poi") == []

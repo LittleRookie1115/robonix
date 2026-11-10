@@ -554,23 +554,50 @@ def _annotation_to_region(a: "Annotation") -> Region:
     )
 
 
+# A caller blocks on find for at most this long, whatever settle_s it asked for.
+_FIND_SETTLE_MAX_S = 10.0
+# Perception passes come about this often; polling faster finds nothing sooner.
+_FIND_POLL_S = 0.2
+# Matches unchanged for this long, two or three perception passes, have settled.
+_FIND_STABLE_S = 1.5
+
+
 @mcp_contract(mcp, contract_id="robonix/system/scene/find")
 async def find(req: Find_Request) -> Find_Response:
     """The objects matching a class (`label`), a `region` and one scene-graph
-    `relation` to an `anchor`, nearest the robot first. Use instead of
-    list_objects when looking for something. Contract: robonix/system/scene/find."""
-    objects, _map_id, _generation, _supported = await _epoch_snapshot()
-    regions = [{"name": a.name, "points": a.points}
-               for a in (_ANNO_STORE.list() if _ANNO_STORE is not None else [])
-               if a.kind == "region"]
-    snapshot = _SG_STORE.get_snapshot() if _SG_STORE is not None else None
-    robot = _robot(objects)
-    matches, detail = find_impl.find(
-        objects, label=req.label or "", region=req.region or "",
-        relation=req.relation or "", anchor=req.anchor or "", regions=regions,
-        edges=list(snapshot.edges) if snapshot else [],
-        robot_xy=(float(robot.pose.x), float(robot.pose.y)) if robot else None)
-    return Find_Response(objects=[_to_idl(o) for o in matches], detail=detail)
+    `relation` to an `anchor`, nearest the robot first. After arriving
+    somewhere, pass `settle_s` (3 to 5): find then waits up to that long for
+    perception to register what the camera now sees.
+
+    `region` is a region's name or id. With `settle_s`, the answer is given
+    once it has stopped changing, and an empty one only when the time is up.
+    Use instead of list_objects when looking for something.
+    Contract: robonix/system/scene/find."""
+    settle_s = min(max(float(getattr(req, "settle_s", 0.0) or 0.0), 0.0), _FIND_SETTLE_MAX_S)
+    deadline = time.monotonic() + settle_s
+    # A caller that read the region from list_regions holds its id, not its name.
+    named, _ = _resolve_region_target(req.region) if req.region else (None, [])
+    region = named.name if named is not None and named.kind == "region" else req.region or ""
+    seen, since = None, time.monotonic()
+    while True:
+        objects, _map_id, _generation, _supported = await _epoch_snapshot()
+        regions = [{"name": a.name, "points": a.points}
+                   for a in (_ANNO_STORE.list() if _ANNO_STORE is not None else [])
+                   if a.kind == "region"]
+        snapshot = _SG_STORE.get_snapshot() if _SG_STORE is not None else None
+        robot = _robot(objects)
+        matches, detail = find_impl.find(
+            objects, label=req.label or "", region=region,
+            relation=req.relation or "", anchor=req.anchor or "", regions=regions,
+            edges=list(snapshot.edges) if snapshot else [],
+            robot_xy=(float(robot.pose.x), float(robot.pose.y)) if robot else None)
+        now = time.monotonic()
+        ids = [o.object_id for o in matches]
+        if ids != seen:
+            seen, since = ids, now
+        if now >= deadline or (ids and now - since >= _FIND_STABLE_S):
+            return Find_Response(objects=[_to_idl(o) for o in matches], detail=detail)
+        await asyncio.sleep(_FIND_POLL_S)
 
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/list_regions")

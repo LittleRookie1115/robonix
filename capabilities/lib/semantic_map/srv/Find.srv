@@ -3,7 +3,7 @@
 
 # A class or caption word, e.g. "chair".
 string label
-# A region name.
+# A region's name or id.
 string region
 # Optional: the object must stand in this scene-graph relation to the object
 # `anchor`, e.g. relation "near", anchor "scene.object.0007" (the sofa).
@@ -11,6 +11,11 @@ string region
 string relation
 # Object id the relation is measured against.
 string anchor
+# Optional: seconds to wait, at most, for the answer to stop changing; an
+# empty answer is given only when they are up. Perception registers what the
+# camera sees a few passes after the robot arrives, so a search made on
+# arrival can come up empty for something in plain view.
+float32 settle_s
 ---
 Object[] objects
 # Why nothing matched, when nothing did.

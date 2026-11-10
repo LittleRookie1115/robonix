@@ -803,7 +803,7 @@ below).
 | `robonix/system/scene/goal_near`               | `goal_near`      | Footprint-safe approach pose near a registered object, as (x, y, yaw) and as `goal`, a `PoseStamped` to pass to `navigation/navigate` by `$ref`. `goal` is set only when `reachable` is true. |
 | `robonix/system/scene/goal_region`             | `goal_region`    | Footprint-safe pose on the region's most open known-free floor (the lidar misses table tops, so the middle of a room is often under one), or a POI's own pose when the footprint fits there. Takes a stable ID or a unique name, and returns the pose with `goal` like `goal_near`. |
 | `robonix/system/scene/goal_room`               | `goal_room`      | Deprecated alias of `goal_region`. |
-| `robonix/system/scene/find`                    | `find`           | Resolve a description to candidate objects, or say they are ambiguous and what would tell them apart. |
+| `robonix/system/scene/find`                    | `find`           | Resolve a description to candidate objects, or say they are ambiguous and what would tell them apart. With `settle_s`, wait up to that long for the answer to stop changing, for a search made on arriving somewhere. |
 | `robonix/system/scene/get_scene_graph`         | `get_scene_graph` | Current semantic graph nodes and relation edges. |
 | `robonix/system/scene/get_object_context`      | `get_object_context` | One object's graph context plus nearby objects and directly related edges. |
 | `robonix/system/scene/list_relations`          | `list_relations` | Relation edges, optionally filtered by relation type. |

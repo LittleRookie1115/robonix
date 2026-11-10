@@ -4,7 +4,7 @@ id      = "robonix/system/scene/find"
 version = "1"
 kind    = "service"
 idl     = "semantic_map/srv/Find.srv"
-description = "The objects matching a class, a region and one scene-graph relation, nearest the robot first."
+description = "The objects matching a class, a region and one scene-graph relation, nearest the robot first; `settle_s` waits up to that long for the answer to settle, for use on arriving somewhere."
 
 [mode]
 type = "rpc"
