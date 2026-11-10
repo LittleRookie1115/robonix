@@ -1420,6 +1420,7 @@ pub async fn run_turn(
     let mut usage_totals = UsageTotals::default();
     let mut cache_epoch = 0_u64;
     let mut last_soma_body = String::new();
+    let mut last_map_regions = String::new();
     let mut last_capability_docs = String::new();
     // Last user-facing narration; surfaced as FinalText when the turn ends.
     let mut last_content = String::new();
@@ -1432,8 +1433,6 @@ pub async fn run_turn(
     let speculate = task_speculates(task);
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
-    // What goal_region answered for each of the map's regions this turn.
-    let mut region_goals = HashMap::new();
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
@@ -1570,8 +1569,8 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        let environment_block =
-            state_context::collect(executor, atlas, &cap_list, &mut region_goals).await;
+        let (environment_block, map_regions) =
+            state_context::collect(executor, atlas, &cap_list).await;
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
             .ok()
@@ -1612,6 +1611,7 @@ pub async fn run_turn(
             executor_active_block.as_str(),
             embodiment_block.as_str(),
             environment_block.as_str(),
+            map_regions.as_str(),
             tasks.board().as_str(),
         ]
         .iter()
@@ -1634,6 +1634,7 @@ pub async fn run_turn(
             catalog_view.reset();
             last_soma_body.clear();
             last_capability_docs.clear();
+            last_map_regions.clear();
         }
         let catalog_update = catalog_view.update(&display_caps);
         let soma_body_update = if soma_body == last_soma_body {
@@ -1646,11 +1647,17 @@ pub async fn run_turn(
         } else {
             capability_docs.as_str()
         };
+        let map_regions_update = if map_regions == last_map_regions {
+            ""
+        } else {
+            map_regions.as_str()
+        };
         // Current observations follow history, in a fixed order.
         let live_sections = [
             ("capability_catalog", catalog_update.as_str()),
             ("embodiment_description", soma_body_update),
             ("capability_docs", capability_docs_update),
+            ("map_regions", map_regions_update),
             ("in_flight_trees", forest_block.as_str()),
             ("executor_state", executor_active_block.as_str()),
             ("embodiment_live", embodiment_block.as_str()),
@@ -1805,6 +1812,7 @@ pub async fn run_turn(
         append_request_context(history, &runtime_context);
         catalog_view.commit();
         last_soma_body = soma_body;
+        last_map_regions = map_regions;
         last_capability_docs = capability_docs;
 
         // A streamed call must not duplicate work already in flight.

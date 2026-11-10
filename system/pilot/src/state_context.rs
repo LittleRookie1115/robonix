@@ -10,6 +10,7 @@ use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 use tonic::Request;
 use tonic::transport::Channel;
@@ -21,16 +22,33 @@ const SCENE_REGIONS: &str = "robonix/system/scene/list_regions";
 const SCENE_FIND: &str = "robonix/system/scene/find";
 const SCENE_GOAL: &str = "robonix/system/scene/goal_region";
 
-/// The state a planner otherwise spends rounds asking for: where the robot is,
-/// the map's regions with a navigate-ready goal each, and the objects Scene
-/// knows by region. `goals` keeps what goal_region answered this turn, since a
-/// map's regions do not move within one.
+/// What goal_region answered for the regions of one map. A map's regions do
+/// not move, so an answer is kept for as long as Scene reports that map.
+#[derive(Default)]
+struct Goals {
+    /// The map the answers are for, as list_regions names it.
+    map_id: String,
+    /// goal_region's answer by region id.
+    by_region: HashMap<String, Value>,
+    /// Whether a task is asking for the regions still missing.
+    asking: bool,
+}
+
+static GOALS: LazyLock<Mutex<Goals>> = LazyLock::new(Mutex::default);
+
+fn goals() -> std::sync::MutexGuard<'static, Goals> {
+    GOALS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The state a planner otherwise spends rounds asking for, as two prompt
+/// blocks: what changes from round to round (where the robot is and the
+/// objects Scene knows, by region), and the map's regions with a
+/// navigate-ready goal each, which a caller shows only when it changes.
 pub async fn collect(
     executor: &ExecutorConn,
     atlas: &mut AtlasClient,
     caps: &[(String, atlas_pb::Capability)],
-    goals: &mut HashMap<String, Value>,
-) -> String {
+) -> (String, String) {
     let query = |contract: &'static str, args: Value| {
         let provider = caps
             .iter()
@@ -57,30 +75,57 @@ pub async fn collect(
         .filter(|region| region["kind"] == "region")
         .filter_map(|region| region["name"].as_str())
         .collect();
-    let unresolved: Vec<&str> = listed
-        .iter()
-        .filter_map(|region| region["id"].as_str())
-        .filter(|id| !goals.contains_key(*id))
-        .collect();
     // An empty region matches every object, which shows the ones outside all regions.
     let find = |room: &str| {
-        let args = json!({"label": "", "region": room, "relation": "", "anchor": ""});
+        let args =
+            json!({"label": "", "region": room, "relation": "", "anchor": "", "settle_s": 0.0});
         query(SCENE_FIND, args)
     };
-    let (everything, by_room, resolved) = tokio::join!(
-        find(""),
-        join_all(rooms.iter().map(|room| find(room))),
-        join_all(
-            unresolved
-                .iter()
-                .map(|id| query(SCENE_GOAL, json!({"region_id": id})))
-        ),
-    );
-    for (id, goal) in unresolved.into_iter().zip(resolved) {
-        if goal["available"] == true {
-            goals.insert(id.to_string(), goal["state"].clone());
+    let (everything, by_room) =
+        tokio::join!(find(""), join_all(rooms.iter().map(|room| find(room))));
+    // Scene answers goal_region one call at a time and a map has dozens of
+    // regions, so they are asked for in the background, once, and a round
+    // shows the answers that have come in.
+    let known = {
+        let map_id = regions["state"]["map_id"].as_str().unwrap_or_default();
+        let mut cache = goals();
+        if cache.map_id != map_id {
+            *cache = Goals {
+                map_id: map_id.into(),
+                ..Default::default()
+            };
         }
-    }
+        let ids = listed.iter().filter_map(|region| region["id"].as_str());
+        let missing: Vec<String> = ids
+            .filter(|id| !cache.by_region.contains_key(*id))
+            .map(String::from)
+            .collect();
+        let provider = caps
+            .iter()
+            .find(|(_, capability)| capability.contract_id == SCENE_GOAL);
+        if let (false, false, Some((provider_id, _))) = (cache.asking, missing.is_empty(), provider)
+        {
+            cache.asking = true;
+            let (graph, provider_id, map_id) = (
+                executor.graph.clone(),
+                provider_id.clone(),
+                map_id.to_string(),
+            );
+            tokio::spawn(async move {
+                for id in missing {
+                    let args = json!({"region_id": id});
+                    let goal =
+                        query_scene(graph.clone(), provider_id.clone(), SCENE_GOAL, args).await;
+                    let mut cache = goals();
+                    if goal["available"] == true && cache.map_id == map_id {
+                        cache.by_region.insert(id, rounded(&goal["state"]));
+                    }
+                }
+                goals().asking = false;
+            });
+        }
+        cache.by_region.clone()
+    };
     let providers = match atlas
         .query_capabilities("", "", atlas_pb::Transport::Unspecified)
         .await
@@ -107,27 +152,52 @@ pub async fn collect(
             .collect::<Vec<_>>(),
         Err(error) => vec![json!({"available": false, "error": error.to_string()})],
     };
-    format!(
+    let environment = format!(
         "\n\n## Current environment and provider state\n\
          Refreshed immediately before this planning round. Scene owns map pose, \
-         room membership, areas, and nearby objects. `regions` are the map's regions \
-         and points of interest as Scene's list_regions returns them, without their \
-         geometry; a region's `goal` is what goal_region answered for it this turn, \
-         ready to pass to navigate, and is absent where goal_region found no reachable \
-         pose. `objects` are the ids and labels of every object Scene currently \
-         knows, by the region it is in, as Scene's find returns them. Call \
-         list_regions, goal_region or find only for what this block does not \
-         show. Atlas state only indicates \
+         room membership, areas, and nearby objects. `objects` are the ids and labels \
+         of every object Scene currently knows, by the region it is in, as Scene's \
+         find returns them: call find only for what they do not show, or with \
+         `settle_s` in a tree that has just moved the robot, because perception \
+         takes a few seconds to add what the camera then sees. Atlas state \
+         only indicates \
          provider availability; current task progress remains in the in-flight RTDL \
          tree block. Missing or stale state means unknown.\n\n{}\n",
         serde_json::to_string(&json!({
             "scene": scene,
-            "regions": named(&regions, goals),
             "objects": by_region(&everything, &rooms, &by_room),
             "provider_availability": providers,
         }))
         .unwrap_or_else(|_| "{}".into())
-    )
+    );
+    let map = format!(
+        "\n\n## Map regions\n\
+         The map's regions and points of interest as Scene's list_regions returns \
+         them, without their geometry. A region's `goal` is what goal_region answered \
+         for it on this map, ready to pass to navigate, and is absent where goal_region \
+         found no reachable pose or has not answered yet. Call list_regions or \
+         goal_region only for what this does not show. Shown again only when it \
+         changes.\n\n{}\n",
+        named(&regions, &known)
+    );
+    (environment, map)
+}
+
+/// `value` with its numbers to the millimetre, which a prompt has no use beyond.
+fn rounded(value: &Value) -> Value {
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            let rounded = (number.as_f64().unwrap_or_default() * 1000.0).round() / 1000.0;
+            json!(rounded)
+        }
+        Value::Array(items) => items.iter().map(rounded).collect(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| (key.clone(), rounded(value)))
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        other => other.clone(),
+    }
 }
 
 /// What `list_regions` returned, cut to what choosing a destination needs,
@@ -253,7 +323,7 @@ fn lifecycle_name(state: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{by_region, lifecycle_name, named};
+    use super::{by_region, lifecycle_name, named, rounded};
     use robonix_atlas::pb::LifecycleState;
     use serde_json::json;
     use std::collections::HashMap;
@@ -292,6 +362,17 @@ mod tests {
         );
         let unavailable = json!({"available": false, "error": "timed out"});
         assert_eq!(named(&unavailable, &goals), unavailable);
+    }
+
+    #[test]
+    fn numbers_are_kept_to_the_millimetre() {
+        let goal = json!({"reachable": true, "x": 1.1954571252531956, "n": 3,
+                          "goal": {"pose": {"orientation": [0.0, -0.7071080798594735]}}});
+        assert_eq!(
+            rounded(&goal),
+            json!({"reachable": true, "x": 1.195, "n": 3,
+                   "goal": {"pose": {"orientation": [0.0, -0.707]}}})
+        );
     }
 
     #[test]
