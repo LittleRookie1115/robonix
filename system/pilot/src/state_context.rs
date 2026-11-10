@@ -15,20 +15,29 @@ use uuid::Uuid;
 
 const RTDL_DO: u32 = 2;
 const SCENE_CONTEXT: &str = "robonix/system/scene/get_robot_context";
+const SCENE_REGIONS: &str = "robonix/system/scene/list_regions";
 
 pub async fn collect(
     executor: &ExecutorConn,
     atlas: &mut AtlasClient,
     caps: &[(String, atlas_pb::Capability)],
 ) -> String {
-    let scene_target = caps
-        .iter()
-        .find(|(_, capability)| capability.contract_id == SCENE_CONTEXT)
-        .map(|(provider_id, _)| provider_id.clone());
-    let scene = match scene_target {
-        Some(provider_id) => query_scene(executor.graph.clone(), provider_id).await,
-        None => json!({"available": false, "error": "Scene context contract is not registered"}),
+    let query = |contract: &'static str| {
+        let provider = caps
+            .iter()
+            .find(|(_, capability)| capability.contract_id == contract)
+            .map(|(provider_id, _)| provider_id.clone());
+        let graph = executor.graph.clone();
+        async move {
+            match provider {
+                Some(provider_id) => query_scene(graph, provider_id, contract).await,
+                None => {
+                    json!({"available": false, "error": format!("{contract} is not registered")})
+                }
+            }
+        }
     };
+    let (scene, regions) = tokio::join!(query(SCENE_CONTEXT), query(SCENE_REGIONS));
     let providers = match atlas
         .query_capabilities("", "", atlas_pb::Transport::Unspecified)
         .await
@@ -58,20 +67,40 @@ pub async fn collect(
     format!(
         "\n\n## Current environment and provider state\n\
          Refreshed immediately before this planning round. Scene owns map pose, \
-         room membership, areas, and nearby objects. Atlas state only indicates \
+         room membership, areas, and nearby objects; `regions` are the map's regions \
+         and points of interest as Scene's list_regions returns them, without their \
+         geometry. Atlas state only indicates \
          provider availability; current task progress remains in the in-flight RTDL \
          tree block. Missing or stale state means unknown.\n\n{}\n",
         serde_json::to_string(&json!({
             "scene": scene,
+            "regions": named(&regions),
             "provider_availability": providers,
         }))
         .unwrap_or_else(|_| "{}".into())
     )
 }
 
+/// What `list_regions` returned, cut to what choosing a destination needs:
+/// a deployment's map can hold many polygons, and every round would resend them.
+fn named(listed: &Value) -> Value {
+    let Some(regions) = listed["state"]["regions"].as_array() else {
+        return listed.clone();
+    };
+    let named = |region: &Value| {
+        let mut named = json!({"id": region["id"], "kind": region["kind"], "name": region["name"]});
+        if region["stale"] == true {
+            named["stale"] = true.into();
+        }
+        named
+    };
+    regions.iter().map(named).collect()
+}
+
 async fn query_scene(
     mut graph: RobonixSystemExecutorExecuteClient<Channel>,
     provider_id: String,
+    contract: &str,
 ) -> Value {
     let plan_id = format!("state-prefetch-{}", Uuid::new_v4());
     let plan = Plan {
@@ -84,11 +113,11 @@ async fn query_scene(
             call: Some(CapabilityCall {
                 call_id: format!("{plan_id}:0"),
                 provider_id,
-                contract_id: SCENE_CONTEXT.into(),
+                contract_id: contract.into(),
                 args_json: "{}".into(),
             }),
             op_id: "scene_snapshot".into(),
-            description: "Read Scene spatial context before planning".into(),
+            description: format!("Read {contract} before planning"),
         }],
         root_index: 0,
     };
@@ -143,8 +172,28 @@ fn lifecycle_name(state: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::lifecycle_name;
+    use super::{lifecycle_name, named};
     use robonix_atlas::pb::LifecycleState;
+    use serde_json::json;
+
+    #[test]
+    fn listed_regions_keep_their_identity_and_lose_their_geometry() {
+        let listed = json!({"available": true, "state": {"map_id": "m", "regions": [
+            {"id": "scene.region.a", "kind": "region", "name": "kitchen",
+             "points_xy": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0], "stale": false},
+            {"id": "scene.poi.b", "kind": "poi", "name": "sink", "points_xy": [0.5, 0.5],
+             "stale": true, "stale_reason": "map epoch changed"},
+        ]}});
+        assert_eq!(
+            named(&listed),
+            json!([
+                {"id": "scene.region.a", "kind": "region", "name": "kitchen"},
+                {"id": "scene.poi.b", "kind": "poi", "name": "sink", "stale": true},
+            ])
+        );
+        let unavailable = json!({"available": false, "error": "timed out"});
+        assert_eq!(named(&unavailable), unavailable);
+    }
 
     #[test]
     fn lifecycle_labels_are_stable() {
