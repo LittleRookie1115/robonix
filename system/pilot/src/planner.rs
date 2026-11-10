@@ -318,20 +318,21 @@ fn task_speculates(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
-/// Let a speculation see how its tree ended.
+/// Let a speculation see how its tree goes and ends.
 fn observe(speculation: &mut Option<Speculation>, event: &TreeInterrupt) {
-    if let (
-        Some(spec),
+    let Some(spec) = speculation else { return };
+    match event {
+        TreeInterrupt::NodeState {
+            plan_id,
+            node_state,
+        } => spec.progressed(plan_id, node_state),
         TreeInterrupt::Completion {
             plan_id,
             results,
             any_failed,
             canceled,
             ..
-        },
-    ) = (speculation, event)
-    {
-        spec.ended(plan_id, results, *any_failed, *canceled);
+        } => spec.ended(plan_id, results, *any_failed, *canceled),
     }
 }
 
@@ -1714,6 +1715,8 @@ pub async fn run_turn(
         // A prepared reply stands in for this request only if it was written
         // for how the tree really ended and nothing else reached the model since.
         let mut prepared = None;
+        // What a used reply had prepared ahead for the tree it dispatches.
+        let mut ahead = None;
         let mut request: Option<BoxFuture<Result<BoxStream<Result<VlmStreamItem>>>>> = None;
         if let Some((spec, settled)) = pending {
             turn_steps.extend_from_slice(spec.report());
@@ -1766,9 +1769,9 @@ pub async fn run_turn(
                 }
             };
             match reply {
-                Ok((reply, branch)) => {
+                Ok((reply, mut branch)) => {
                     let outputs = spec.outputs().clone();
-                    spec.commit(&branch, waiting.elapsed());
+                    ahead = spec.commit(&mut branch, waiting.elapsed());
                     prepared = Some((reply, outputs));
                 }
                 Err(reason) => spec.discard(&reason),
@@ -2188,21 +2191,19 @@ pub async fn run_turn(
             && forest.kill_pending.is_empty()
             && !is_control_only(&graph)
         {
-            let mut context = history.clone();
-            let board = tasks.board();
-            if !board.is_empty() {
-                context.push(Message::user(&board));
-            }
-            let mut prefix = vec![Message::system(&render_context_sections(&sections))];
-            prefix.extend(history::sanitize_for_vlm(&context));
-            speculation = Some(Speculation::start(
-                vlm,
-                &graph,
-                prefix,
-                task,
-                tasks.messages.len(),
-                vlm_idle_timeout(),
-            ));
+            let seen = tasks.messages.len();
+            speculation = ahead
+                .and_then(|ahead: Speculation| ahead.adopt(&graph, seen))
+                .or_else(|| {
+                    let mut context = history.clone();
+                    let board = tasks.board();
+                    if !board.is_empty() {
+                        context.push(Message::user(&board));
+                    }
+                    let mut prefix = vec![Message::system(&render_context_sections(&sections))];
+                    prefix.extend(history::sanitize_for_vlm(&context));
+                    Speculation::start(vlm, &graph, prefix, task, seen, vlm_idle_timeout())
+                });
         }
     }
 

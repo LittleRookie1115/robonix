@@ -4,12 +4,14 @@ use crate::pb::contracts::robonix_system_executor_control_plan_client::RobonixSy
 use crate::pb::contracts::robonix_system_executor_execute_stream_client::RobonixSystemExecutorExecuteStreamClient;
 use crate::pb::executor::{ControlPlanRequest, ExecuteStreamInput, RtdlEvent};
 use crate::pb::pilot::Plan;
+use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::rtdl_stream::{
     EXECUTE_STREAM_CLOSE, EXECUTE_STREAM_END, EXECUTE_STREAM_NODE, EXECUTE_STREAM_START,
 };
 use anyhow::{Result, ensure};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Streaming, transport::Channel};
@@ -48,6 +50,36 @@ pub(crate) struct StreamExecution {
     pub(crate) complete: bool,
     /// Whether output was lost before terminal execution evidence arrived.
     pub(crate) transport_failed: bool,
+    /// How long this tree's calls take.
+    clock: CallClock,
+}
+
+/// Times one tree's calls. Executor reports a call only when it ends, so a
+/// call is timed from when it was sent or the call before it ended, whichever
+/// came later: exact for steps run one after another, and short of the truth
+/// only for the later of calls run side by side.
+#[derive(Default)]
+struct CallClock {
+    /// When each call not yet ended was sent, by node index.
+    sent: HashMap<u32, Instant>,
+    /// When the last call ended.
+    last_ended: Option<Instant>,
+}
+
+impl CallClock {
+    /// How long the call at `index` ran, if `state` reported at `now` ends it
+    /// in success. A call under verification has ended: its final state comes
+    /// only after later steps have run.
+    fn ended(&mut self, index: u32, state: u32, now: Instant) -> Option<Duration> {
+        let verifying = state == RtdlNodeStateEnum::Verifying as u32;
+        if !(verifying || matches!(state, 2..=5)) {
+            return None;
+        }
+        let sent = self.sent.remove(&index)?;
+        let started = self.last_ended.map_or(sent, |ended| ended.max(sent));
+        self.last_ended = Some(now);
+        (verifying || state == RtdlNodeStateEnum::Succeeded as u32).then(|| now - started)
+    }
 }
 
 impl StreamExecution {
@@ -131,6 +163,9 @@ impl StreamExecution {
                         .push(message.node_index);
                 }
                 self.closed.push(node.node_kind == 2);
+                if node.call.is_some() {
+                    self.clock.sent.insert(message.node_index, Instant::now());
+                }
                 self.plan.nodes.push(node);
             }
             EXECUTE_STREAM_CLOSE => self.closed[message.node_index as usize] = true,
@@ -141,11 +176,20 @@ impl StreamExecution {
 
     /// Receive one execution event while token generation is still active.
     pub(crate) async fn next(&mut self) -> Result<Option<RtdlEvent>, tonic::Status> {
-        match &mut self.output {
-            Some(stream) => stream.message().await,
+        let event = match &mut self.output {
+            Some(stream) => stream.message().await?,
             None if self.plan.plan_id.is_empty() => std::future::pending().await,
-            None => Ok(None),
+            None => None,
+        };
+        if let Some(node) = event.as_ref().and_then(|event| event.node_state.as_ref())
+            && let Some(time) = self
+                .clock
+                .ended(node.node_index, node.state, Instant::now())
+            && let Some(call) = self.plan.nodes[node.node_index as usize].call.as_ref()
+        {
+            crate::speculation::took(call, time);
         }
+        Ok(event)
     }
 
     /// Remember events until the final prefix Plan has been published to the forest.
@@ -269,6 +313,41 @@ mod tests {
     use crate::pb::executor::{ControlPlanResponse, RtdlPlanComplete};
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn a_call_is_timed_from_the_end_of_the_one_before_it_to_when_it_stops_running() {
+        use RtdlNodeStateEnum::{Failed, Running, Succeeded, Verifying};
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        // Query, long action and photo, sent together and run one after another.
+        let mut clock = CallClock {
+            sent: (1..=3).map(|index| (index, at(0))).collect(),
+            last_ended: None,
+        };
+        assert_eq!(clock.ended(1, Running as u32, at(0)), None);
+        assert_eq!(
+            clock.ended(1, Succeeded as u32, at(1)),
+            Some(Duration::from_secs(1))
+        );
+        // The action is verified while the photo is taken, and reports success after it.
+        assert_eq!(
+            clock.ended(2, Verifying as u32, at(31)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            clock.ended(3, Succeeded as u32, at(32)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(clock.ended(2, Succeeded as u32, at(33)), None);
+        // A step sent after the one before it ended, which then fails.
+        clock.sent.insert(4, at(40));
+        assert_eq!(clock.ended(4, Failed as u32, at(41)), None);
+        clock.sent.insert(5, at(41));
+        assert_eq!(
+            clock.ended(5, Succeeded as u32, at(43)),
+            Some(Duration::from_secs(2))
+        );
+    }
 
     #[tokio::test]
     async fn identical_active_call_is_rejected_before_dispatch() {

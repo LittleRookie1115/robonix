@@ -11,25 +11,82 @@
 //! with an empty `when` covers the whole outcome; any other prepared reply that
 //! dispatches nothing is used only if the decision model finds it supported by
 //! the step results. The questions start as soon as the tree ends.
+//!
+//! When to prepare follows from how long things take, which Pilot learns as
+//! it runs: a tree expected to end before a reply could be written is not
+//! prepared for while it runs, and with `lookahead` above 1 in `context_json`,
+//! a success reply that would dispatch such a tree has that tree's reply
+//! prepared ahead, while the tree before it still runs.
 
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
-use crate::pb::pilot::{Plan, RtdlNode, RtdlNodeState, Task};
+use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
 use crate::planner::{RTDL_DO, RTDL_SEQUENCE};
-use crate::rtdl_stream::RtdlIncrementalParser;
+use crate::rtdl_stream::{RtdlIncrementalParser, next_op_id};
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
 use anyhow::{Result, bail};
-use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
+use futures_util::{FutureExt, StreamExt};
 use robonix_scribe::{info, warn};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 /// Requests per tree. The provider serves about four concurrent requests on one
 /// context without slowing each down; more would queue behind the success branch.
 const MAX_BRANCHES: usize = 4;
+
+/// Background requests in flight at once; a request prepared ahead waits here
+/// for a branch to finish or to be dropped.
+static SLOTS: Semaphore = Semaphore::const_new(MAX_BRANCHES);
+
+/// How long things have taken in this Pilot process, which decides whether a
+/// reply can be prepared before a tree ends.
+#[derive(Default)]
+struct Timings {
+    /// The longest successful call of each capability, by the name a reply calls it.
+    calls: HashMap<String, Duration>,
+    /// About how long a request takes before its reply text begins.
+    first_text: Option<Duration>,
+    /// About how long a prepared reply takes to write in full.
+    reply: Option<Duration>,
+}
+
+impl Timings {
+    /// How long a tree calling these capabilities is expected to run, once
+    /// each has been seen to finish.
+    fn expected<'a>(&self, capabilities: impl IntoIterator<Item = &'a str>) -> Option<Duration> {
+        capabilities
+            .into_iter()
+            .map(|capability| self.calls.get(capability))
+            .sum()
+    }
+}
+
+static TIMINGS: LazyLock<Mutex<Timings>> = LazyLock::new(Mutex::default);
+
+fn timings() -> std::sync::MutexGuard<'static, Timings> {
+    TIMINGS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The name a reply calls this capability by.
+fn called(call: &CapabilityCall) -> String {
+    format!(
+        "{}.{}",
+        call.provider_id,
+        crate::discovery::llm_name(&call.contract_id)
+    )
+}
+
+/// Record that this call succeeded after `time`.
+pub(crate) fn took(call: &CapabilityCall, time: Duration) {
+    let mut timings = timings();
+    let longest = timings.calls.entry(called(call)).or_default();
+    *longest = time.max(*longest);
+}
 
 /// What a prepared reply asks for instead of a plan when it cannot be written
 /// without the real outputs. It must fit the reply schema, which providers enforce.
@@ -117,9 +174,31 @@ impl Outcome {
 pub(crate) struct Branch {
     /// The outcome the reply was written for.
     outcome: Outcome,
-    /// The reply text once generated, or once settled by [`Speculation::settle`];
+    /// The reply once generated, or once settled by [`Speculation::settle`];
     /// otherwise why there is none.
-    reply: JoinHandle<Result<String, String>>,
+    reply: JoinHandle<Result<Prepared, String>>,
+    /// What was prepared ahead for the tree the resolved reply dispatches.
+    next: Option<Box<Ahead>>,
+}
+
+/// A prepared reply and what was prepared beyond it.
+struct Prepared {
+    /// The reply as written, or once settled, the one reply to use.
+    text: String,
+    /// For each reply in `text`, in order, what was prepared ahead for the
+    /// tree it dispatches.
+    next: Vec<Option<Ahead>>,
+}
+
+/// A reply being prepared for the success of a tree that is not dispatched yet.
+struct Ahead {
+    /// That tree's steps in order: the op_id the request named each by, and
+    /// the capability it calls.
+    steps: Vec<(String, String)>,
+    /// The request.
+    branch: Branch,
+    /// When the request was sent.
+    started: Instant,
 }
 
 impl Drop for Branch {
@@ -130,7 +209,7 @@ impl Drop for Branch {
 
 impl Branch {
     /// Wait for the reply, or why there is none.
-    async fn reply(&mut self) -> Result<String, String> {
+    async fn reply(&mut self) -> Result<Prepared, String> {
         (&mut self.reply)
             .await
             .unwrap_or_else(|_| Err("request failed".into()))
@@ -147,9 +226,15 @@ impl Branch {
         &mut self,
         mut dry_run: RtdlIncrementalParser,
     ) -> Result<String, String> {
-        let reply = self.reply().await?;
+        let Prepared {
+            text: reply,
+            mut next,
+        } = self.reply().await?;
         match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
-            Ok((_, None)) => Ok(reply),
+            Ok((_, None)) => {
+                self.next = next.pop().flatten().map(Box::new);
+                Ok(reply)
+            }
             Ok((_, Some(_))) => Err("reply is a plan-control op".into()),
             Err(error) => Err(format!("reply rejected: {error:#}")),
         }
@@ -188,12 +273,48 @@ pub(crate) struct Speculation {
     tau_done: f64,
     /// When the requests were sent.
     started: Instant,
+    /// For a speculation prepared ahead, the tree's steps as its request named
+    /// them, until [`Speculation::adopt`] meets the tree.
+    ahead: Vec<(String, String)>,
+    /// Op_ids that requests prepared ahead used for steps not dispatched yet,
+    /// with the op_ids those steps got.
+    renames: Vec<(String, String)>,
+}
+
+/// The `do` steps of a tree that run one after another under its root, as node
+/// index and op_id. Only there does "step k failed" fix what else ran.
+fn steps_in_order(plan: &Plan) -> Vec<(u32, String)> {
+    let is_step = |index: &u32| {
+        plan.nodes
+            .get(*index as usize)
+            .is_some_and(|node| node.node_kind == RTDL_DO)
+    };
+    let root = &plan.nodes[0];
+    if root.node_kind == RTDL_DO {
+        vec![(0, root.op_id.clone())]
+    } else if root.node_kind == RTDL_SEQUENCE && root.children.iter().all(is_step) {
+        root.children
+            .iter()
+            .map(|&child| (child, plan.nodes[child as usize].op_id.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// A tree's capability calls, in node order.
+fn calls(plan: &Plan) -> impl Iterator<Item = (&RtdlNode, &CapabilityCall)> {
+    plan.nodes
+        .iter()
+        .filter(|node| node.node_kind == RTDL_DO)
+        .filter_map(|node| Some((node, node.call.as_ref()?)))
 }
 
 impl Speculation {
     /// Send one request per outcome: success, then failure of each step in order.
     /// `prefix` is the request the next planning round would send, up to where
-    /// the tree's results would go.
+    /// the tree's results would go. `None` if the tree is expected to end
+    /// before a prepared reply could answer sooner than that round's request.
     pub(crate) fn start(
         vlm: &VlmClient,
         plan: &Plan,
@@ -201,23 +322,28 @@ impl Speculation {
         task: &Task,
         messages_seen: usize,
         idle_timeout: Duration,
-    ) -> Self {
-        let is_step = |index: &u32| {
-            plan.nodes
-                .get(*index as usize)
-                .is_some_and(|node| node.node_kind == RTDL_DO)
-        };
-        let root = &plan.nodes[0];
-        let steps: Vec<(u32, String)> = if root.node_kind == RTDL_DO {
-            vec![(0, root.op_id.clone())]
-        } else if root.node_kind == RTDL_SEQUENCE && root.children.iter().all(is_step) {
-            root.children
-                .iter()
-                .map(|&child| (child, plan.nodes[child as usize].op_id.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+    ) -> Option<Self> {
+        let names: Vec<String> = calls(plan).map(|(_, call)| called(call)).collect();
+        {
+            let timings = timings();
+            if let Some(run) = timings.expected(names.iter().map(String::as_str))
+                && let (Some(first_text), Some(reply)) = (timings.first_text, timings.reply)
+                && run + first_text < reply
+            {
+                info!(
+                    "[pilot/segue] {}",
+                    json!({
+                        "event": "skip",
+                        "plan_id": plan.plan_id,
+                        "expected_ms": run.as_millis() as u64,
+                        "first_text_ms": first_text.as_millis() as u64,
+                        "reply_ms": reply.as_millis() as u64,
+                    })
+                );
+                return None;
+            }
+        }
+        let steps = steps_in_order(plan);
         let outcomes = std::iter::once(Outcome::Succeeded)
             .chain(
                 steps
@@ -227,34 +353,56 @@ impl Speculation {
             .take(MAX_BRANCHES);
         // Only a decision model reading the real results can choose between situations.
         let situations = DECISION_MODEL.is_some();
-        let shape = if situations {
-            ReplyShape::Situations
-        } else {
-            ReplyShape::RtdlEnvelope
-        };
-        let started = Instant::now();
-        let branches = outcomes
-            .map(|outcome| {
-                let mut messages = prefix.clone();
-                messages.push(Message::user(&hypothesis(plan, &outcome, situations)));
-                let (vlm, plan_id, label) = (vlm.clone(), plan.plan_id.clone(), outcome.label());
-                let reply = tokio::spawn(async move {
-                    generate(vlm, messages, shape, &plan_id, &label, idle_timeout)
-                        .await
-                        .map_err(|error| {
-                            warn!(
-                                "[pilot/segue] plan_id={plan_id} {label} request failed: {error:#}"
-                            );
-                            "request failed".to_string()
-                        })
-                });
-                Branch { outcome, reply }
-            })
-            .collect::<Vec<_>>();
+        let request = Arc::new(Request {
+            vlm: vlm.clone(),
+            shape: if situations {
+                ReplyShape::Situations
+            } else {
+                ReplyShape::RtdlEnvelope
+            },
+            plan_id: plan.plan_id.clone(),
+            idle_timeout,
+        });
         let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
+        let lookahead = context
+            .get("lookahead")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let tree = format!(
+            "RTDL plan {} ({:?})",
+            plan.plan_id, plan.nodes[0].description
+        );
+        let listed: String = plan
+            .nodes
+            .iter()
+            .filter(|node| node.node_kind == RTDL_DO)
+            .map(|node| format!("\n- op_id={}: {}", node.op_id, node.description))
+            .collect();
+        let started = Instant::now();
+        let branches = outcomes
+            .map(|outcome| {
+                let mut messages = prefix.clone();
+                messages.push(Message::user(&hypothesis(
+                    &tree, &listed, &outcome, situations,
+                )));
+                // Failures are rare, so only the success path is prepared further along.
+                let ahead = if outcome == Outcome::Succeeded {
+                    lookahead.saturating_sub(1)
+                } else {
+                    0
+                };
+                let reply =
+                    tokio::spawn(prepare(request.clone(), messages, outcome.label(), ahead));
+                Branch {
+                    outcome,
+                    reply,
+                    next: None,
+                }
+            })
+            .collect::<Vec<_>>();
         info!(
             "[pilot/segue] {}",
             json!({
@@ -264,9 +412,10 @@ impl Speculation {
                 "decision_model": DECISION_MODEL.as_ref().map(|m| &m.model),
                 "tau_choice": tau_choice,
                 "tau_done": tau_done,
+                "lookahead": lookahead,
             })
         );
-        Self {
+        Some(Self {
             plan_id: plan.plan_id.clone(),
             steps,
             nodes: plan.nodes.clone(),
@@ -279,6 +428,52 @@ impl Speculation {
             tau_choice,
             tau_done,
             started,
+            ahead: Vec::new(),
+            renames: Vec::new(),
+        })
+    }
+
+    /// Meet the tree a speculation prepared ahead was written for. `None` if
+    /// `plan` is not that tree, or a user message arrived since.
+    pub(crate) fn adopt(mut self, plan: &Plan, messages: usize) -> Option<Self> {
+        self.plan_id = plan.plan_id.clone();
+        let met: Vec<(String, String)> = calls(plan)
+            .map(|(node, call)| (node.op_id.clone(), called(call)))
+            .collect();
+        if met.len() != self.ahead.len() || met.iter().zip(&self.ahead).any(|(a, b)| a.1 != b.1) {
+            self.discard("not the tree prepared for");
+            return None;
+        }
+        if messages != self.messages_seen {
+            self.discard("user message arrived");
+            return None;
+        }
+        let made_up = self.ahead.drain(..).map(|(op_id, _)| op_id);
+        self.renames
+            .extend(made_up.zip(met.into_iter().map(|(op_id, _)| op_id)));
+        self.nodes = plan.nodes.clone();
+        info!(
+            "[pilot/segue] {}",
+            json!({
+                "event": "start",
+                "plan_id": self.plan_id,
+                "branches": ["succeeded"],
+                "ahead_ms": self.started.elapsed().as_millis() as u64,
+                "ready": self.branches.iter().all(|b| b.reply.is_finished()),
+            })
+        );
+        Some(self)
+    }
+
+    /// Drop the reply prepared for the failure of a step that has succeeded,
+    /// which frees its request for one prepared ahead.
+    pub(crate) fn progressed(&mut self, plan_id: &str, node: &RtdlNodeState) {
+        if plan_id == self.plan_id
+            && node.state == RtdlNodeStateEnum::Succeeded as u32
+            && let Some(step) = self.nodes.get(node.node_index as usize)
+        {
+            let failed = Outcome::Failed(step.op_id.clone());
+            self.branches.retain(|branch| branch.outcome != failed);
         }
     }
 
@@ -305,13 +500,15 @@ impl Speculation {
             })
             .collect();
         leaves.sort_by_key(|(r, _)| r.node_index);
-        self.outputs = leaves
-            .iter()
-            .filter(|(r, _)| r.state == succeeded)
-            .filter_map(|(r, node)| {
-                Some((node.op_id.clone(), r.leaf_result.as_ref()?.output.clone()))
-            })
-            .collect();
+        // A speculation prepared ahead already holds the outputs of the trees before this one.
+        self.outputs.extend(
+            leaves
+                .iter()
+                .filter(|(r, _)| r.state == succeeded)
+                .filter_map(|(r, node)| {
+                    Some((node.op_id.clone(), r.leaf_result.as_ref()?.output.clone()))
+                }),
+        );
         let parse = |text: &str| serde_json::from_str(text).unwrap_or_else(|_| Value::from(text));
         self.report = leaves
             .iter()
@@ -398,13 +595,21 @@ impl Speculation {
         let outcome = written.outcome.clone();
         let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
         let (tau_choice, tau_done) = (self.tau_choice, self.tau_done);
+        let renames = self.renames.clone();
         let reply = tokio::spawn(async move {
-            let mut reply = written.reply().await?;
+            let Prepared {
+                text: mut reply,
+                mut next,
+            } = written.reply().await?;
             let mut state = json!({"task": task, "steps": steps});
             let mut picked = false;
             if DECISION_MODEL.is_some() {
-                (reply, picked) = situation(&plan_id, &reply, state.clone(), tau_choice).await?;
+                let index;
+                (reply, index, picked) =
+                    situation(&plan_id, &reply, state.clone(), tau_choice).await?;
+                next = next.into_iter().skip(index).take(1).collect();
             }
+            let reply = renamed(reply, &renames);
             if needs_results(&reply) {
                 return Err("reply needs results".into());
             }
@@ -419,9 +624,13 @@ impl Speculation {
                     decide(&plan_id, state, question, tau_done).await?;
                 }
             }
-            Ok(reply)
+            Ok(Prepared { text: reply, next })
         });
-        Ok(Branch { outcome, reply })
+        Ok(Branch {
+            outcome,
+            reply,
+            next: None,
+        })
     }
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
@@ -438,8 +647,9 @@ impl Speculation {
         );
     }
 
-    /// Log that a prepared reply replaces this planning request.
-    pub(crate) fn commit(self, branch: &Branch, waited: Duration) {
+    /// Log that a prepared reply replaces this planning request, and hand on
+    /// what was prepared ahead for the tree that reply dispatches.
+    pub(crate) fn commit(self, branch: &mut Branch, waited: Duration) -> Option<Self> {
         info!(
             "[pilot/segue] {}",
             json!({
@@ -451,18 +661,41 @@ impl Speculation {
                 "unfinished": self.branches.iter().filter(|b| !b.reply.is_finished()).count(),
             })
         );
+        let ahead = branch.next.take()?;
+        Some(Self {
+            plan_id: String::new(),
+            steps: Vec::new(),
+            nodes: Vec::new(),
+            branches: vec![ahead.branch],
+            ended: None,
+            report: Vec::new(),
+            started: ahead.started,
+            ahead: ahead.steps,
+            ..self
+        })
     }
 }
 
+/// `reply` with each op_id a request prepared ahead made up for a step
+/// replaced by the op_id that step got.
+fn renamed(mut reply: String, renames: &[(String, String)]) -> String {
+    for (made_up, op_id) in renames {
+        for end in ['#', '"'] {
+            reply = reply.replace(&format!("\"{made_up}{end}"), &format!("\"{op_id}{end}"));
+        }
+    }
+    reply
+}
+
 /// The reply prepared for the situation the decision model finds in `state`,
-/// and whether it picked one: a lone situation with an empty `when` was
-/// written for the whole outcome and needs no pick.
+/// that situation's index, and whether the model picked it: a lone situation
+/// with an empty `when` was written for the whole outcome and needs no pick.
 async fn situation(
     plan_id: &str,
     reply: &str,
     state: Value,
     tau: f64,
-) -> Result<(String, bool), String> {
+) -> Result<(String, usize, bool), String> {
     let mut reply: Value = serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
     let situations = reply
         .get_mut("situations")
@@ -474,7 +707,7 @@ async fn situation(
             .as_str()
             .is_some_and(|when| when.trim().is_empty())
     {
-        return Ok((only["reply"].take().to_string(), false));
+        return Ok((only["reply"].take().to_string(), 0, false));
     }
     let mut criteria: serde_json::Map<String, Value> = situations
         .iter()
@@ -484,12 +717,12 @@ async fn situation(
     criteria.insert("none".into(), NONE_OF_THEM.into());
     let question = json!({"type": "choice", "instructions": CHOICE, "criteria": criteria});
     let pick = decide(plan_id, state, question, tau).await?;
-    let situation = pick
+    let (index, situation) = pick
         .parse::<usize>()
         .ok()
-        .and_then(|index| situations.get_mut(index))
+        .and_then(|index| Some((index, situations.get_mut(index)?)))
         .ok_or_else(|| format!("decision model picked unknown situation {pick}"))?;
-    Ok((situation["reply"].take().to_string(), true))
+    Ok((situation["reply"].take().to_string(), index, true))
 }
 
 /// Ask the decision model one question, log it as a `decide` event, and
@@ -557,15 +790,10 @@ pub(crate) fn replay(reply: String) -> BoxStream<'static, Result<VlmStreamItem>>
     futures_util::stream::iter([Ok(VlmStreamItem::TextDelta(reply))]).boxed()
 }
 
-/// The user message that states one outcome as already reported; with
-/// `situations`, it asks for a reply per situation the outcome could show.
-fn hypothesis(plan: &Plan, outcome: &Outcome, situations: bool) -> String {
-    let steps: String = plan
-        .nodes
-        .iter()
-        .filter(|node| node.node_kind == RTDL_DO)
-        .map(|node| format!("\n- op_id={}: {}", node.op_id, node.description))
-        .collect();
+/// The user message that states one outcome of `tree` as already reported,
+/// with its steps `listed`; with `situations`, it asks for a reply per
+/// situation the outcome could show.
+fn hypothesis(tree: &str, listed: &str, outcome: &Outcome, situations: bool) -> String {
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
         Outcome::Failed(op_id) => format!(
@@ -601,32 +829,172 @@ fn hypothesis(plan: &Plan, outcome: &Outcome, situations: bool) -> String {
         ),
     };
     format!(
-        "Pilot speculation request (an assumption, not a new user message): assume RTDL plan \
-         {plan_id} ({description:?}) has just {ended}. Its steps:{steps}\n\
+        "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
+         just {ended}. Its steps:{listed}\n\
          The steps' outputs are not known yet, and the live state above was captured before \
          this plan ran. {ask} {assume} Where the next step depends on an output of these \
          steps, pass it with {{\"$ref\": \"<op_id>#/<field>\"}} and decide with `check` inside \
          `fallback`. If that cannot express what the next step needs, reply with `content` \
          exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
-         outcome matches its assumption.",
-        plan_id = plan.plan_id,
-        description = plan.nodes[0].description,
+         outcome matches its assumption."
     )
 }
 
-/// Run one background request to completion and return its text.
-async fn generate(
+/// What the requests of one speculation share.
+struct Request {
+    /// The planning model.
     vlm: VlmClient,
-    messages: Vec<Message>,
+    /// The shape every reply is asked in.
     shape: ReplyShape,
-    plan_id: &str,
-    outcome: &str,
+    /// The running tree the speculation started from, which its log records name.
+    plan_id: String,
+    /// Longest wait for the stream to open or to send its next item.
     idle_timeout: Duration,
-) -> Result<String> {
+}
+
+/// Write the reply for the outcome `label` names, then, while `ahead` trees
+/// further are allowed, the replies after the trees that reply would dispatch.
+fn prepare(
+    request: Arc<Request>,
+    messages: Vec<Message>,
+    label: String,
+    ahead: u64,
+) -> BoxFuture<'static, Result<Prepared, String>> {
+    async move {
+        let text = generate(&request, messages.clone(), &label)
+            .await
+            .map_err(|error| {
+                warn!(
+                    "[pilot/segue] plan_id={} {label} request failed: {error:#}",
+                    request.plan_id
+                );
+                "request failed".to_string()
+            })?;
+        let next = match ahead {
+            0 => Vec::new(),
+            _ => look_ahead(&request, messages, &text, &label, ahead - 1),
+        };
+        Ok(Prepared { text, next })
+    }
+    .boxed()
+}
+
+/// The `do` nodes of a reply's RTDL tree, in the order its steps are numbered.
+fn do_nodes(node: &Value) -> Vec<&Value> {
+    if node["op"] == "do" {
+        return vec![node];
+    }
+    let children = node["children"].as_array();
+    children.into_iter().flatten().flat_map(do_nodes).collect()
+}
+
+/// For each reply in `text`, start preparing the reply after the tree it
+/// dispatches, if that tree is expected to end before a reply could be written
+/// while it runs. `messages` is the request `text` answered.
+fn look_ahead(
+    request: &Arc<Request>,
+    messages: Vec<Message>,
+    text: &str,
+    label: &str,
+    ahead: u64,
+) -> Vec<Option<Ahead>> {
+    let Ok(written) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    // Without a decision model the reply is one envelope rather than situations.
+    let replies: Vec<(&Value, &Value)> = match written["situations"].as_array() {
+        Some(situations) => situations
+            .iter()
+            .map(|s| (&s["when"], &s["reply"]))
+            .collect(),
+        None => vec![(&Value::Null, &written)],
+    };
+    let prepare_for = |(index, (when, reply)): (usize, (&Value, &Value))| {
+        let nodes = do_nodes(&reply["rtdl"]);
+        let names = nodes.iter().map(|node| node["cap"].as_str().unwrap_or(""));
+        if nodes.is_empty() {
+            return None;
+        }
+        let (run, write) = {
+            let timings = timings();
+            (timings.expected(names.clone()), timings.reply)
+        };
+        let short = run.zip(write).is_some_and(|(run, write)| run < write);
+        info!(
+            "[pilot/segue] {}",
+            json!({
+                "event": "ahead",
+                "plan_id": request.plan_id,
+                "outcome": format!("{label}/{index}"),
+                "expected_ms": run.map(|run| run.as_millis() as u64),
+                "reply_ms": write.map(|write| write.as_millis() as u64),
+                "sent": short,
+            })
+        );
+        if !short {
+            return None;
+        }
+        let steps: Vec<(String, String)> = names.map(|name| (next_op_id(), name.into())).collect();
+        let listed: String = steps
+            .iter()
+            .zip(&nodes)
+            .map(|((op_id, _), node)| {
+                let description = node["description"].as_str().unwrap_or("");
+                format!("\n- op_id={op_id}: {description}")
+            })
+            .collect();
+        let plan = reply["rtdl"]["description"].as_str().unwrap_or("");
+        let tree = match when.as_str().map(str::trim).filter(|when| !when.is_empty()) {
+            Some(when) => format!(
+                "the outputs showed the situation {when:?}, Pilot used that situation's reply \
+                 above, and the RTDL plan it dispatched ({plan:?})"
+            ),
+            None => {
+                format!("Pilot used the reply above, and the RTDL plan it dispatched ({plan:?})")
+            }
+        };
+        let mut messages = messages.clone();
+        messages.push(Message::assistant(text));
+        let ask = hypothesis(
+            &tree,
+            &listed,
+            &Outcome::Succeeded,
+            DECISION_MODEL.is_some(),
+        );
+        messages.push(Message::user(&ask));
+        let reply = tokio::spawn(prepare(
+            request.clone(),
+            messages,
+            format!("{label}/{index}"),
+            ahead,
+        ));
+        Some(Ahead {
+            steps,
+            branch: Branch {
+                outcome: Outcome::Succeeded,
+                reply,
+                next: None,
+            },
+            started: Instant::now(),
+        })
+    };
+    replies.into_iter().enumerate().map(prepare_for).collect()
+}
+
+/// Run one background request to completion and return its text.
+async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> Result<String> {
+    let Request {
+        vlm,
+        shape,
+        plan_id,
+        idle_timeout,
+    } = request;
+    let idle_timeout = *idle_timeout;
+    let _slot = SLOTS.acquire().await?;
     let started = Instant::now();
     let mut stream = tokio::time::timeout(
         idle_timeout,
-        vlm.chat_stream(&messages, &[], Some(vlm.prompt_cache_key()), shape),
+        vlm.chat_stream(&messages, &[], Some(vlm.prompt_cache_key()), *shape),
     )
     .await??;
     let mut text = String::new();
@@ -643,12 +1011,24 @@ async fn generate(
             VlmStreamItem::ReasoningDelta(_) | VlmStreamItem::Finish => {}
         }
     }
+    // A reply that declines to plan is quick to write and says nothing about one that plans.
+    if !needs_results(&text) {
+        let smooth = |seen: &mut Option<Duration>, new: Duration| {
+            *seen = Some(seen.map_or(new, |old| old.mul_f64(0.7) + new.mul_f64(0.3)));
+        };
+        let mut timings = timings();
+        if let Some(first) = first_token {
+            smooth(&mut timings.first_text, first);
+        }
+        smooth(&mut timings.reply, started.elapsed());
+    }
     info!(
         "[pilot/segue] {}",
         json!({
             "event": "ready",
             "plan_id": plan_id,
             "outcome": outcome,
+            "depth": outcome.matches('/').count() + 1,
             "latency_ms": started.elapsed().as_millis() as u64,
             "first_token_ms": first_token.map(|t| t.as_millis() as u64),
             "input_tokens": usage.as_ref().map(|u| u.prompt_tokens),
@@ -662,7 +1042,7 @@ async fn generate(
 
 #[cfg(test)]
 mod tests {
-    use super::{Branch, Outcome, Speculation};
+    use super::{Branch, Outcome, Prepared, Speculation};
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
     use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState};
     use crate::planner::{RTDL_DO, RTDL_SEQUENCE};
@@ -700,8 +1080,12 @@ mod tests {
             branches: outcomes
                 .into_iter()
                 .map(|outcome| Branch {
-                    reply: tokio::spawn(std::future::ready(Ok(outcome.label()))),
+                    reply: tokio::spawn(std::future::ready(Ok(Prepared {
+                        text: outcome.label(),
+                        next: Vec::new(),
+                    }))),
                     outcome,
+                    next: None,
                 })
                 .collect(),
             messages_seen: 1,
@@ -712,6 +1096,8 @@ mod tests {
             tau_choice: super::TAU_CHOICE,
             tau_done: super::TAU_DONE,
             started: Instant::now(),
+            ahead: Vec::new(),
+            renames: Vec::new(),
         }
     }
 
@@ -761,7 +1147,7 @@ mod tests {
             let results: Vec<_> = states.into_iter().map(|(i, s)| state(i, s)).collect();
             spec.ended("p", &results, any_failed, false);
             let mut branch = spec.take_branch().unwrap();
-            assert_eq!(branch.reply().await.as_deref(), Ok(expected));
+            assert_eq!(branch.reply().await.unwrap().text, expected);
             let mut outputs: Vec<_> = spec.outputs().keys().map(String::as_str).collect();
             outputs.sort();
             assert_eq!(outputs, finished);
@@ -825,24 +1211,110 @@ mod tests {
     async fn a_lone_situation_without_when_is_used_without_asking() {
         let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
         let settled = super::situation("p", reply, serde_json::json!({}), 1.0).await;
-        assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), false)));
+        assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), 0, false)));
     }
 
     #[test]
     fn with_a_decision_model_every_outcome_asks_for_situations() {
-        let plan = Plan {
-            plan_id: "p".into(),
-            nodes: vec![RtdlNode {
-                node_kind: RTDL_DO,
-                op_id: "p-0".into(),
-                ..Default::default()
-            }],
+        for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
+            assert!(super::hypothesis("plan p", "", &outcome, true).contains(r#"{"situations""#));
+            assert!(!super::hypothesis("plan p", "", &outcome, false).contains("situations"));
+        }
+    }
+
+    #[test]
+    fn a_tree_is_expected_to_take_what_its_calls_took_once_all_were_seen() {
+        let seconds = std::time::Duration::from_secs;
+        let timings = super::Timings {
+            calls: HashMap::from([("a".into(), seconds(1)), ("b".into(), seconds(30))]),
             ..Default::default()
         };
-        for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
-            assert!(super::hypothesis(&plan, &outcome, true).contains(r#"{"situations""#));
-            assert!(!super::hypothesis(&plan, &outcome, false).contains("situations"));
-        }
+        assert_eq!(timings.expected(["a", "b", "a"]), Some(seconds(32)));
+        assert_eq!(timings.expected(["a", "never seen"]), None);
+    }
+
+    #[tokio::test]
+    async fn a_step_that_succeeded_has_no_failure_left_to_prepare_for() {
+        let mut spec = three_steps();
+        spec.progressed("other", &state(1, RtdlNodeStateEnum::Succeeded));
+        spec.progressed("p", &state(2, RtdlNodeStateEnum::Running));
+        assert_eq!(spec.branches.len(), 4);
+        spec.progressed("p", &state(1, RtdlNodeStateEnum::Succeeded));
+        let left: Vec<_> = spec.branches.iter().map(|b| b.outcome.label()).collect();
+        assert_eq!(left, ["succeeded", "failed:p-2", "failed:p-3"]);
+    }
+
+    /// The reply a test prepares ahead: two calls under a fallback, then a third.
+    fn nested_reply() -> serde_json::Value {
+        let call = |name: &str| {
+            serde_json::json!({"op": "do", "op_id": 0, "description": name,
+                               "cap": format!("x.t_{name}"), "args": {}})
+        };
+        serde_json::json!({"content": "", "message_updates": [], "rtdl_parent_task_id": null,
+        "rtdl_description": "d", "task_updates": [],
+        "rtdl": {"op": "sequence", "op_id": 0, "description": "d", "children": [
+            {"op": "fallback", "op_id": 0, "description": "f",
+             "children": [call("a"), call("b")]},
+            call("c"),
+        ]}})
+    }
+
+    /// `nested_reply` as the planner parses it when it is dispatched.
+    fn nested_plan() -> Plan {
+        let targets = ["a", "b", "c"].map(|n| (format!("x.t_{n}"), ("x".into(), format!("t/{n}"))));
+        let mut parser = crate::rtdl_stream::RtdlIncrementalParser::new(
+            HashMap::from(targets),
+            Default::default(),
+            "session".into(),
+            0,
+        );
+        parser.push(&nested_reply().to_string()).unwrap();
+        parser.finish().unwrap();
+        parser.plan
+    }
+
+    #[tokio::test]
+    async fn a_speculation_prepared_ahead_meets_only_the_tree_it_named() {
+        let reply = nested_reply();
+        let named: Vec<(String, String)> = super::do_nodes(&reply["rtdl"])
+            .iter()
+            .zip(["m-1", "m-2", "m-3"])
+            .map(|(node, op_id)| (op_id.into(), node["cap"].as_str().unwrap().into()))
+            .collect();
+        let ahead = |named: &[(String, String)]| Speculation {
+            plan_id: String::new(),
+            nodes: Vec::new(),
+            ahead: named.to_vec(),
+            ..three_steps()
+        };
+        let plan = nested_plan();
+        let met = ahead(&named).adopt(&plan, 1).unwrap();
+        let got: Vec<&str> = super::calls(&plan)
+            .map(|(node, _)| node.op_id.as_str())
+            .collect();
+        let renames: Vec<(&str, &str)> = met
+            .renames
+            .iter()
+            .map(|(made_up, op_id)| (made_up.as_str(), op_id.as_str()))
+            .collect();
+        assert_eq!(renames, [("m-1", got[0]), ("m-2", got[1]), ("m-3", got[2])]);
+        assert_eq!(met.plan_id, plan.plan_id);
+
+        assert!(ahead(&named).adopt(&plan, 2).is_none());
+        assert!(ahead(&named[..2]).adopt(&plan, 1).is_none());
+        let mut other = named.clone();
+        other.swap(0, 2);
+        assert!(ahead(&other).adopt(&plan, 1).is_none());
+    }
+
+    #[test]
+    fn a_made_up_op_id_is_replaced_only_where_it_is_the_whole_id() {
+        let reply = r#"{"a":{"$ref":"m-1#/x"},"b":{"$ref":"m-1"},"c":{"$ref":"m-10#/x"}}"#;
+        let renames = [("m-1".to_string(), "r-7".to_string())];
+        assert_eq!(
+            super::renamed(reply.into(), &renames),
+            r#"{"a":{"$ref":"r-7#/x"},"b":{"$ref":"r-7"},"c":{"$ref":"m-10#/x"}}"#
+        );
     }
 
     #[test]
