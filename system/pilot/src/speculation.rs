@@ -592,9 +592,10 @@ fn hypothesis(plan: &Plan, outcome: &Outcome, situations: bool) -> String {
             "Name one to three situations that the steps' outputs could show and that call for \
              different next moves. Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: \
              `when` says in one sentence what the outputs would show in that situation, and \
-             `reply` is the complete reply you would give once those outputs are reported. If \
-             the next move is the same whatever the outputs show, give one situation with `when` \
-             empty.",
+             `reply` is the complete reply you would give once those outputs are reported. A \
+             `when` may rest only on what the outputs say as text, never on what an image \
+             shows: the situation is picked without seeing images. If the next move is the same \
+             whatever the outputs show, give one situation with `when` empty.",
             "Beyond what a situation's `when` says, do not assume any output value, and do not \
              state one in its reply's `content`.",
         ),

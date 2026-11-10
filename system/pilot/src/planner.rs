@@ -26,7 +26,9 @@ use crate::tasks::{self, Applied, TaskFields, TaskTable};
 use crate::transcript::Transcript;
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use robonix_scribe::{debug, info, warn};
@@ -83,6 +85,23 @@ fn max_tool_rounds() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64)
+}
+
+/// The stream of a planning request once its reply text begins, with the
+/// thinking that came before it kept in front.
+async fn reply_begun(
+    request: AbortOnDropHandle<Result<BoxStream<'static, Result<VlmStreamItem>>>>,
+) -> Result<BoxStream<'static, Result<VlmStreamItem>>> {
+    let mut stream = request.await??.fuse();
+    let mut thinking = Vec::new();
+    while let Some(item) = stream.next().await {
+        let begun = !matches!(item, Ok(VlmStreamItem::ReasoningDelta(_)));
+        thinking.push(item);
+        if begun {
+            break;
+        }
+    }
+    Ok(futures_util::stream::iter(thinking).chain(stream).boxed())
 }
 
 fn vlm_idle_timeout() -> Duration {
@@ -1695,7 +1714,7 @@ pub async fn run_turn(
         // A prepared reply stands in for this request only if it was written
         // for how the tree really ended and nothing else reached the model since.
         let mut prepared = None;
-        let mut request = None;
+        let mut request: Option<BoxFuture<Result<BoxStream<Result<VlmStreamItem>>>>> = None;
         if let Some((spec, settled)) = pending {
             turn_steps.extend_from_slice(spec.report());
             let branch = if compacted {
@@ -1712,10 +1731,11 @@ pub async fn run_turn(
             let reply = match branch {
                 Err(reason) => Err(reason.to_string()),
                 Ok(mut branch) => {
-                    // Refusing a reply still being written or asked about must
-                    // not delay the round, so the real request runs alongside it.
+                    // A reply still being written or asked about must not delay
+                    // the round: the real request runs alongside it and takes
+                    // the round once its own reply begins.
                     if !branch.is_settled() {
-                        request = Some(open_request(history, tasks));
+                        request = Some(reply_begun(open_request(history, tasks)).boxed());
                     }
                     let dry_run = crate::rtdl_stream::RtdlIncrementalParser::new(
                         target_map.clone(),
@@ -1737,6 +1757,10 @@ pub async fn run_turn(
                             Err("user message arrived".to_string())
                         }
                         reply = branch.resolve(dry_run) => reply,
+                        stream = async { request.as_mut().expect("guarded").await }, if request.is_some() => {
+                            request = Some(std::future::ready(stream).boxed());
+                            Err("request answered first".to_string())
+                        }
                     };
                     reply.map(|reply| (reply, branch))
                 }
@@ -1754,9 +1778,12 @@ pub async fn run_turn(
         let (mut stream, outputs) = match prepared {
             Some((reply, outputs)) => (speculation::replay(reply), outputs),
             None => (
-                request
-                    .unwrap_or_else(|| open_request(history, tasks))
-                    .await??,
+                match request {
+                    // Polled as a stream, so the loop below still hears an
+                    // abort or a steer while this request thinks.
+                    Some(request) => futures_util::stream::once(request).try_flatten().boxed(),
+                    None => open_request(history, tasks).await??,
+                },
                 HashMap::new(),
             ),
         };
@@ -2903,6 +2930,33 @@ mod tests {
 
         let unknown = HistoryBudget::new(None, "unavailable");
         assert!(!unknown.must_compact(&history, 100_000));
+    }
+
+    #[tokio::test]
+    async fn a_request_has_begun_only_once_its_reply_text_arrives() {
+        use crate::vlm::VlmStreamItem::{ReasoningDelta, TextDelta};
+        use futures_util::StreamExt;
+        let (items, stream) = tokio::sync::mpsc::channel(4);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(stream).boxed();
+        let request = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async { Ok(stream) }));
+        let mut begun = std::pin::pin!(super::reply_begun(request));
+
+        items.send(Ok(ReasoningDelta("hm".into()))).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut begun)
+                .await
+                .is_err()
+        );
+        items.send(Ok(TextDelta("{".into()))).await.unwrap();
+        let stream = begun.await.unwrap();
+        items.send(Ok(TextDelta("}".into()))).await.unwrap();
+        drop(items);
+
+        let all: Vec<_> = stream.map(Result::unwrap).collect().await;
+        assert!(matches!(
+            &all[..],
+            [ReasoningDelta(_), TextDelta(first), TextDelta(rest)] if first == "{" && rest == "}"
+        ));
     }
 
     #[test]
