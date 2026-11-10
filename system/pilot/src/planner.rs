@@ -2294,6 +2294,7 @@ Nodes are exactly one of:
 - {"op":"do","op_id":0,"description":"...","cap":"<exact capability_name>","args":{...}}
 op_id is 0, or a small integer unique in this reply when a later do node's args read this node's output as {"$ref":"<integer>#<JSON pointer>"}, e.g. {"$ref":"2#/objects/0/x"}; no # means the whole output. Pilot assigns real IDs. Do not add node fields.
 A fallback runs its children in order until one succeeds; a failure inside it reaches you only if every child fails. To branch on a value, start a fallback child sequence with the executor's check capability, which fails when its comparison is false. Compose a task's known dependent steps into one sequence and its independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence.
+A tree that only reads (look-ups, goal poses, snapshots, manuals) costs a planning round for nothing. Put each read in the tree that acts on it: after the step that brings the robot to what it is about, before the steps that use its output through $ref. When the next steps depend on what it returns, write both courses as fallback children, each starting with the check that selects it (empty and not_empty test a list). Read alone only when you must see the result yourself, as with a camera image.
 
 Plan control is the entire rtdl value, never a nested node or capability: cancel_plan using an exact listed plan_id, or cancel_all, and only for plans listed in In-flight trees; with none listed, return an empty sequence. Never repeat a completed/cancelled control operation and never cancel an unrelated tree after another tree fails.
 
@@ -3075,9 +3076,10 @@ mod tests {
 
     #[test]
     fn later_round_protocol_is_compact_but_keeps_admission_rules() {
-        // The task fields' names are spelled out, and fallback, check and $ref
-        // cost about 500 characters.
-        assert!(RTDL_PROTOCOL_REMINDER.len() < 2_600);
+        // The task fields' names are spelled out; fallback, check and $ref cost
+        // about 500 characters, and keeping reads out of trees of their own
+        // about as many, which each saved round repays many times over.
+        assert!(RTDL_PROTOCOL_REMINDER.len() < 3_100);
         for required in [
             "capability_name",
             "sequence",

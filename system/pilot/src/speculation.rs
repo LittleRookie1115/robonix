@@ -348,9 +348,15 @@ impl Speculation {
         reader: Reader,
     ) -> Option<Self> {
         let names: Vec<String> = calls(plan).map(|(_, call)| called(call)).collect();
+        // Long unless it is known to end before one reply could be written.
+        let long;
         {
             let timings = timings();
-            if let Some(run) = timings.expected(names.iter().map(String::as_str))
+            let run = timings.expected(names.iter().map(String::as_str));
+            long = run
+                .zip(timings.reply)
+                .is_none_or(|(run, reply)| run >= reply);
+            if let Some(run) = run
                 && let (Some(first_text), Some(reply)) = (timings.first_text, timings.reply)
                 && run + first_text < reply
             {
@@ -416,7 +422,7 @@ impl Speculation {
             .map(|outcome| {
                 let mut messages = prefix.clone();
                 messages.push(Message::user(&hypothesis(
-                    &tree, &listed, &outcome, situations, false,
+                    &tree, &listed, &outcome, situations, false, long,
                 )));
                 // Failures are rare, so only the success path is prepared further along.
                 let ahead = if outcome == Outcome::Succeeded {
@@ -853,12 +859,15 @@ pub(crate) fn replay(reply: String) -> BoxStream<'static, Result<VlmStreamItem>>
 /// with its steps `listed`; with `situations`, it asks for a reply per
 /// situation the outcome could show. With `returned`, `listed` gives what each
 /// step returned when it was run ahead, so nothing about them is left to guess.
+/// With `long`, the tree leaves time to prepare a bold course and a careful
+/// one, so its success is not to be answered with a refusal to plan.
 fn hypothesis(
     tree: &str,
     listed: &str,
     outcome: &Outcome,
     situations: bool,
     returned: bool,
+    long: bool,
 ) -> String {
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
@@ -892,6 +901,23 @@ fn hypothesis(
              reported. If the next move is the same whatever the error shows, give one situation \
              with `when` empty.",
             assume_nothing,
+        ),
+        Outcome::Succeeded if long => (
+            "This plan runs long enough to prepare more than one course, so prepare two or \
+             three situations rather than decline. First the bold one: what the outputs most \
+             likely show, with a reply that carries the task as far from there as one tree can. \
+             Then the careful one: the outputs show otherwise, or too little to act on, with a \
+             reply that still moves the task forward without relying on them, such as looking \
+             again from elsewhere or searching the next likely place. Neither reply may give the \
+             task up or report that it cannot be done: where that is the only course, that \
+             situation's reply asks for the results instead. Reporting the task done is the \
+             bold course when this plan's success completes it. Answer {\"situations\": \
+             [{\"when\": ..., \"reply\": ...}]}: `when` says in one sentence what the outputs \
+             would show in that situation, and `reply` is the complete reply you would give once \
+             those outputs are reported. A `when` may rest only on what the outputs say as text, \
+             never on what an image shows: the situation is picked without seeing images.",
+            "Beyond what a situation's `when` says, do not assume any output value, and do not \
+             state one in its reply's `content`.",
         ),
         Outcome::Succeeded => (
             "Name one to three situations that the steps' outputs could show and that call for \
@@ -1171,6 +1197,7 @@ fn look_ahead(
                 &Outcome::Succeeded,
                 DECISION_MODEL.is_some(),
                 read.is_some(),
+                false,
             );
             messages.push(Message::user(&ask));
             let prepared = prepare(request, messages, label, ahead).await?;
@@ -1429,15 +1456,21 @@ mod tests {
     #[test]
     fn with_a_decision_model_every_outcome_asks_for_situations() {
         for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
-            assert!(
-                super::hypothesis("plan p", "", &outcome, true, false).contains(r#"{"situations""#)
-            );
-            assert!(
-                !super::hypothesis("plan p", "", &outcome, false, false).contains("situations")
-            );
+            let ask =
+                |situations| super::hypothesis("plan p", "", &outcome, situations, false, false);
+            assert!(ask(true).contains(r#"{"situations""#));
+            assert!(!ask(false).contains("situations"));
         }
-        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true);
+        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true, false);
         assert!(read.contains(r#"{"when": "", "reply": ...}"#) && !read.contains("not known yet"));
+    }
+
+    #[test]
+    fn a_long_tree_is_asked_for_a_bold_and_a_careful_course_on_success_only() {
+        let ask = |outcome, long| super::hypothesis("plan p", "", &outcome, true, false, long);
+        assert!(ask(Outcome::Succeeded, true).contains("First the bold one"));
+        assert!(!ask(Outcome::Succeeded, false).contains("First the bold one"));
+        assert!(!ask(Outcome::Failed("p-0".into()), true).contains("First the bold one"));
     }
 
     #[test]
