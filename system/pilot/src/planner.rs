@@ -2213,7 +2213,11 @@ pub async fn run_turn(
                     }
                     let mut prefix = vec![Message::system(&render_context_sections(&sections))];
                     prefix.extend(history::sanitize_for_vlm(&context));
-                    Speculation::start(vlm, &graph, prefix, task, seen, vlm_idle_timeout())
+                    let reader = speculation::Reader {
+                        targets: target_map.clone(),
+                        graph: executor.graph.clone(),
+                    };
+                    Speculation::start(vlm, &graph, prefix, task, seen, vlm_idle_timeout(), reader)
                 });
         }
     }

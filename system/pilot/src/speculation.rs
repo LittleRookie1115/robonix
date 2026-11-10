@@ -17,10 +17,18 @@
 //! prepared for while it runs, and with `lookahead` above 1 in `context_json`,
 //! a success reply that would dispatch such a tree has that tree's reply
 //! prepared ahead, while the tree before it still runs.
+//!
+//! Capabilities a task lists under `read_only` in `context_json` change
+//! nothing, so a tree of them may run before its turn: a reply that would
+//! dispatch one has it run at once, and the reply after it is prepared from
+//! what it returned and used only if it returns the same in its turn. A
+//! situation whose reply only reads is used whatever the decision model's
+//! confidence, since a wrong pick costs one lookup.
 
+use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
-use crate::planner::{RTDL_DO, RTDL_SEQUENCE};
+use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_SEQUENCE};
 use crate::rtdl_stream::{RtdlIncrementalParser, next_op_id};
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
 use anyhow::{Result, bail};
@@ -29,11 +37,12 @@ use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, StreamExt};
 use robonix_scribe::{info, warn};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tonic::transport::Channel;
 
 /// Requests per tree. The provider serves about four concurrent requests on one
 /// context without slowing each down; more would queue behind the success branch.
@@ -188,6 +197,17 @@ struct Prepared {
     /// For each reply in `text`, in order, what was prepared ahead for the
     /// tree it dispatches.
     next: Vec<Option<Ahead>>,
+    /// What the steps of the tree this reply follows returned when they were
+    /// run ahead, in step order, if the reply was written from that.
+    read: Option<Vec<Value>>,
+}
+
+/// What lets Pilot run a prepared tree of read-only calls before its turn.
+pub(crate) struct Reader {
+    /// The catalog a reply's capability names resolve against.
+    pub(crate) targets: CapabilityTargetMap,
+    /// Executor's entry for the plans Pilot runs for itself.
+    pub(crate) graph: RobonixSystemExecutorExecuteClient<Channel>,
 }
 
 /// A reply being prepared for the success of a tree that is not dispatched yet.
@@ -229,6 +249,7 @@ impl Branch {
         let Prepared {
             text: reply,
             mut next,
+            ..
         } = self.reply().await?;
         match dry_run.push(&reply).and_then(|()| dry_run.finish()) {
             Ok((_, None)) => {
@@ -279,6 +300,8 @@ pub(crate) struct Speculation {
     /// Op_ids that requests prepared ahead used for steps not dispatched yet,
     /// with the op_ids those steps got.
     renames: Vec<(String, String)>,
+    /// The task's read-only capabilities, by the name after the provider's.
+    reads: Arc<HashSet<String>>,
 }
 
 /// The `do` steps of a tree that run one after another under its root, as node
@@ -322,6 +345,7 @@ impl Speculation {
         task: &Task,
         messages_seen: usize,
         idle_timeout: Duration,
+        reader: Reader,
     ) -> Option<Self> {
         let names: Vec<String> = calls(plan).map(|(_, call)| called(call)).collect();
         {
@@ -353,6 +377,11 @@ impl Speculation {
             .take(MAX_BRANCHES);
         // Only a decision model reading the real results can choose between situations.
         let situations = DECISION_MODEL.is_some();
+        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
+        let listed = context["read_only"].as_array();
+        let contracts = listed.into_iter().flatten().filter_map(Value::as_str);
+        let reads: Arc<HashSet<String>> =
+            Arc::new(contracts.map(crate::discovery::llm_name).collect());
         let request = Arc::new(Request {
             vlm: vlm.clone(),
             shape: if situations {
@@ -362,8 +391,9 @@ impl Speculation {
             },
             plan_id: plan.plan_id.clone(),
             idle_timeout,
+            reads: reads.clone(),
+            reader,
         });
-        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
@@ -386,7 +416,7 @@ impl Speculation {
             .map(|outcome| {
                 let mut messages = prefix.clone();
                 messages.push(Message::user(&hypothesis(
-                    &tree, &listed, &outcome, situations,
+                    &tree, &listed, &outcome, situations, false,
                 )));
                 // Failures are rare, so only the success path is prepared further along.
                 let ahead = if outcome == Outcome::Succeeded {
@@ -430,6 +460,7 @@ impl Speculation {
             started,
             ahead: Vec::new(),
             renames: Vec::new(),
+            reads,
         })
     }
 
@@ -596,17 +627,25 @@ impl Speculation {
         let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
         let (tau_choice, tau_done) = (self.tau_choice, self.tau_done);
         let renames = self.renames.clone();
+        let (reads, own) = (self.reads.clone(), self.report.clone());
         let reply = tokio::spawn(async move {
             let Prepared {
                 text: mut reply,
                 mut next,
+                read,
             } = written.reply().await?;
+            if let Some(read) = read {
+                let now = own.iter().map(|step| &step["output"]);
+                if read.len() != own.len() || !read.iter().zip(now).all(|(a, b)| same(a, b)) {
+                    return Err("results differ from those read ahead".into());
+                }
+            }
             let mut state = json!({"task": task, "steps": steps});
             let mut picked = false;
             if DECISION_MODEL.is_some() {
                 let index;
                 (reply, index, picked) =
-                    situation(&plan_id, &reply, state.clone(), tau_choice).await?;
+                    situation(&plan_id, &reply, state.clone(), tau_choice, &reads).await?;
                 next = next.into_iter().skip(index).take(1).collect();
             }
             let reply = renamed(reply, &renames);
@@ -621,10 +660,14 @@ impl Speculation {
                 if !dispatches(&envelope["rtdl"]) {
                     state["final_reply"] = envelope["content"].take();
                     let question = json!({"type": "noul", "instructions": DONE});
-                    decide(&plan_id, state, question, tau_done).await?;
+                    decide(&plan_id, state, question, |_| tau_done).await?;
                 }
             }
-            Ok(Prepared { text: reply, next })
+            Ok(Prepared {
+                text: reply,
+                next,
+                read: None,
+            })
         });
         Ok(Branch {
             outcome,
@@ -695,6 +738,7 @@ async fn situation(
     reply: &str,
     state: Value,
     tau: f64,
+    reads: &HashSet<String>,
 ) -> Result<(String, usize, bool), String> {
     let mut reply: Value = serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
     let situations = reply
@@ -716,7 +760,16 @@ async fn situation(
         .collect();
     criteria.insert("none".into(), NONE_OF_THEM.into());
     let question = json!({"type": "choice", "instructions": CHOICE, "criteria": criteria});
-    let pick = decide(plan_id, state, question, tau).await?;
+    // A reply that only reads cannot do harm, so it needs no confidence.
+    let free: Vec<bool> = situations
+        .iter()
+        .map(|situation| reads_only(&situation["reply"]["rtdl"], reads))
+        .collect();
+    let needed = |key: &str| match key.parse::<usize>().ok().and_then(|index| free.get(index)) {
+        Some(true) => 0.0,
+        _ => tau,
+    };
+    let pick = decide(plan_id, state, question, needed).await?;
     let (index, situation) = pick
         .parse::<usize>()
         .ok()
@@ -726,9 +779,15 @@ async fn situation(
 }
 
 /// Ask the decision model one question, log it as a `decide` event, and
-/// return the option it picked if that is not "none" and has at least
-/// probability `tau`. A yes/no question picks "yes" with p(yes).
-async fn decide(plan_id: &str, state: Value, question: Value, tau: f64) -> Result<String, String> {
+/// return the option it picked if that is not "none" and has at least the
+/// probability `tau` asks of that option. A yes/no question picks "yes" with
+/// p(yes).
+async fn decide(
+    plan_id: &str,
+    state: Value,
+    question: Value,
+    tau: impl Fn(&str) -> f64,
+) -> Result<String, String> {
     let model = DECISION_MODEL.as_ref().ok_or("no decision model")?;
     let asked = Instant::now();
     let answer = model
@@ -749,7 +808,7 @@ async fn decide(plan_id: &str, state: Value, question: Value, tau: f64) -> Resul
             _ => None,
         });
     let accepted = pick
-        .filter(|&(key, p)| key != "none" && p >= tau)
+        .filter(|&(key, p)| key != "none" && p >= tau(key))
         .map(|(key, _)| key.to_string());
     info!(
         "[pilot/segue] {}",
@@ -757,7 +816,7 @@ async fn decide(plan_id: &str, state: Value, question: Value, tau: f64) -> Resul
             "event": "decide",
             "plan_id": plan_id,
             "latency_ms": asked.elapsed().as_millis() as u64,
-            "tau": tau,
+            "tau": pick.map(|(key, _)| tau(key)),
             "accept": accepted.is_some(),
             "answer": answer.as_ref().ok(),
             "error": answer.as_ref().err(),
@@ -768,7 +827,7 @@ async fn decide(plan_id: &str, state: Value, question: Value, tau: f64) -> Resul
     accepted.ok_or_else(|| match (&answer, pick) {
         (Err(error), _) => error.clone(),
         (Ok(_), None) => "decision model answer unreadable".into(),
-        (Ok(_), Some((key, p))) => format!("decision model: {key} p={p:.3}, tau={tau}"),
+        (Ok(_), Some((key, p))) => format!("decision model: {key} p={p:.3}, tau={}", tau(key)),
     })
 }
 
@@ -792,8 +851,15 @@ pub(crate) fn replay(reply: String) -> BoxStream<'static, Result<VlmStreamItem>>
 
 /// The user message that states one outcome of `tree` as already reported,
 /// with its steps `listed`; with `situations`, it asks for a reply per
-/// situation the outcome could show.
-fn hypothesis(tree: &str, listed: &str, outcome: &Outcome, situations: bool) -> String {
+/// situation the outcome could show. With `returned`, `listed` gives what each
+/// step returned when it was run ahead, so nothing about them is left to guess.
+fn hypothesis(
+    tree: &str,
+    listed: &str,
+    outcome: &Outcome,
+    situations: bool,
+    returned: bool,
+) -> String {
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
         Outcome::Failed(op_id) => format!(
@@ -802,10 +868,21 @@ fn hypothesis(tree: &str, listed: &str, outcome: &Outcome, situations: bool) -> 
         ),
     };
     let assume_nothing = "Do not assume any output value, and do not state one in `content`.";
+    let beyond_listed = "Beyond the outputs listed, do not assume any output value, and do not \
+                         state one in `content`.";
     let (ask, assume) = match outcome {
         _ if !situations => (
             "Write the reply you would give once this outcome is reported.",
-            assume_nothing,
+            if returned {
+                beyond_listed
+            } else {
+                assume_nothing
+            },
+        ),
+        Outcome::Succeeded if returned => (
+            "Answer {\"situations\": [{\"when\": \"\", \"reply\": ...}]}, where `reply` is the \
+             complete reply you would give once these outputs are reported.",
+            beyond_listed,
         ),
         Outcome::Failed(_) => (
             "Name one to three situations that could have caused this failure and call for \
@@ -828,11 +905,18 @@ fn hypothesis(tree: &str, listed: &str, outcome: &Outcome, situations: bool) -> 
              state one in its reply's `content`.",
         ),
     };
+    let known = if returned {
+        "Each step is listed with what it returned when Pilot ran it just now; Pilot uses this \
+         reply only if the steps return the same when the plan runs in its turn, so plan on \
+         them as listed. The live state above was captured before these plans ran."
+    } else {
+        "The steps' outputs are not known yet, and the live state above was captured before \
+         this plan ran."
+    };
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
-         The steps' outputs are not known yet, and the live state above was captured before \
-         this plan ran. {ask} {assume} Where the next step depends on an output of these \
+         {known} {ask} {assume} Where the next step depends on an output of these \
          steps, pass it with {{\"$ref\": \"<op_id>#/<field>\"}} and decide with `check` inside \
          `fallback`. If that cannot express what the next step needs, reply with `content` \
          exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
@@ -850,6 +934,104 @@ struct Request {
     plan_id: String,
     /// Longest wait for the stream to open or to send its next item.
     idle_timeout: Duration,
+    /// The task's read-only capabilities, by the name after the provider's.
+    reads: Arc<HashSet<String>>,
+    /// Runs a prepared tree of those capabilities before its turn.
+    reader: Reader,
+}
+
+/// Whether a reply's tree calls something and only capabilities in `reads`.
+fn reads_only(tree: &Value, reads: &HashSet<String>) -> bool {
+    let nodes = do_nodes(tree);
+    let read = |node: &&Value| {
+        let name = node["cap"].as_str().and_then(|cap| cap.rsplit_once('.'));
+        name.is_some_and(|(_, name)| reads.contains(name))
+    };
+    !nodes.is_empty() && nodes.iter().all(read)
+}
+
+/// Whether two outputs say the same, allowing numbers the drift of a repeated measurement.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(a), Value::Number(b)) => {
+            let (a, b) = (
+                a.as_f64().unwrap_or(f64::NAN),
+                b.as_f64().unwrap_or(f64::NAN),
+            );
+            (a - b).abs() <= 0.1_f64.max(0.2 * a.abs().max(b.abs()))
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| same(a, b)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Run a reply's tree now and return what each of its steps returned, in step
+/// order. `None` unless every step succeeded with text: a reply that names an
+/// output not known yet does not parse, and an image cannot be compared later.
+async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
+    let mut parser = RtdlIncrementalParser::new(
+        reader.targets.clone(),
+        Default::default(),
+        "pilot-read-ahead".into(),
+        0,
+    );
+    parser.push(&reply.to_string()).ok()?;
+    let (_, None) = parser.finish().ok()? else {
+        return None;
+    };
+    let mut plan = parser.plan;
+    plan.plan_id = format!("read-ahead-{}", uuid::Uuid::new_v4());
+    let calls = plan.nodes.iter_mut().filter_map(|node| node.call.as_mut());
+    for (index, call) in calls.enumerate() {
+        call.call_id = format!("{}:{index}", plan.plan_id);
+    }
+    let steps: Vec<u32> = (0..plan.nodes.len() as u32)
+        .filter(|&index| plan.nodes[index as usize].node_kind == RTDL_DO)
+        .collect();
+    let mut graph = reader.graph.clone();
+    let run = async move {
+        let mut events = graph
+            .execute(tonic::Request::new(plan))
+            .await
+            .ok()?
+            .into_inner();
+        let mut returned = HashMap::new();
+        while let Some(event) = events.message().await.ok()? {
+            let Some(node) = event.node_state else {
+                continue;
+            };
+            let state = RtdlNodeStateEnum::try_from(node.state as i32).ok()?;
+            match (state, node.leaf_result) {
+                (RtdlNodeStateEnum::Succeeded, Some(result)) => {
+                    if crate::history::is_image_output(&result.output) {
+                        return None;
+                    }
+                    let output = serde_json::from_str(&result.output)
+                        .unwrap_or_else(|_| Value::from(result.output));
+                    returned.insert(node.node_index, output);
+                }
+                (
+                    RtdlNodeStateEnum::Failed
+                    | RtdlNodeStateEnum::Canceled
+                    | RtdlNodeStateEnum::Timeout,
+                    _,
+                ) => return None,
+                _ => {}
+            }
+        }
+        Some(returned)
+    };
+    let mut returned = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .ok()??;
+    steps.iter().map(|index| returned.remove(index)).collect()
 }
 
 /// Write the reply for the outcome `label` names, then, while `ahead` trees
@@ -874,7 +1056,11 @@ fn prepare(
             0 => Vec::new(),
             _ => look_ahead(&request, messages, &text, &label, ahead - 1),
         };
-        Ok(Prepared { text, next })
+        Ok(Prepared {
+            text,
+            next,
+            read: None,
+        })
     }
     .boxed()
 }
@@ -920,6 +1106,8 @@ fn look_ahead(
             (timings.expected(names.clone()), timings.reply)
         };
         let short = run.zip(write).is_some_and(|(run, write)| run < write);
+        // A tree that only reads is short whatever was timed, and can run now.
+        let readable = reads_only(&reply["rtdl"], &request.reads);
         info!(
             "[pilot/segue] {}",
             json!({
@@ -928,14 +1116,15 @@ fn look_ahead(
                 "outcome": format!("{label}/{index}"),
                 "expected_ms": run.map(|run| run.as_millis() as u64),
                 "reply_ms": write.map(|write| write.as_millis() as u64),
-                "sent": short,
+                "reads_only": readable,
+                "sent": short || readable,
             })
         );
-        if !short {
+        if !(short || readable) {
             return None;
         }
         let steps: Vec<(String, String)> = names.map(|name| (next_op_id(), name.into())).collect();
-        let listed: String = steps
+        let described: Vec<String> = steps
             .iter()
             .zip(&nodes)
             .map(|((op_id, _), node)| {
@@ -955,19 +1144,38 @@ fn look_ahead(
         };
         let mut messages = messages.clone();
         messages.push(Message::assistant(text));
-        let ask = hypothesis(
-            &tree,
-            &listed,
-            &Outcome::Succeeded,
-            DECISION_MODEL.is_some(),
-        );
-        messages.push(Message::user(&ask));
-        let reply = tokio::spawn(prepare(
-            request.clone(),
-            messages,
-            format!("{label}/{index}"),
-            ahead,
-        ));
+        let (request, reply, label) = (request.clone(), reply.clone(), format!("{label}/{index}"));
+        let reply = tokio::spawn(async move {
+            let read = match readable {
+                true => read_ahead(&request.reader, &reply).await,
+                false => None,
+            };
+            if readable {
+                info!(
+                    "[pilot/segue] {}",
+                    json!({"event": "read", "plan_id": request.plan_id, "outcome": label,
+                           "returned": read.is_some()})
+                );
+            }
+            let listed: String = match &read {
+                Some(read) => described
+                    .iter()
+                    .zip(read)
+                    .map(|(step, output)| format!("{step}; returned {output}"))
+                    .collect(),
+                None => described.concat(),
+            };
+            let ask = hypothesis(
+                &tree,
+                &listed,
+                &Outcome::Succeeded,
+                DECISION_MODEL.is_some(),
+                read.is_some(),
+            );
+            messages.push(Message::user(&ask));
+            let prepared = prepare(request, messages, label, ahead).await?;
+            Ok(Prepared { read, ..prepared })
+        });
         Some(Ahead {
             steps,
             branch: Branch {
@@ -988,6 +1196,7 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
         shape,
         plan_id,
         idle_timeout,
+        ..
     } = request;
     let idle_timeout = *idle_timeout;
     let _slot = SLOTS.acquire().await?;
@@ -1083,6 +1292,7 @@ mod tests {
                     reply: tokio::spawn(std::future::ready(Ok(Prepared {
                         text: outcome.label(),
                         next: Vec::new(),
+                        read: None,
                     }))),
                     outcome,
                     next: None,
@@ -1098,6 +1308,7 @@ mod tests {
             started: Instant::now(),
             ahead: Vec::new(),
             renames: Vec::new(),
+            reads: Default::default(),
         }
     }
 
@@ -1210,16 +1421,81 @@ mod tests {
     #[tokio::test]
     async fn a_lone_situation_without_when_is_used_without_asking() {
         let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
-        let settled = super::situation("p", reply, serde_json::json!({}), 1.0).await;
+        let settled =
+            super::situation("p", reply, serde_json::json!({}), 1.0, &Default::default()).await;
         assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), 0, false)));
     }
 
     #[test]
     fn with_a_decision_model_every_outcome_asks_for_situations() {
         for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
-            assert!(super::hypothesis("plan p", "", &outcome, true).contains(r#"{"situations""#));
-            assert!(!super::hypothesis("plan p", "", &outcome, false).contains("situations"));
+            assert!(
+                super::hypothesis("plan p", "", &outcome, true, false).contains(r#"{"situations""#)
+            );
+            assert!(
+                !super::hypothesis("plan p", "", &outcome, false, false).contains("situations")
+            );
         }
+        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true);
+        assert!(read.contains(r#"{"when": "", "reply": ...}"#) && !read.contains("not known yet"));
+    }
+
+    #[test]
+    fn a_tree_reads_only_if_every_call_is_a_listed_capability() {
+        use serde_json::json;
+        let reads = ["scene_find".to_string()].into();
+        let call = |cap: &str| json!({"op": "do", "cap": cap});
+        let tree = |calls: Vec<serde_json::Value>| json!({"op": "sequence", "children": calls});
+        assert!(super::reads_only(
+            &tree(vec![call("scene.scene_find"), call("b.scene_find")]),
+            &reads
+        ));
+        assert!(!super::reads_only(
+            &tree(vec![call("scene.scene_find"), call("arm.arm_pick")]),
+            &reads
+        ));
+        assert!(!super::reads_only(&tree(vec![]), &reads));
+    }
+
+    #[test]
+    fn outputs_are_the_same_up_to_the_drift_of_a_repeated_measurement() {
+        use serde_json::json;
+        let seen = json!({"objects": [{"id": "o1", "x": 1.52, "last_seen_unix": 1794297111.4, "count": 40}], "detail": ""});
+        let again = json!({"objects": [{"id": "o1", "x": 1.49, "last_seen_unix": 1794297150.9, "count": 44}], "detail": ""});
+        assert!(super::same(&seen, &again));
+        assert!(!super::same(
+            &seen,
+            &json!({"objects": [], "detail": "no object matches"})
+        ));
+        let moved = json!({"objects": [{"id": "o1", "x": 2.9, "last_seen_unix": 1794297150.9, "count": 44}], "detail": ""});
+        assert!(!super::same(&seen, &moved));
+        let other = json!({"objects": [{"id": "o2", "x": 1.52, "last_seen_unix": 1794297111.4, "count": 40}], "detail": ""});
+        assert!(!super::same(&seen, &other));
+    }
+
+    #[tokio::test]
+    async fn a_reply_written_from_results_read_ahead_needs_the_same_results() {
+        use RtdlNodeStateEnum::Succeeded;
+        let written = |read: Vec<serde_json::Value>| {
+            let mut spec = three_steps();
+            spec.branches[0].reply = tokio::spawn(std::future::ready(Ok(Prepared {
+                text: r#"{"content": "x"}"#.into(),
+                next: Vec::new(),
+                read: Some(read),
+            })));
+            let results: Vec<_> = (0..=3).map(|index| state(index, Succeeded)).collect();
+            spec.ended("p", &results, false, false);
+            spec.settle(Vec::new()).unwrap()
+        };
+        let step = |index: u32| serde_json::json!({"step": index});
+        let reply = written(vec![step(1), step(2), step(3)]).reply().await;
+        assert_eq!(reply.unwrap().text, r#"{"content": "x"}"#);
+        let changed = written(vec![step(1), step(2), step(9)]).reply().await;
+        assert_eq!(
+            changed.err().unwrap(),
+            "results differ from those read ahead"
+        );
+        assert!(written(vec![step(1)]).reply().await.is_err());
     }
 
     #[test]
