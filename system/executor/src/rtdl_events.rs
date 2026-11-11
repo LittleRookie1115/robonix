@@ -12,7 +12,7 @@ use tonic::Status;
 const RTDL_SEQUENCE: u32 = 0;
 pub(crate) const RTDL_PARALLEL: u32 = 1;
 /// Operator that runs its children in order until one succeeds.
-pub(crate) const RTDL_FALLBACK: u32 = 3;
+pub(crate) const RTDL_FALLBACK: u32 = 6;
 
 /// Plan and node metadata copied into RTDL progress events and verification requests.
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct NodeEventContext {
     pub plan_id: String,
     /// Position of the node in the plan's node arena.
     pub node_index: u32,
-    /// RTDL node kind distinguishing sequence, parallel, and capability calls.
+    /// RTDL node kind distinguishing operators and capability calls.
     pub node_kind: u32,
     /// Stable node identity used to correlate state updates.
     pub op_id: String,
@@ -119,6 +119,9 @@ pub(crate) async fn send_operator_state(
     let op = match node.node_kind {
         RTDL_SEQUENCE => "sequence",
         RTDL_PARALLEL => "parallel",
+        3 => "if",
+        4 => "repeat",
+        5 => "while",
         RTDL_FALLBACK => "fallback",
         _ => "operator",
     };
@@ -126,6 +129,27 @@ pub(crate) async fn send_operator_state(
         "RTDL {op} op_id={} {reason}: {}",
         node.op_id, node.description
     );
+    runtime
+        .record_op_state(&node.plan_id, &node.op_id, state)
+        .await;
+    let _ = tx.send(Ok(operator_node_state(node, state, detail))).await;
+}
+
+/// Report a node that failed before invoking a capability or completing a child.
+pub(crate) async fn send_node_failure(
+    tx: &Sender<Result<RtdlEvent, Status>>,
+    node: &NodeEventContext,
+    detail: String,
+    runtime: &PlanRuntime,
+) {
+    robonix_scribe::warn!(
+        "[executor/rtdl] plan_id={} node={} op_id={} failed: {}",
+        node.plan_id,
+        node.node_index,
+        node.op_id,
+        detail
+    );
+    let state = RtdlNodeStateEnum::Failed as u32;
     runtime
         .record_op_state(&node.plan_id, &node.op_id, state)
         .await;

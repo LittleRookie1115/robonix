@@ -39,6 +39,7 @@ pub struct RunningAsyncCall {
 
 /// Mutable progress and cancellation state retained for one active plan.
 struct PlanRun {
+    context: crate::execution_context::ExecutionContext,
     /// Whether cancellation has been requested, even if calls are still draining.
     cancelled: bool,
     /// Calls still available for cancellation, keyed by capability call ID.
@@ -122,6 +123,7 @@ impl PlanRuntime {
         plans.insert(
             plan_id.into(),
             PlanRun {
+                context: Default::default(),
                 cancelled: false,
                 running_async: HashMap::new(),
                 description: String::new(),
@@ -162,6 +164,16 @@ impl PlanRuntime {
             run.ops = ops;
             run.description = description;
         }
+    }
+
+    pub async fn context(&self, plan_id: &str) -> crate::execution_context::ExecutionContext {
+        self.inner
+            .lock()
+            .await
+            .get(plan_id)
+            .expect("registered plan")
+            .context
+            .clone()
     }
 
     /// Record the latest observed RTDL state for an op. Called by the execution
@@ -602,13 +614,16 @@ fn state_label(state: u32) -> &'static str {
     }
 }
 
-/// Label an RTDL node kind (0=sequence, 1=parallel, 2=do, 3=fallback).
+/// Label an RTDL node kind (RtdlNode.msg).
 fn kind_label(node_kind: u32) -> &'static str {
     match node_kind {
         0 => "sequence",
         1 => "parallel",
         2 => "do",
-        3 => "fallback",
+        3 => "if",
+        4 => "repeat",
+        5 => "while",
+        6 => "fallback",
         _ => "unknown",
     }
 }
@@ -731,6 +746,7 @@ mod tests {
                     call: None,
                     op_id: "1".into(),
                     description: "sequence".into(),
+                    ..Default::default()
                 },
                 RtdlNode {
                     node_kind: 2,
@@ -743,6 +759,7 @@ mod tests {
                     }),
                     op_id: "2".into(),
                     description: "take snapshot".into(),
+                    ..Default::default()
                 },
             ],
         };
@@ -784,6 +801,7 @@ mod tests {
                     call: None,
                     op_id: "1".into(),
                     description: "drive to the kitchen".into(),
+                    ..Default::default()
                 }],
             })
             .await;

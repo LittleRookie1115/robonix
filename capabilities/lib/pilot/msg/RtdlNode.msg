@@ -1,8 +1,9 @@
 # RTDL execution tree node encoded as an arena entry in Plan.nodes.
-# node_kind: 0=sequence, 1=parallel, 2=do, 3=fallback.
+# node_kind: 0=sequence, 1=parallel, 2=do, 3=if, 4=repeat, 5=while, 6=fallback.
 uint32 node_kind
 
-# Child node indices for sequence, parallel and fallback nodes. Empty for do nodes.
+# Child indices: sequence/parallel/fallback list; if then followed by optional
+# else; repeat/while have exactly one body. Empty for do nodes.
 uint32[] children
 
 # Capability call payload for do nodes. Operators leave this empty.
@@ -13,3 +14,16 @@ string op_id
 
 # Human-readable intent for this RTDL node.
 string description
+
+# JSON-encoded condition expression for if and while.
+# Empty for other node kinds.
+string condition_json
+
+# Result variable name for 'do'. Empty means no binding.
+string bind
+
+# Number of body executions for repeat.
+uint32 repeat_count
+
+# Maximum number of body executions for while.
+uint32 max_iterations

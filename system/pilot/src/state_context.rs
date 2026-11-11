@@ -269,6 +269,7 @@ async fn query_scene(
             }),
             op_id: "scene_snapshot".into(),
             description: format!("Read {contract} before planning"),
+            ..Default::default()
         }],
         root_index: 0,
     };
