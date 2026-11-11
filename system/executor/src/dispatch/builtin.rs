@@ -130,7 +130,6 @@ async fn run(
         "patch_file" => patch_file(args_json),
         "list_dir" => list_dir(args_json),
         "run_command" => run_command(args_json, runtime, plan_id).await,
-        "check" => check(args_json),
         other => anyhow::bail!("unknown builtin: {}", other),
     }
 }
@@ -171,11 +170,6 @@ pub const BUILTINS: &[BuiltinSpec] = &[
         op: "run_command",
         description: "Run a shell command and return stdout/stderr",
         input_schema_json: r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}"#,
-    },
-    BuiltinSpec {
-        op: "check",
-        description: "Succeed when a comparison holds and fail when it does not, so a fallback can pick its branch from an earlier node's output (pass that output with $ref). op is one of ==, !=, <, <=, >, >= (numbers compare numerically, strings by text) or empty / not_empty, which test left alone: null, \"\", [] and {} are empty.",
-        input_schema_json: r#"{"type":"object","properties":{"left":{"description":"Value under test, usually a $ref"},"op":{"type":"string","enum":["==","!=","<","<=",">",">=","empty","not_empty"]},"right":{"description":"Value compared with left; unused by empty and not_empty"}},"required":["left","op"]}"#,
     },
     BuiltinSpec {
         op: "cancel_plan",
@@ -337,49 +331,6 @@ struct ListArgs {
 struct CmdArgs {
     /// Shell source passed to `bash -c` for execution.
     command: String,
-}
-/// JSON arguments of the `check` builtin, which tests one comparison.
-#[derive(Deserialize)]
-struct CheckArgs {
-    /// Value under test, usually an earlier node's output substituted for a `$ref`.
-    left: serde_json::Value,
-    /// Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`, `empty` or `not_empty`.
-    op: String,
-    /// Value compared with `left`; `empty` and `not_empty` ignore it.
-    #[serde(default)]
-    right: serde_json::Value,
-}
-
-fn check(args: &str) -> anyhow::Result<String> {
-    use serde_json::Value;
-    use std::cmp::Ordering;
-    let a: CheckArgs = serde_json::from_str(args)?;
-    let order = match (&a.left, &a.right) {
-        (Value::Number(l), Value::Number(r)) => l.as_f64().partial_cmp(&r.as_f64()),
-        (Value::String(l), Value::String(r)) => Some(l.cmp(r)),
-        _ => None,
-    };
-    let equal = order.map_or(a.left == a.right, Ordering::is_eq);
-    let empty = match &a.left {
-        Value::Null => true,
-        Value::String(s) => s.is_empty(),
-        Value::Array(v) => v.is_empty(),
-        Value::Object(m) => m.is_empty(),
-        _ => false,
-    };
-    let holds = match a.op.as_str() {
-        "==" => equal,
-        "!=" => !equal,
-        "<" => order.is_some_and(Ordering::is_lt),
-        "<=" => order.is_some_and(Ordering::is_le),
-        ">" => order.is_some_and(Ordering::is_gt),
-        ">=" => order.is_some_and(Ordering::is_ge),
-        "empty" => empty,
-        "not_empty" => !empty,
-        other => anyhow::bail!("unknown check op: {other}"),
-    };
-    anyhow::ensure!(holds, "check failed: {} {} {}", a.left, a.op, a.right);
-    Ok("true".into())
 }
 
 fn read_file(args: &str) -> anyhow::Result<String> {
@@ -711,23 +662,5 @@ mod tests {
             result.starts_with("A"),
             "should start with 'A', got: {result}"
         );
-    }
-
-    /// Numbers compare numerically, emptiness covers every empty JSON value, and a
-    /// comparison that does not hold is an error so the calling node fails.
-    #[test]
-    fn check_compares_values() {
-        let holds = |args: &str| check(args).is_ok();
-        assert!(holds(r#"{"left":1,"op":"==","right":1.0}"#));
-        assert!(holds(r#"{"left":0.4,"op":"<","right":0.5}"#));
-        assert!(holds(r#"{"left":"b","op":">=","right":"a"}"#));
-        assert!(holds(r#"{"left":true,"op":"==","right":true}"#));
-        assert!(holds(r#"{"left":[1],"op":"not_empty"}"#));
-        assert!(holds(r#"{"left":{},"op":"empty"}"#));
-        assert!(holds(r#"{"left":null,"op":"empty"}"#));
-        assert!(!holds(r#"{"left":"1","op":"==","right":1}"#));
-        assert!(!holds(r#"{"left":true,"op":"<","right":false}"#));
-        assert!(!holds(r#"{"left":"","op":"not_empty"}"#));
-        assert!(!holds(r#"{"left":1,"op":"~","right":1}"#));
     }
 }

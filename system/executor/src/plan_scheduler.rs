@@ -8,8 +8,7 @@ use crate::plan_input::{EXECUTE_STREAM_NODE, PlanInput};
 use crate::rtdl_events::{self, RTDL_FALLBACK};
 use crate::verification::VerificationPolicy;
 use robonix_atlas::client::AtlasClient;
-use robonix_scribe::{info, warn};
-use serde_json::Value;
+use robonix_scribe::info;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -30,8 +29,6 @@ struct Execution {
     verifying: bool,
     /// Whether the scheduler skipped this node due to cancellation or a failed sibling.
     canceled: bool,
-    /// Output of a successful call, kept so later nodes can read it through `$ref`.
-    output: Option<String>,
     /// Branch or loop body enabled by this control node, if any.
     active_child: Option<usize>,
     /// Number of times this control node has enabled a child.
@@ -164,47 +161,6 @@ impl PlanScheduler {
             } else {
                 children.any(|failed| failed == Some(true))
             }
-    }
-
-    /// Replace each `{"$ref": "<op_id>#<JSON pointer>"}` in the arguments with that part of an
-    /// earlier node's output; arguments without references pass through unchanged.
-    fn resolve_refs(&self, args_json: &str) -> Result<String, String> {
-        if !args_json.contains("\"$ref\"") {
-            return Ok(args_json.to_string());
-        }
-        let mut args: Value = serde_json::from_str(args_json).map_err(|e| e.to_string())?;
-        self.substitute_refs(&mut args)?;
-        Ok(args.to_string())
-    }
-
-    fn substitute_refs(&self, value: &mut Value) -> Result<(), String> {
-        match value {
-            Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
-                let reference = map["$ref"]
-                    .as_str()
-                    .ok_or("$ref must be a string")?
-                    .to_string();
-                let (op_id, pointer) = reference.split_once('#').unwrap_or((&reference, ""));
-                let output = self
-                    .input
-                    .plan()
-                    .nodes
-                    .iter()
-                    .position(|n| n.op_id == op_id)
-                    .and_then(|i| self.execution[i].output.as_deref())
-                    .ok_or_else(|| format!("$ref '{reference}' names no succeeded call"))?;
-                let output = serde_json::from_str(output)
-                    .unwrap_or_else(|_| Value::String(output.to_string()));
-                *value = output
-                    .pointer(pointer)
-                    .cloned()
-                    .ok_or_else(|| format!("$ref '{reference}' is not in {op_id}'s output"))?;
-            }
-            Value::Object(map) => map.values_mut().try_for_each(|v| self.substitute_refs(v))?,
-            Value::Array(items) => items.iter_mut().try_for_each(|v| self.substitute_refs(v))?,
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Select the next child only after the current one and its verification have finished.
@@ -368,31 +324,7 @@ impl PlanScheduler {
             }
             self.execution[index].started = true;
             let node = &self.input.plan().nodes[index];
-            if let Some(mut call) = node.call.clone() {
-                match self.resolve_refs(&call.args_json) {
-                    Ok(args_json) => call.args_json = args_json,
-                    Err(error) => {
-                        warn!(
-                            "[executor] call_id={} not dispatched: {error}",
-                            call.call_id
-                        );
-                        self.execution[index].immediate = Some(true);
-                        self.execution[index].final_failed = Some(true);
-                        self.runtime
-                            .record_op_state(&ctx.plan_id, &ctx.op_id, State::Failed as u32)
-                            .await;
-                        let result = crate::dispatch::error_result(&call, error);
-                        let _ = self
-                            .tx
-                            .send(Ok(rtdl_events::node_state_from_result(
-                                &ctx,
-                                result,
-                                State::Failed as u32,
-                            )))
-                            .await;
-                        continue;
-                    }
-                }
+            if let Some(call) = node.call.clone() {
                 let bind = node.bind.clone();
                 let atlas = self.atlas.clone();
                 let provider_id = self.provider_id.clone();
@@ -415,7 +347,10 @@ impl PlanScheduler {
                             .await;
                         return Completion::Call(
                             index,
-                            capability_execution::NodeExecution::finished(true, String::new()),
+                            capability_execution::NodeExecution {
+                                failed: true,
+                                verifier: None,
+                            },
                         );
                     }
                     let mut call = call;
@@ -434,7 +369,10 @@ impl PlanScheduler {
                             .await;
                             return Completion::Call(
                                 index,
-                                capability_execution::NodeExecution::finished(true, String::new()),
+                                capability_execution::NodeExecution {
+                                    failed: true,
+                                    verifier: None,
+                                },
                             );
                         }
                     }
@@ -560,9 +498,6 @@ impl PlanScheduler {
                     match result {
                         Some(Ok(Completion::Call(index, outcome))) => {
                             self.execution[index].immediate = Some(outcome.failed);
-                            if !outcome.failed {
-                                self.execution[index].output = Some(outcome.output);
-                            }
                             if let Some(verifier) = outcome.verifier {
                                 self.tasks.spawn(async move { Completion::Verified(index, capability_execution::wait_for_verifier(verifier).await) });
                             } else {
@@ -1123,20 +1058,8 @@ mod scheduling_tests {
             description: "try alternatives".into(),
             ..Default::default()
         };
-        let fails = |id| {
-            builtin(
-                id,
-                "check",
-                serde_json::json!({"left":1,"op":"==","right":2}),
-            )
-        };
-        let holds = |id| {
-            builtin(
-                id,
-                "check",
-                serde_json::json!({"left":1,"op":"==","right":1}),
-            )
-        };
+        let fails = |id| builtin(id, "read_file", serde_json::json!({"path": "no-such-file"}));
+        let holds = |id| builtin(id, "read_file", serde_json::json!({"path": "Cargo.toml"}));
 
         let (states, failed) = run_plan(vec![
             fallback(vec![1, 2, 3]),
@@ -1154,38 +1077,6 @@ mod scheduling_tests {
         let (states, failed) = run_plan(vec![fallback(vec![1, 2]), fails("a"), fails("b")]).await;
         assert_eq!(final_state(&states, 2), RtdlNodeStateEnum::Failed);
         assert_eq!(final_state(&states, 0), RtdlNodeStateEnum::Failed);
-        assert!(failed);
-    }
-
-    /// A `$ref` argument is replaced by the named part of an earlier output, and a reference
-    /// that cannot be resolved fails its node without dispatching it.
-    #[tokio::test]
-    async fn refs_read_earlier_outputs() {
-        let sequence = RtdlNode {
-            node_kind: RTDL_SEQUENCE,
-            children: vec![1, 2, 3],
-            op_id: "sequence".into(),
-            description: "read an output".into(),
-            ..Default::default()
-        };
-        let compare = |id, reference| {
-            builtin(
-                id,
-                "check",
-                serde_json::json!({"left":{"$ref":reference},"op":"==","right":"branching"}),
-            )
-        };
-        let (states, failed) = run_plan(vec![
-            sequence,
-            builtin("plans", "get_all_plans", serde_json::json!({})),
-            compare("found", "plans#/plans/0/plan_id"),
-            compare("missing", "plans#/plans/1/plan_id"),
-        ])
-        .await;
-        assert_eq!(final_state(&states, 2), RtdlNodeStateEnum::Succeeded);
-        assert_eq!(final_state(&states, 3), RtdlNodeStateEnum::Failed);
-        let missing = states.iter().rfind(|s| s.node_index == 3).unwrap();
-        assert!(missing.leaf_result.as_ref().unwrap().error.contains("$ref"));
         assert!(failed);
     }
 }

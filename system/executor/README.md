@@ -51,10 +51,6 @@ Both execution RPCs share one scheduler:
 - A completed `if` / `repeat` / `while` subtree executes under one control task.
   Its body may run more than once; the next outer sequence child waits for the
   control task and its descendant verification to finish.
-- An argument value `{"$ref": "<op_id>#<JSON pointer>"}` is replaced at
-  dispatch with that part of an earlier succeeded node's output (non-JSON
-  output is one string; no pointer means all of it). An unresolvable reference
-  fails the node without dispatching it.
 - Input requires a nonempty plan ID, unique op/call IDs, nonempty node
   descriptions, object-valued call arguments, at most 256 nodes and 32 levels.
   Complete plans must form one tree; active plan IDs cannot be reused.
@@ -126,9 +122,6 @@ Under `robonix/system/executor/builtin/`:
   only the opening paragraph of a description, so this is where the rest of a
   long one is read; serving descriptions as well as the manual means providers
   that never wrote a `CAPABILITY.md` still answer.
-- `check`: succeed when `left op right` holds and fail otherwise, so a
-  `fallback` can branch on an earlier output. `op` is `==`, `!=`, `<`, `<=`,
-  `>`, `>=`, `empty` or `not_empty`.
 - `cancel_plan`: best-effort cancellation for an in-flight RTDL plan. Args:
   `plan_id` (required) and `wait_ms` (optional, default 5000). Async capability
   calls receive cancel requests through `<contract_id>/cancel`; synchronous

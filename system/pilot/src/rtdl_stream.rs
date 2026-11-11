@@ -233,8 +233,6 @@ struct Candidate {
     parent: Option<usize>,
     /// Whether this node's complete JSON object has arrived.
     closed: bool,
-    /// Nonzero op_id the model gave a do node so later `$ref` arguments can name it.
-    label: Option<u64>,
 }
 
 /// One model response, with a single immutable-identity arena and pending wire messages.
@@ -251,10 +249,9 @@ pub(crate) struct RtdlIncrementalParser {
     pub(crate) task_fields: TaskFields,
     /// Accepted operators already closed on the incremental input.
     closed: Vec<bool>,
-    /// Real op_id of each labelled do node already admitted, keyed by the model's label.
-    labels: HashMap<u64, String>,
-    /// Raw outputs of leaves of finished trees, by real op_id. A `$ref` naming one
-    /// is replaced by the value, because Executor resolves references only within a plan.
+    /// Raw outputs of leaves of finished trees, by real op_id. A `{"var": ...}`
+    /// naming one is replaced by the value, because Executor's variables live in
+    /// one plan.
     outputs: HashMap<String, String>,
     /// Newly admitted wire messages awaiting submission to Executor.
     pending: Vec<ExecuteStreamInput>,
@@ -297,7 +294,6 @@ impl RtdlIncrementalParser {
             },
             task_fields: TaskFields::default(),
             closed: vec![],
-            labels: HashMap::new(),
             outputs: HashMap::new(),
             pending: vec![],
             in_string: false,
@@ -312,7 +308,7 @@ impl RtdlIncrementalParser {
         }
     }
 
-    /// Let `$ref` arguments name these finished leaves by real op_id.
+    /// Let `{"var": "<op_id>"}` references name these finished leaves.
     pub(crate) fn with_outputs(mut self, outputs: HashMap<String, String>) -> Self {
         self.outputs = outputs;
         self
@@ -524,13 +520,10 @@ impl RtdlIncrementalParser {
             let call_index = self.plan.nodes.iter().filter(|n| n.call.is_some()).count();
             if let Some(call) = &mut node.call {
                 call.call_id = format!("{}:{call_index}", self.plan.plan_id);
-                call.args_json = self.relabel_refs(&call.args_json)?;
+                call.args_json = self.fill_outputs(&call.args_json)?;
             }
-            if let Some(label) = candidate.label {
-                ensure!(
-                    self.labels.insert(label, node.op_id.clone()).is_none(),
-                    "op_id {label} labels two do nodes"
-                );
+            if !node.condition_json.is_empty() {
+                node.condition_json = self.fill_outputs(&node.condition_json)?;
             }
             if submit {
                 self.pending.push(ExecuteStreamInput {
@@ -651,11 +644,6 @@ impl RtdlIncrementalParser {
                 )?,
                 parent,
                 closed: true,
-                label: fields
-                    .get("op_id")
-                    .and_then(Partial::value)
-                    .and_then(|id| id.as_u64())
-                    .filter(|id| *id != 0),
             });
             return Ok(true);
         }
@@ -712,7 +700,6 @@ impl RtdlIncrementalParser {
                 },
                 parent,
                 closed: true,
-                label: None,
             });
             let body_key = if op == "if" { "then" } else { "body" };
             let body = fields
@@ -755,7 +742,6 @@ impl RtdlIncrementalParser {
             },
             parent,
             closed: false,
-            label: None,
         });
         for child in children {
             if !self.walk(child, Some(index), depth + 1, label, out)? {
@@ -766,14 +752,21 @@ impl RtdlIncrementalParser {
         Ok(*closed)
     }
 
-    /// Point each `{"$ref":"<label>#<pointer>"}` argument at the labelled node's real op_id.
-    fn relabel_refs(&self, args_json: &str) -> Result<String> {
-        if !args_json.contains("\"$ref\"") {
-            return Ok(args_json.to_string());
+    /// Replace each `{"var": "<op_id>", "path": [...]}` naming a finished leaf
+    /// with that part of its output, unless this tree binds the same name.
+    fn fill_outputs(&self, json: &str) -> Result<String> {
+        if self.outputs.is_empty() {
+            return Ok(json.to_string());
         }
-        let mut args: Value = serde_json::from_str(args_json)?;
-        relabel(&mut args, &self.labels, &self.outputs)?;
-        Ok(serde_json::to_string(&args)?)
+        let bound: Vec<&str> = self
+            .plan
+            .nodes
+            .iter()
+            .map(|node| node.bind.as_str())
+            .collect();
+        let mut value: Value = serde_json::from_str(json)?;
+        fill(&mut value, &self.outputs, &bound)?;
+        Ok(serde_json::to_string(&value)?)
     }
 
     /// Decode a complete call without assigning identities or appending to an arena.
@@ -821,44 +814,33 @@ impl RtdlIncrementalParser {
     }
 }
 
-fn relabel(
-    value: &mut Value,
-    labels: &HashMap<u64, String>,
-    outputs: &HashMap<String, String>,
-) -> Result<()> {
+fn fill(value: &mut Value, outputs: &HashMap<String, String>, bound: &[&str]) -> Result<()> {
     match value {
-        Value::Object(map) if map.len() == 1 && map.contains_key("$ref") => {
-            let Some(reference) = map["$ref"].as_str() else {
-                bail!("$ref must be a string")
-            };
-            let (label, pointer) = reference.split_once('#').unwrap_or((reference, ""));
-            if let Some(output) = outputs.get(label.trim()) {
-                let output =
-                    serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.clone()));
-                *value = output.pointer(pointer).cloned().ok_or_else(|| {
-                    anyhow::anyhow!("$ref `{reference}` points at no output field")
-                })?;
+        Value::Object(map) if crate::expression::is_reference(map) => {
+            let name = map["var"].as_str().unwrap_or_default();
+            let Some(output) = outputs.get(name).filter(|_| !bound.contains(&name)) else {
                 return Ok(());
-            }
-            let op_id = label
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .and_then(|label| labels.get(&label))
-                .ok_or_else(|| anyhow::anyhow!("$ref `{reference}` names no earlier do node"))?;
-            let target = if reference.contains('#') {
-                format!("{op_id}#{pointer}")
-            } else {
-                op_id.clone()
             };
-            map.insert("$ref".into(), Value::String(target));
+            let mut found =
+                serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.clone()));
+            for part in map
+                .get("path")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let next = match part {
+                    Value::String(field) => found.get(field.as_str()),
+                    _ => part.as_u64().and_then(|index| found.get(index as usize)),
+                };
+                found = next
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("var `{name}` has no {part} in its output"))?;
+            }
+            *value = found;
         }
-        Value::Object(map) => map
-            .values_mut()
-            .try_for_each(|v| relabel(v, labels, outputs))?,
-        Value::Array(items) => items
-            .iter_mut()
-            .try_for_each(|v| relabel(v, labels, outputs))?,
+        Value::Object(map) => map.values_mut().try_for_each(|v| fill(v, outputs, bound))?,
+        Value::Array(items) => items.iter_mut().try_for_each(|v| fill(v, outputs, bound))?,
         _ => {}
     }
     Ok(())
@@ -1163,66 +1145,73 @@ mod tests {
     }
 
     #[test]
-    fn refs_name_earlier_labelled_do_nodes_by_real_op_id() {
-        let parse = |children: Value| {
-            let mut p = parser();
-            let raw = serde_json::json!({"content": "", "rtdl_description": "root", "message_updates": [], "rtdl_parent_task_id": "T1", "task_updates": [],
-                "rtdl": {"op": "fallback", "children": children}})
-            .to_string();
-            p.push(&raw).and_then(|()| p.finish()).map(|_| p.plan)
-        };
-        let plan = parse(serde_json::json!([
-            {"op": "do", "op_id": 2, "cap": "run", "args": {}},
-            {"op": "do", "op_id": 0, "cap": "run", "args": {"x": [{"$ref": "2#/a/0"}], "all": {"$ref": "2"}}}
-        ]))
-        .unwrap();
-        assert_eq!(plan.nodes[0].node_kind, RTDL_FALLBACK);
-        let first = &plan.nodes[1].op_id;
-        let args: Value =
-            serde_json::from_str(&plan.nodes[2].call.as_ref().unwrap().args_json).unwrap();
-        assert_eq!(
-            args,
-            serde_json::json!({"x": [{"$ref": format!("{first}#/a/0")}], "all": {"$ref": first}})
-        );
-
-        for children in [
-            serde_json::json!([{"op": "do", "op_id": 1, "cap": "run", "args": {"x": {"$ref": "1#/a"}}}]),
-            serde_json::json!([
-                {"op": "do", "cap": "run", "args": {"x": {"$ref": "3"}}},
-                {"op": "do", "op_id": 3, "cap": "run", "args": {}}
-            ]),
-            serde_json::json!([{"op": "do", "cap": "run", "args": {"x": {"$ref": 1}}}]),
-            serde_json::json!([
-                {"op": "do", "op_id": 1, "cap": "run", "args": {}},
-                {"op": "do", "op_id": 1, "cap": "run", "args": {}}
-            ]),
-        ] {
-            assert!(parse(children.clone()).is_err(), "{children}");
-        }
+    fn a_fallback_parses_as_its_own_node_kind() {
+        let mut p = parser();
+        let raw = serde_json::json!({"content": "", "rtdl_description": "root", "message_updates": [], "rtdl_parent_task_id": "T1", "task_updates": [],
+            "rtdl": {"op": "fallback", "children": [
+                {"op": "do", "cap": "run", "args": {}}, {"op": "do", "cap": "run", "args": {}}]}})
+        .to_string();
+        p.push(&raw).unwrap();
+        p.finish().unwrap();
+        assert_eq!(p.plan.nodes[0].node_kind, RTDL_FALLBACK);
+        assert_eq!(p.plan.nodes[0].children, [1, 2]);
     }
 
-    /// A finished tree's leaf is outside the new plan, so its output is substituted in place.
+    /// A finished tree's leaf is outside the new plan, whose variables Executor keeps,
+    /// so a reference to it by op_id is filled in with its output.
     #[test]
-    fn refs_to_finished_leaves_take_their_output() {
-        let parse = |args: Value| {
+    fn references_to_finished_leaves_take_their_output() {
+        let parse = |rtdl: Value| {
             let mut p = parser().with_outputs(HashMap::from([
-                ("ab12-3".into(), r#"{"pose": {"x": 0.5}}"#.into()),
+                (
+                    "ab12-3".into(),
+                    r#"{"pose": {"x": 0.5}, "items": [{"id": "o1"}]}"#.into(),
+                ),
                 ("ab12-4".into(), "plain text".into()),
             ]));
             let raw = serde_json::json!({"content": "", "rtdl_description": "root", "message_updates": [], "rtdl_parent_task_id": "T1", "task_updates": [],
-                "rtdl": {"op": "do", "cap": "run", "args": args}})
+                "rtdl": rtdl})
             .to_string();
             p.push(&raw).and_then(|()| p.finish()).map(|_| p.plan)
         };
-        let plan = parse(serde_json::json!({
-            "x": {"$ref": "ab12-3#/pose/x"}, "all": {"$ref": "ab12-4"}
-        }))
+        let call = |args: Value| serde_json::json!({"op": "do", "cap": "run", "args": args});
+        let args = |plan: &Plan, index: usize| -> Value {
+            serde_json::from_str(&plan.nodes[index].call.as_ref().unwrap().args_json).unwrap()
+        };
+        let plan = parse(call(serde_json::json!({
+            "x": {"var": "ab12-3", "path": ["pose", "x"]},
+            "id": {"var": "ab12-3", "path": ["items", 0, "id"]},
+            "all": {"var": "ab12-4"},
+            "own": {"var": "seen"},
+        })))
         .unwrap();
-        let args: Value =
-            serde_json::from_str(&plan.nodes[0].call.as_ref().unwrap().args_json).unwrap();
-        assert_eq!(args, serde_json::json!({"x": 0.5, "all": "plain text"}));
-        assert!(parse(serde_json::json!({"x": {"$ref": "ab12-3#/pose/y"}})).is_err());
-        assert!(parse(serde_json::json!({"x": {"$ref": "ab12-5#/pose"}})).is_err());
+        assert_eq!(
+            args(&plan, 0),
+            serde_json::json!({"x": 0.5, "id": "o1", "all": "plain text", "own": {"var": "seen"}})
+        );
+        assert!(
+            parse(call(
+                serde_json::json!({"x": {"var": "ab12-3", "path": ["pose", "y"]}})
+            ))
+            .is_err()
+        );
+
+        // A condition reads finished leaves too, and a name the tree binds is its own.
+        let plan = parse(serde_json::json!({"op": "sequence", "children": [
+            {"op": "do", "cap": "run", "args": {}, "bind": "ab12-4"},
+            {"op": "if", "condition": {"op": "eq", "args": [{"var": "ab12-3", "path": ["pose", "x"]}, 0.5]},
+             "then": call(serde_json::json!({"text": {"var": "ab12-4"}}))},
+        ]}))
+        .unwrap();
+        let condition: Value = serde_json::from_str(&plan.nodes[2].condition_json).unwrap();
+        assert_eq!(
+            condition,
+            serde_json::json!({"op": "eq", "args": [0.5, 0.5]})
+        );
+        assert_eq!(
+            args(&plan, 3),
+            serde_json::json!({"text": {"var": "ab12-4"}})
+        );
     }
 
     fn assert_nodes(parser: &RtdlIncrementalParser, expected: &[(u32, &[u32], &str)]) {

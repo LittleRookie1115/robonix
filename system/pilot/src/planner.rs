@@ -2358,15 +2358,15 @@ Reply with exactly one JSON object and no surrounding prose, with its fields in 
 Nodes are exactly one of:
 - {"op":"sequence","op_id":0,"description":"...","children":[...]}
 - {"op":"parallel","op_id":0,"description":"...","children":[...]}
-- {"op":"fallback","op_id":0,"description":"...","children":[...]}
 - {"op":"do","op_id":0,"description":"...","cap":"<exact capability_name>","args":{...}}
 - {"op":"if","op_id":0,"description":"...","condition":<expr>,"then":<node>,"else":<optional node>}
 - {"op":"repeat","op_id":0,"description":"...","count":0..10000,"body":<node>}
 - {"op":"while","op_id":0,"description":"...","condition":<expr>,"max_iterations":1..10000,"body":<node>}
-op_id is 0, or a small integer unique in this reply when a later do node's args read this node's output as {"$ref":"<integer>#<JSON pointer>"}, e.g. {"$ref":"2#/objects/0/x"}; no # means the whole output. Pilot assigns real IDs. Do not add node fields.
-do may set bind. References: {"var":"name","path":["field",0]}; conditions: {"op":"eq|ne|lt|le|gt|ge|and|or|not","args":[...]}, or booleans. Bindings contain successful output; later sequential calls and loops overwrite them. Read only earlier completed nodes, never sibling parallel branches.
-A fallback runs its children in order until one succeeds; a failure inside it reaches you only if every child fails. To branch on a value, start a fallback child sequence with the executor's check capability, which fails when its comparison is false. Compose a task's known dependent steps into one sequence and its independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence with task_updates: [] if no task changes, or task_updates: [{"task_id":"T1","status":"done"}] to close task T1. in_progress with nothing running is rejected.
-A tree that only reads (look-ups, goal poses, snapshots, manuals) costs a planning round for nothing. Put each read in the tree that acts on it: after the step that brings the robot to what it is about, before the steps that use its output through $ref. When the next steps depend on what it returns, write both courses as fallback children, each starting with the check that selects it (empty and not_empty test a list). Read alone only when you must see the result yourself, as with a camera image.
+- {"op":"fallback","op_id":0,"description":"...","children":[...]}
+do may set bind. References: {"var":"name","path":["field",0]}; conditions: {"op":"eq|ne|lt|le|gt|ge|and|or|not","args":[...]}, or booleans; {"op":"ne","args":[{"var":"found","path":["objects"]},[]]} holds when a list is not empty. Bindings contain successful output; later sequential calls and loops overwrite them. Read only earlier completed nodes, never sibling parallel branches.
+Branch on a value with if. A fallback runs its children in order until one succeeds (later children handle earlier failures); its failure reaches you only if all fail.
+Every node needs a description and op_id=0; Pilot assigns the real ID. Do not add node fields. Compose dependent steps into one sequence and independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence with task_updates: [] if no task changes, or task_updates: [{"task_id":"T1","status":"done"}] to close task T1. in_progress with nothing running is rejected.
+A tree that only reads (look-ups, goal poses, snapshots, manuals) wastes a planning round: put each read in the tree that acts on it, bound for the steps that use it, with each course under an if. Read alone only to see a result yourself, as a camera image.
 
 Plan control is the entire rtdl value, never a nested node or capability: cancel_plan using an exact listed plan_id, or cancel_all, and only for plans listed in In-flight trees; with none listed, return an empty sequence. Never repeat a completed/cancelled control operation and never cancel an unrelated tree after another tree fails.
 
@@ -3166,15 +3166,16 @@ mod tests {
 
     #[test]
     fn later_round_protocol_is_compact_but_keeps_admission_rules() {
-        // Both node languages are described until one replaces the other.
-        assert!(RTDL_PROTOCOL_REMINDER.len() < 4_200);
+        // Upstream's limit, plus fallback and keeping reads out of trees of their
+        // own, which each saved round repays many times over.
+        assert!(RTDL_PROTOCOL_REMINDER.len() < 3_600);
         for required in [
             "capability_name",
             "sequence",
             "parallel",
             "fallback",
-            r#"{"$ref":"#,
-            "check capability",
+            "bind",
+            r#"{"var":"#,
             "cancel_plan",
             "plan_id/call_id",
             // The task fields and their order must reach the model every round.

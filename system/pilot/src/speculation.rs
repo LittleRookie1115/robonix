@@ -28,7 +28,7 @@
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
-use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_SEQUENCE};
+use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_REPEAT, RTDL_SEQUENCE, RTDL_WHILE};
 use crate::rtdl_stream::{RtdlIncrementalParser, next_op_id};
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
 use anyhow::{Result, bail};
@@ -280,7 +280,8 @@ pub(crate) struct Speculation {
     /// How the tree ended, once its completion arrived; `None` inside when the
     /// ending matches no outcome a reply could be written for.
     ended: Option<Option<Outcome>>,
-    /// Raw outputs of the tree's succeeded steps by op_id, for `$ref` binding.
+    /// Raw outputs of the tree's succeeded steps by op_id, which a prepared
+    /// reply reads as `{"var": "<op_id>"}`.
     outputs: HashMap<String, String>,
     /// The tree's finished steps as the decision model reads them.
     report: Vec<Value>,
@@ -352,7 +353,14 @@ impl Speculation {
         let long;
         {
             let timings = timings();
-            let run = timings.expected(names.iter().map(String::as_str));
+            // A loop runs its body any number of times, so its calls' times bound nothing.
+            let looped = plan
+                .nodes
+                .iter()
+                .any(|node| matches!(node.node_kind, RTDL_REPEAT | RTDL_WHILE));
+            let run = timings
+                .expected(names.iter().map(String::as_str))
+                .filter(|_| !looped);
             long = run
                 .zip(timings.reply)
                 .is_none_or(|(run, reply)| run >= reply);
@@ -614,7 +622,7 @@ impl Speculation {
         Ok(self.branches.swap_remove(index))
     }
 
-    /// Outputs of the tree's succeeded steps, for binding `$ref`s that name them.
+    /// Outputs of the tree's succeeded steps, for filling in the references that name them.
     pub(crate) fn outputs(&self) -> &HashMap<String, String> {
         &self.outputs
     }
@@ -729,9 +737,7 @@ impl Speculation {
 /// replaced by the op_id that step got.
 fn renamed(mut reply: String, renames: &[(String, String)]) -> String {
     for (made_up, op_id) in renames {
-        for end in ['#', '"'] {
-            reply = reply.replace(&format!("\"{made_up}{end}"), &format!("\"{op_id}{end}"));
-        }
+        reply = reply.replace(&format!("\"{made_up}\""), &format!("\"{op_id}\""));
     }
     reply
 }
@@ -839,10 +845,7 @@ async fn decide(
 
 /// Whether a prepared reply's RTDL tree dispatches any step.
 fn dispatches(node: &Value) -> bool {
-    node["op"] == "do"
-        || node["children"]
-            .as_array()
-            .is_some_and(|children| children.iter().any(dispatches))
+    !do_nodes(node).is_empty()
 }
 
 /// Whether a prepared reply declined to plan without the real outputs.
@@ -943,8 +946,8 @@ fn hypothesis(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
          {known} {ask} {assume} Where the next step depends on an output of these \
-         steps, pass it with {{\"$ref\": \"<op_id>#/<field>\"}} and decide with `check` inside \
-         `fallback`. If that cannot express what the next step needs, reply with `content` \
+         steps, refer to it as {{\"var\": \"<op_id>\", \"path\": [\"<field>\"]}} and decide \
+         with `if`. If that cannot express what the next step needs, reply with `content` \
          exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
          outcome matches its assumption."
     )
@@ -1096,8 +1099,11 @@ fn do_nodes(node: &Value) -> Vec<&Value> {
     if node["op"] == "do" {
         return vec![node];
     }
-    let children = node["children"].as_array();
-    children.into_iter().flatten().flat_map(do_nodes).collect()
+    let children = node["children"].as_array().into_iter().flatten();
+    let branches = ["then", "else", "body"]
+        .into_iter()
+        .filter_map(|key| node.get(key));
+    children.chain(branches).flat_map(do_nodes).collect()
 }
 
 /// For each reply in `text`, start preparing the reply after the tree it
@@ -1618,11 +1624,11 @@ mod tests {
 
     #[test]
     fn a_made_up_op_id_is_replaced_only_where_it_is_the_whole_id() {
-        let reply = r#"{"a":{"$ref":"m-1#/x"},"b":{"$ref":"m-1"},"c":{"$ref":"m-10#/x"}}"#;
+        let reply = r#"{"a":{"var":"m-1","path":["x"]},"b":{"var":"m-10"}}"#;
         let renames = [("m-1".to_string(), "r-7".to_string())];
         assert_eq!(
             super::renamed(reply.into(), &renames),
-            r#"{"a":{"$ref":"r-7#/x"},"b":{"$ref":"r-7"},"c":{"$ref":"m-10#/x"}}"#
+            r#"{"a":{"var":"r-7","path":["x"]},"b":{"var":"m-10"}}"#
         );
     }
 
@@ -1632,6 +1638,12 @@ mod tests {
         let nested =
             json!({"op": "sequence", "children": [{"op": "fallback", "children": [{"op": "do"}]}]});
         assert!(super::dispatches(&nested));
+        let branch =
+            json!({"op": "if", "then": {"op": "sequence", "children": []}, "else": {"op": "do"}});
+        assert!(super::dispatches(&branch));
+        assert!(super::dispatches(
+            &json!({"op": "while", "body": {"op": "do"}})
+        ));
         assert!(!super::dispatches(
             &json!({"op": "sequence", "children": []})
         ));
