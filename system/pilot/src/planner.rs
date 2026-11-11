@@ -315,10 +315,15 @@ fn task_is_session_end(task: &Task) -> bool {
 
 /// `context_json`: `{"speculate": true}` — prepare replies while trees run.
 fn task_speculates(task: &Task) -> bool {
+    task_switch(task, "speculate", false)
+}
+
+/// A `context_json` boolean, e.g. `{"state_view": false}`, or `default` when absent.
+fn task_switch(task: &Task, key: &str, default: bool) -> bool {
     serde_json::from_str::<serde_json::Value>(&task.context_json)
         .ok()
-        .and_then(|v| v.get("speculate").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
+        .and_then(|v| v.get(key).and_then(serde_json::Value::as_bool))
+        .unwrap_or(default)
 }
 
 /// Let a speculation see how its tree goes and ends.
@@ -1499,6 +1504,11 @@ pub async fn run_turn(
     let mut output_retries = 0usize;
     let mut reply_shape = ReplyShape::RtdlEnvelope;
     let speculate = task_speculates(task);
+    // Segue's planning context and its guidance on folding reads into trees, each
+    // switchable so their share of the speedup can be measured.
+    let state_view = task_switch(task, "state_view", true);
+    let protocol_prompt = rtdl_protocol(task_switch(task, "fold_reads", true));
+    let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
     // Every step reported this turn, since a reply may close the task on
@@ -1638,7 +1648,7 @@ pub async fn run_turn(
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
         let (environment_block, map_regions) =
-            state_context::collect(executor, atlas, &cap_list).await;
+            state_context::collect(executor, atlas, &cap_list, state_view).await;
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
             .ok()
@@ -1658,7 +1668,6 @@ pub async fn run_turn(
         // The RTDL protocol is part of the cacheable system prefix. Starting
         // with its compact form avoids the old full-on-round-zero rewrite that
         // made the second provider request cold.
-        let protocol_prompt = RTDL_PROTOCOL_REMINDER;
         let forest_block = build_forest_block(&forest.trees, &forest.kill_pending, tasks);
         let (executor_active_block, _) = fetch_executor_active_snapshot(executor).await;
         // Only instructions that never change sit before history.
@@ -2348,9 +2357,9 @@ fn build_capability_target_map(display_caps: &[DisplayCapability<'_>]) -> Capabi
     out
 }
 
-/// The RTDL protocol text sent on every planning round: the wire grammar and
-/// the harness invariants needed to parse and admit the next plan. It stays
-/// byte-identical across rounds so the prompt cache can reuse it.
+/// The RTDL protocol's opening and node grammar; with the rules after it, the
+/// text sent on every planning round, byte-identical across rounds so the
+/// prompt cache can reuse it.
 const RTDL_PROTOCOL_REMINDER: &str = r#"## RTDL output
 Reply with exactly one JSON object and no surrounding prose, with its fields in this order:
 {"content":"...","message_updates":[...],"rtdl_parent_task_id":"T1"|"new"|null,"rtdl_description":"...","rtdl":<node or plan-control op>,"task_updates":[...]}
@@ -2366,8 +2375,14 @@ Nodes are exactly one of:
 do may set bind. References: {"var":"name","path":["field",0]}; conditions: {"op":"eq|ne|lt|le|gt|ge|and|or|not","args":[...]}, or booleans; {"op":"ne","args":[{"var":"found","path":["objects"]},[]]} holds when a list is not empty. Bindings contain successful output; later sequential calls and loops overwrite them. Read only earlier completed nodes, never sibling parallel branches.
 Branch on a value with if. A fallback runs its children in order until one succeeds (later children handle earlier failures); its failure reaches you only if all fail.
 Every node needs a description and op_id=0; Pilot assigns the real ID. Do not add node fields. Compose dependent steps into one sequence and independent steps into one parallel tree; do not drip one known call per round. With no new call, return an empty sequence with task_updates: [] if no task changes, or task_updates: [{"task_id":"T1","status":"done"}] to close task T1. in_progress with nothing running is rejected.
-A tree that only reads (look-ups, goal poses, snapshots, manuals) wastes a planning round: put each read in the tree that acts on it, bound for the steps that use it, with each course under an if. Read alone only to see a result yourself, as a camera image.
+"#;
 
+/// The protocol's guidance against trees that only read, which Segue adds.
+const FOLD_READS: &str = r#"A tree that only reads (look-ups, goal poses, snapshots, manuals) wastes a planning round: put each read in the tree that acts on it, bound for the steps that use it, with each course under an if. Read alone only to see a result yourself, as a camera image.
+"#;
+
+/// The protocol's rules after the node grammar.
+const RTDL_PROTOCOL_RULES: &str = r#"
 Plan control is the entire rtdl value, never a nested node or capability: cancel_plan using an exact listed plan_id, or cancel_all, and only for plans listed in In-flight trees; with none listed, return an empty sequence. Never repeat a completed/cancelled control operation and never cancel an unrelated tree after another tree fails.
 
 Tasks (ids from the status board):
@@ -2379,6 +2394,13 @@ Resolve a named room through current Scene regions before navigation; never use 
 
 Copy each cap exactly from the current catalog. Scope feedback by plan_id/call_id. A dispatch record describes submitted RTDL nodes, not actual capability invocations. Use Executor leaf feedback to confirm calls that ran. A successful repeat result reports how many times its body ran, including zero. Do not repeat successful work.
 "#;
+
+/// The RTDL protocol text sent on every planning round, with or without
+/// Segue's guidance on folding reads into the trees that act on them.
+fn rtdl_protocol(fold_reads: bool) -> String {
+    let fold = if fold_reads { FOLD_READS } else { "" };
+    format!("{RTDL_PROTOCOL_REMINDER}{fold}{RTDL_PROTOCOL_RULES}")
+}
 
 /// One parsed RTDL envelope from the VLM.
 #[derive(Debug)]
@@ -2922,8 +2944,8 @@ for a running plan. Concretely:
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityTargetMap, CatalogView, HistoryBudget, MetaPlanOp, RTDL_DO, RTDL_FALLBACK,
-        RTDL_PARALLEL, RTDL_PROTOCOL_REMINDER, RTDL_REPEAT, RTDL_SEQUENCE, RUN_TAG, SessionForest,
+        CapabilityTargetMap, CatalogView, FOLD_READS, HistoryBudget, MetaPlanOp, RTDL_DO,
+        RTDL_FALLBACK, RTDL_PARALLEL, RTDL_REPEAT, RTDL_SEQUENCE, RUN_TAG, SessionForest,
         TaskTable, TreeInterrupt, TreeMeta, TreeStep, UsageTotals, append_request_context,
         append_steer, assemble_planning_messages, build_capability_target_map,
         build_display_capabilities, build_forest_block, call_signature, compact_tool_result,
@@ -2931,8 +2953,8 @@ mod tests {
         format_plan_summary, handle_interrupt, invalid_cancel_target, is_control_only,
         is_legacy_plan_control_contract, is_terminal_executor_state, parse_meta_plan_op,
         plan_call_signatures, record_dispatched_plan, repeat_result_message, rtdl_node_kind_name,
-        rtdl_state_name, should_replan_after_plan_done, skip_memory_prefetch, task_is_session_end,
-        upsert_terminal_result,
+        rtdl_protocol, rtdl_state_name, should_replan_after_plan_done, skip_memory_prefetch,
+        task_is_session_end, upsert_terminal_result,
     };
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
     use crate::pb::pilot::{
@@ -3168,7 +3190,9 @@ mod tests {
     fn later_round_protocol_is_compact_but_keeps_admission_rules() {
         // Upstream's limit, plus fallback and keeping reads out of trees of their
         // own, which each saved round repays many times over.
-        assert!(RTDL_PROTOCOL_REMINDER.len() < 3_600);
+        let protocol = rtdl_protocol(true);
+        assert!(protocol.len() < 3_600);
+        assert!(!rtdl_protocol(false).contains(FOLD_READS) && protocol.contains(FOLD_READS));
         for required in [
             "capability_name",
             "sequence",
@@ -3186,7 +3210,7 @@ mod tests {
             "Scene regions",
             "Never call a skill's cancel capability",
         ] {
-            assert!(RTDL_PROTOCOL_REMINDER.contains(required));
+            assert!(protocol.contains(required));
         }
     }
 

@@ -44,10 +44,12 @@ fn goals() -> std::sync::MutexGuard<'static, Goals> {
 /// blocks: what changes from round to round (where the robot is and the
 /// objects Scene knows, by region), and the map's regions with a
 /// navigate-ready goal each, which a caller shows only when it changes.
+/// Without `view`, only where the robot is, and no map block.
 pub async fn collect(
     executor: &ExecutorConn,
     atlas: &mut AtlasClient,
     caps: &[(String, atlas_pb::Capability)],
+    view: bool,
 ) -> (String, String) {
     let query = |contract: &'static str, args: Value| {
         let provider = caps
@@ -64,6 +66,37 @@ pub async fn collect(
             }
         }
     };
+    let providers = match atlas
+        .query_capabilities("", "", atlas_pb::Transport::Unspecified)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|provider| {
+                provider.capabilities.iter().any(|capability| {
+                    let id = capability.contract_id.as_str();
+                    id.contains("/navigation/")
+                        || id.contains("/scene/")
+                        || id.contains("/arm/")
+                        || id.contains("/chassis/")
+                        || id.contains("/skill/")
+                })
+            })
+            .map(|provider| {
+                json!({
+                    "provider_id": provider.id,
+                    "state": lifecycle_name(provider.state),
+                    "detail": provider.state_detail,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => vec![json!({"available": false, "error": error.to_string()})],
+    };
+    if !view {
+        let scene = query(SCENE_CONTEXT, json!({})).await;
+        let state = json!({"scene": scene, "provider_availability": providers});
+        return (environment(&state, ""), String::new());
+    }
     let (scene, regions) = tokio::join!(
         query(SCENE_CONTEXT, json!({})),
         query(SCENE_REGIONS, json!({}))
@@ -126,50 +159,16 @@ pub async fn collect(
         }
         cache.by_region.clone()
     };
-    let providers = match atlas
-        .query_capabilities("", "", atlas_pb::Transport::Unspecified)
-        .await
-    {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|provider| {
-                provider.capabilities.iter().any(|capability| {
-                    let id = capability.contract_id.as_str();
-                    id.contains("/navigation/")
-                        || id.contains("/scene/")
-                        || id.contains("/arm/")
-                        || id.contains("/chassis/")
-                        || id.contains("/skill/")
-                })
-            })
-            .map(|provider| {
-                json!({
-                    "provider_id": provider.id,
-                    "state": lifecycle_name(provider.state),
-                    "detail": provider.state_detail,
-                })
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => vec![json!({"available": false, "error": error.to_string()})],
-    };
-    let environment = format!(
-        "\n\n## Current environment and provider state\n\
-         Refreshed immediately before this planning round. Scene owns map pose, \
-         room membership, areas, and nearby objects. `objects` are the ids and labels \
-         of every object Scene currently knows, by the region it is in, as Scene's \
-         find returns them: call find only for what they do not show, or with \
-         `settle_s` in a tree that has just moved the robot, because perception \
-         takes a few seconds to add what the camera then sees. Atlas state \
-         only indicates \
-         provider availability; current task progress remains in the in-flight RTDL \
-         tree block. Missing or stale state means unknown.\n\n{}\n",
-        serde_json::to_string(&json!({
-            "scene": scene,
-            "objects": by_region(&everything, &rooms, &by_room),
-            "provider_availability": providers,
-        }))
-        .unwrap_or_else(|_| "{}".into())
-    );
+    let state = json!({
+        "scene": scene,
+        "objects": by_region(&everything, &rooms, &by_room),
+        "provider_availability": providers,
+    });
+    let objects = "`objects` are the ids and labels of every object Scene currently knows, by \
+                   the region it is in, as Scene's find returns them: call find only for what \
+                   they do not show, or with `settle_s` in a tree that has just moved the \
+                   robot, because perception takes a few seconds to add what the camera then \
+                   sees. ";
     let map = format!(
         "\n\n## Map regions\n\
          The map's regions and points of interest as Scene's list_regions returns \
@@ -180,7 +179,19 @@ pub async fn collect(
          changes.\n\n{}\n",
         named(&regions, &known)
     );
-    (environment, map)
+    (environment(&state, objects), map)
+}
+
+/// The environment block around `state`, with `objects` saying what its objects are.
+fn environment(state: &Value, objects: &str) -> String {
+    format!(
+        "\n\n## Current environment and provider state\n\
+         Refreshed immediately before this planning round. Scene owns map pose, \
+         room membership, areas, and nearby objects. {objects}Atlas state only indicates \
+         provider availability; current task progress remains in the in-flight RTDL \
+         tree block. Missing or stale state means unknown.\n\n{}\n",
+        serde_json::to_string(state).unwrap_or_else(|_| "{}".into())
+    )
 }
 
 /// `value` with its numbers to the millimetre, which a prompt has no use beyond.
