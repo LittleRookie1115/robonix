@@ -318,9 +318,13 @@ pub(crate) struct Speculation {
     report: Vec<Value>,
     /// The user's words for the task, as the decision model reads them.
     task: String,
-    /// Least confidence the decision model must give a situation for its reply
-    /// to be used.
+    /// Least confidence the decision model must give a situation prepared for a
+    /// failure for its reply to be used.
     tau_choice: f64,
+    /// The same for a situation prepared for success: its choices are between
+    /// what the outputs show and are right more often at the same confidence.
+    /// The task's `tau_success`, else `tau_choice`.
+    tau_success: f64,
     /// Least probability the decision model must give that a reply which
     /// dispatches nothing is supported by the results and finishes the task.
     tau_done: f64,
@@ -481,6 +485,7 @@ impl Speculation {
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
+        let tau_success = tau("tau_success", tau_choice);
         let lookahead = context["lookahead"].as_u64().unwrap_or(LOOKAHEAD);
         let tree = format!(
             "RTDL plan {} ({:?})",
@@ -523,6 +528,7 @@ impl Speculation {
                 "failure_rates": failures.iter().cloned().collect::<HashMap<_, _>>(),
                 "decision_model": DECISION_MODEL.as_ref().map(|m| &m.model),
                 "tau_choice": tau_choice,
+                "tau_success": tau_success,
                 "tau_done": tau_done,
                 "lookahead": lookahead,
             })
@@ -538,6 +544,7 @@ impl Speculation {
             report: Vec::new(),
             task: task.text.clone(),
             tau_choice,
+            tau_success,
             tau_done,
             started,
             ahead: Vec::new(),
@@ -709,7 +716,11 @@ impl Speculation {
         let mut written = self.take_branch()?;
         let outcome = written.outcome.clone();
         let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
-        let (tau_choice, tau_done) = (self.tau_choice, self.tau_done);
+        let tau = match outcome {
+            Outcome::Succeeded => self.tau_success,
+            Outcome::Failed(_) => self.tau_choice,
+        };
+        let tau_done = self.tau_done;
         let renames = self.renames.clone();
         let (reads, own) = (self.reads.clone(), self.report.clone());
         let reply = tokio::spawn(async move {
@@ -729,7 +740,7 @@ impl Speculation {
             if DECISION_MODEL.is_some() {
                 let index;
                 (reply, index, picked) =
-                    situation(&plan_id, &reply, state.clone(), tau_choice, &reads).await?;
+                    situation(&plan_id, &reply, state.clone(), tau, &reads).await?;
                 next = next.into_iter().skip(index).take(1).collect();
             }
             let reply = renamed(reply, &renames);
@@ -1515,6 +1526,7 @@ mod tests {
             report: Vec::new(),
             task: String::new(),
             tau_choice: super::TAU_CHOICE,
+            tau_success: super::TAU_CHOICE,
             tau_done: super::TAU_DONE,
             started: Instant::now(),
             ahead: Vec::new(),
