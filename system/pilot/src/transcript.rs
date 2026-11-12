@@ -233,10 +233,15 @@ fn path_for(session_id: &str) -> PathBuf {
             dir_name.push_str(&format!("%{byte:02X}"));
         }
     }
-    let root = std::env::var_os("ROBONIX_SESSION_DIR")
+    sessions_root().join(dir_name).join("transcript.jsonl")
+}
+
+/// Where Pilot keeps what outlives a process: `$ROBONIX_SESSION_DIR`, or
+/// `./sessions` when unset.
+pub(crate) fn sessions_root() -> PathBuf {
+    std::env::var_os("ROBONIX_SESSION_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("sessions"));
-    root.join(dir_name).join("transcript.jsonl")
+        .unwrap_or_else(|| PathBuf::from("sessions"))
 }
 
 /// A message's fields as stored in the transcript: the image, if any, becomes

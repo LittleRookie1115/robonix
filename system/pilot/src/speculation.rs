@@ -28,6 +28,7 @@
 //! situation whose reply only reads is used whatever the decision model's
 //! confidence, since a wrong pick costs one lookup.
 
+use crate::experience::Experience;
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
@@ -71,6 +72,8 @@ const MIN_FAILURE_RATE: f64 = 0.1;
 struct Timings {
     /// The longest successful call of each capability, by the name a reply calls it.
     calls: HashMap<String, Duration>,
+    /// What the calls Pilot has seen took, kept across restarts.
+    experience: Experience,
     /// How many calls of each capability ended, and how many of those failed.
     ended: HashMap<String, (u32, u32)>,
     /// About how long a request takes before its reply text begins.
@@ -80,13 +83,26 @@ struct Timings {
 }
 
 impl Timings {
-    /// How long a tree calling these capabilities is expected to run, once
-    /// each has been seen to finish.
-    fn expected<'a>(&self, capabilities: impl IntoIterator<Item = &'a str>) -> Option<Duration> {
-        capabilities
-            .into_iter()
-            .map(|capability| self.calls.get(capability))
-            .sum()
+    /// How long `steps`, each a capability and its arguments, are expected to
+    /// run from `from`, and where they leave the robot: from experience, or
+    /// without it from each capability's longest call this process, which knows
+    /// nothing of where the robot goes.
+    fn expected(
+        &self,
+        steps: &[(String, Value)],
+        from: Option<(f64, f64)>,
+        experienced: bool,
+    ) -> (Option<Duration>, Option<(f64, f64)>) {
+        if experienced {
+            let steps = steps
+                .iter()
+                .map(|(capability, args)| (capability.as_str(), args));
+            return self.experience.estimate(steps, from);
+        }
+        let longest = steps
+            .iter()
+            .map(|(capability, _)| self.calls.get(capability));
+        (longest.sum(), None)
     }
 
     /// How often a call of `capability` fails, estimated from its calls so far
@@ -98,7 +114,17 @@ impl Timings {
     }
 }
 
-static TIMINGS: LazyLock<Mutex<Timings>> = LazyLock::new(Mutex::default);
+static TIMINGS: LazyLock<Mutex<Timings>> = LazyLock::new(|| {
+    Mutex::new(Timings {
+        experience: Experience::load(&experience_path()),
+        ..Default::default()
+    })
+});
+
+/// Where Pilot keeps its experience between runs.
+fn experience_path() -> std::path::PathBuf {
+    crate::transcript::sessions_root().join("experience.json")
+}
 
 fn timings() -> std::sync::MutexGuard<'static, Timings> {
     TIMINGS.lock().unwrap_or_else(PoisonError::into_inner)
@@ -113,11 +139,61 @@ fn called(call: &CapabilityCall) -> String {
     )
 }
 
-/// Record that this call succeeded after `time`.
-pub(crate) fn took(call: &CapabilityCall, time: Duration) {
-    let mut timings = timings();
-    let longest = timings.calls.entry(called(call)).or_default();
-    *longest = time.max(*longest);
+/// Record that this call succeeded after `time` with `output`, and keep the
+/// experience it adds to.
+pub(crate) fn took(call: &CapabilityCall, time: Duration, output: &str) {
+    let saved = {
+        let mut timings = timings();
+        let name = called(call);
+        let longest = timings.calls.entry(name.clone()).or_default();
+        *longest = time.max(*longest);
+        timings.experience.record(&name, time, output);
+        timings.experience.saved()
+    };
+    let path = experience_path();
+    if let Err(error) = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, saved))
+    {
+        warn!(
+            "[pilot/segue] experience not saved to {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// The robot's position as the state view's Scene context gives it.
+pub(crate) fn located(scene: &Value) {
+    let state = &scene["state"];
+    if state["pose_known"] == true
+        && let (Some(x), Some(y)) = (state["x"].as_f64(), state["y"].as_f64())
+    {
+        timings().experience.locate((x, y));
+    }
+}
+
+/// A plan's calls as capability and arguments, in node order.
+fn plan_steps(plan: &Plan) -> Vec<(String, Value)> {
+    calls(plan)
+        .map(|(_, call)| {
+            let args = serde_json::from_str(&call.args_json).unwrap_or_default();
+            (called(call), args)
+        })
+        .collect()
+}
+
+/// A reply tree's steps as capability and arguments, in the order they are numbered.
+fn reply_steps(tree: &Value) -> Vec<(String, Value)> {
+    do_nodes(tree)
+        .into_iter()
+        .map(|node| {
+            (
+                node["cap"].as_str().unwrap_or("").to_string(),
+                node["args"].clone(),
+            )
+        })
+        .collect()
 }
 
 /// Record that this call ended, and whether it failed.
@@ -418,9 +494,12 @@ impl Speculation {
         reader: Reader,
         objects: Value,
     ) -> Option<Self> {
-        let names: Vec<String> = calls(plan).map(|(_, call)| called(call)).collect();
+        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
+        let experienced = context["experience"].as_bool().unwrap_or(true);
         // Long unless it is known to end before one reply could be written.
         let long;
+        // Where the robot will be once the tree ends, as far as is known.
+        let end;
         {
             let timings = timings();
             // A loop runs its body any number of times, so its calls' times bound nothing.
@@ -428,9 +507,10 @@ impl Speculation {
                 .nodes
                 .iter()
                 .any(|node| matches!(node.node_kind, RTDL_REPEAT | RTDL_WHILE));
-            let run = timings
-                .expected(names.iter().map(String::as_str))
-                .filter(|_| !looped);
+            let from = timings.experience.position();
+            let run;
+            (run, end) = timings.expected(&plan_steps(plan), from, experienced);
+            let run = run.filter(|_| !looped);
             long = run
                 .zip(timings.reply)
                 .is_none_or(|(run, reply)| run >= reply);
@@ -452,7 +532,6 @@ impl Speculation {
             }
         }
         let steps = steps_in_order(plan);
-        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let failures = failures_to_prepare(
             &timings(),
             plan,
@@ -481,6 +560,7 @@ impl Speculation {
             idle_timeout,
             reads: reads.clone(),
             reader,
+            experienced,
         });
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
@@ -510,8 +590,13 @@ impl Speculation {
                 } else {
                     0
                 };
-                let reply =
-                    tokio::spawn(prepare(request.clone(), messages, outcome.label(), ahead));
+                let reply = tokio::spawn(prepare(
+                    request.clone(),
+                    messages,
+                    outcome.label(),
+                    ahead,
+                    end,
+                ));
                 Branch {
                     outcome,
                     reply,
@@ -1156,6 +1241,8 @@ struct Request {
     reads: Arc<HashSet<String>>,
     /// Runs a prepared tree of those capabilities before its turn.
     reader: Reader,
+    /// Whether trees are timed from experience, the task's `experience`.
+    experienced: bool,
 }
 
 /// Whether a reply's tree calls something and only capabilities in `reads`.
@@ -1253,12 +1340,14 @@ async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
 }
 
 /// Write the reply for the outcome `label` names, then, while `ahead` trees
-/// further are allowed, the replies after the trees that reply would dispatch.
+/// further are allowed, the replies after the trees that reply would dispatch,
+/// which start from `from` as far as is known.
 fn prepare(
     request: Arc<Request>,
     messages: Vec<Message>,
     label: String,
     ahead: u64,
+    from: Option<(f64, f64)>,
 ) -> BoxFuture<'static, Result<Prepared, String>> {
     async move {
         let text = generate(&request, messages.clone(), &label)
@@ -1272,7 +1361,7 @@ fn prepare(
             })?;
         let next = match ahead {
             0 => Vec::new(),
-            _ => look_ahead(&request, messages, &text, &label, ahead - 1),
+            _ => look_ahead(&request, messages, &text, &label, ahead - 1, from),
         };
         Ok(Prepared {
             text,
@@ -1297,13 +1386,15 @@ fn do_nodes(node: &Value) -> Vec<&Value> {
 
 /// For each reply in `text`, start preparing the reply after the tree it
 /// dispatches, if that tree is expected to end before a reply could be written
-/// while it runs. `messages` is the request `text` answered.
+/// while it runs. `messages` is the request `text` answered; the trees start
+/// from `from` as far as is known.
 fn look_ahead(
     request: &Arc<Request>,
     messages: Vec<Message>,
     text: &str,
     label: &str,
     ahead: u64,
+    from: Option<(f64, f64)>,
 ) -> Vec<Option<Ahead>> {
     let Ok(written) = serde_json::from_str::<Value>(text) else {
         return Vec::new();
@@ -1322,9 +1413,13 @@ fn look_ahead(
         if nodes.is_empty() {
             return None;
         }
-        let (run, write) = {
+        let ((run, end), write) = {
             let timings = timings();
-            (timings.expected(names.clone()), timings.reply)
+            let steps = reply_steps(&reply["rtdl"]);
+            (
+                timings.expected(&steps, from, request.experienced),
+                timings.reply,
+            )
         };
         let short = run.zip(write).is_some_and(|(run, write)| run < write);
         // A tree that only reads is short whatever was timed, and can run now.
@@ -1395,7 +1490,7 @@ fn look_ahead(
                 false,
             );
             messages.push(Message::user(&ask));
-            let prepared = prepare(request, messages, label, ahead).await?;
+            let prepared = prepare(request, messages, label, ahead, end).await?;
             Ok(Prepared { read, ..prepared })
         });
         Some(Ahead {
@@ -1730,14 +1825,21 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_is_expected_to_take_what_its_calls_took_once_all_were_seen() {
+    fn without_experience_a_tree_takes_its_calls_longest_times_once_all_were_seen() {
         let seconds = std::time::Duration::from_secs;
         let timings = super::Timings {
             calls: HashMap::from([("a".into(), seconds(1)), ("b".into(), seconds(30))]),
             ..Default::default()
         };
-        assert_eq!(timings.expected(["a", "b", "a"]), Some(seconds(32)));
-        assert_eq!(timings.expected(["a", "never seen"]), None);
+        let steps = |names: &[&str]| -> Vec<(String, serde_json::Value)> {
+            names
+                .iter()
+                .map(|name| (name.to_string(), serde_json::Value::Null))
+                .collect()
+        };
+        let longest = |names: &[&str]| timings.expected(&steps(names), None, false).0;
+        assert_eq!(longest(&["a", "b", "a"]), Some(seconds(32)));
+        assert_eq!(longest(&["a", "never seen"]), None);
     }
 
     #[test]

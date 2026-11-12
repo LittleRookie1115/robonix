@@ -188,7 +188,8 @@ impl StreamExecution {
                 .clock
                 .ended(node.node_index, node.state, Instant::now())
             {
-                crate::speculation::took(call, time);
+                let output = node.leaf_result.as_ref().map_or("", |r| r.output.as_str());
+                crate::speculation::took(call, time, output);
             }
             // A cancellation is Pilot's doing, not the capability failing.
             let failed = [RtdlNodeStateEnum::Failed, RtdlNodeStateEnum::Timeout]

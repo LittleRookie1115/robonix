@@ -1657,8 +1657,9 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        let (environment_block, map_regions, objects) =
+        let (environment_block, map_regions, state) =
             state_context::collect(executor, atlas, &cap_list, state_view).await;
+        speculation::located(&state["scene"]);
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
             .ok()
@@ -1864,7 +1865,7 @@ pub async fn run_turn(
                             Err("request answered first".to_string())
                         }
                     };
-                    reply.and_then(|reply| Ok((spec.validate(reply, &objects)?, branch)))
+                    reply.and_then(|reply| Ok((spec.validate(reply, &state["objects"])?, branch)))
                 }
             };
             match reply {
@@ -2318,7 +2319,7 @@ pub async fn run_turn(
                         seen,
                         vlm_idle_timeout(),
                         reader,
-                        objects.clone(),
+                        state["objects"].clone(),
                     )
                 });
         }
