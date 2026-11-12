@@ -30,6 +30,13 @@ def _words(obj: Any) -> set[str]:
     return _tokens(f"{getattr(obj, 'label', '')} {getattr(obj, 'caption', '')}")
 
 
+def _matches(want: set[str], obj: Any) -> bool:
+    """Whether the object answers to every word asked for, or the words asked
+    for name its whole class: "red bull" is not a red_bell_pepper, while
+    "pepper" is one and "kitchen trash bin" is a trash_bin."""
+    return want <= _words(obj) or _tokens(getattr(obj, "label", "")) <= want
+
+
 def _edge_holds(edges: list, subject_id: str, relation: str, anchor_id: str) -> bool:
     return any(e.source_id == subject_id and e.relation == relation
                and e.target_id == anchor_id and e.shown_on_map() for e in edges)
@@ -43,7 +50,7 @@ def find(objects: dict, *, label: str = "", region: str = "", relation: str = ""
             if not o.missing and not o.attributes.get("is_robot")]
     if label:
         want = _tokens(label)
-        pool = [o for o in pool if want & _words(o)]
+        pool = [o for o in pool if _matches(want, o)]
         if not pool:
             return [], f"no object matches {label!r}"
     if region:
