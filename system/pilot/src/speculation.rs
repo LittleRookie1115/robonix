@@ -12,11 +12,14 @@
 //! dispatches nothing is used only if the decision model finds it supported by
 //! the step results. The questions start as soon as the tree ends.
 //!
-//! When to prepare follows from how long things take, which Pilot learns as
-//! it runs: a tree expected to end before a reply could be written is not
-//! prepared for while it runs, and with `lookahead` above 1 in `context_json`,
-//! a success reply that would dispatch such a tree has that tree's reply
-//! prepared ahead, while the tree before it still runs.
+//! What to prepare follows from how long things take and how often they
+//! fail, which Pilot learns as it runs. A tree expected to end before a reply
+//! could be written is not prepared for while it runs; instead, a success reply
+//! that would dispatch such a tree has that tree's reply prepared ahead, while
+//! the tree before it still runs, up to three trees along (`lookahead` in
+//! `context_json` sets another limit). A step's failure is prepared for only if
+//! its capability has failed often enough to be worth a request
+//! (`branch_budget`).
 //!
 //! Capabilities a task lists under `read_only` in `context_json` change
 //! nothing, so a tree of them may run before its turn: a reply that would
@@ -52,12 +55,24 @@ const MAX_BRANCHES: usize = 4;
 /// for a branch to finish or to be dropped.
 static SLOTS: Semaphore = Semaphore::const_new(MAX_BRANCHES);
 
+/// Trees along the success path that may be prepared for at once, unless a
+/// task's `lookahead` says otherwise. Each one past the first is prepared only
+/// when the tree before it is expected too short to hide its reply's writing.
+const LOOKAHEAD: u64 = 3;
+
+/// Least estimated failure rate of a step's capability for that failure to be
+/// prepared for. A branch costs a request and a slot whether it is used or not,
+/// so below one use in ten it mostly delays the requests prepared ahead.
+const MIN_FAILURE_RATE: f64 = 0.1;
+
 /// How long things have taken in this Pilot process, which decides whether a
 /// reply can be prepared before a tree ends.
 #[derive(Default)]
 struct Timings {
     /// The longest successful call of each capability, by the name a reply calls it.
     calls: HashMap<String, Duration>,
+    /// How many calls of each capability ended, and how many of those failed.
+    ended: HashMap<String, (u32, u32)>,
     /// About how long a request takes before its reply text begins.
     first_text: Option<Duration>,
     /// About how long a prepared reply takes to write in full.
@@ -72,6 +87,14 @@ impl Timings {
             .into_iter()
             .map(|capability| self.calls.get(capability))
             .sum()
+    }
+
+    /// How often a call of `capability` fails, estimated from its calls so far
+    /// with one failure and one success assumed beforehand, so a capability
+    /// not yet seen counts as failing half the time.
+    fn failure_rate(&self, capability: &str) -> f64 {
+        let (ended, failed) = self.ended.get(capability).copied().unwrap_or_default();
+        f64::from(failed + 1) / f64::from(ended + 2)
     }
 }
 
@@ -95,6 +118,14 @@ pub(crate) fn took(call: &CapabilityCall, time: Duration) {
     let mut timings = timings();
     let longest = timings.calls.entry(called(call)).or_default();
     *longest = time.max(*longest);
+}
+
+/// Record that this call ended, and whether it failed.
+pub(crate) fn finished(call: &CapabilityCall, failed: bool) {
+    let mut timings = timings();
+    let (ended, failures) = timings.ended.entry(called(call)).or_default();
+    *ended += 1;
+    *failures += u32::from(failed);
 }
 
 /// What a prepared reply asks for instead of a plan when it cannot be written
@@ -332,6 +363,32 @@ fn steps_in_order(plan: &Plan) -> Vec<(u32, String)> {
     }
 }
 
+/// The steps whose failure to prepare for, most likely first, as op_id and the
+/// estimated failure rate of the capability each calls: with `budget`, those
+/// failing at least `MIN_FAILURE_RATE` of the time; without it, every step in
+/// order. At most one branch fewer than `MAX_BRANCHES`, leaving one for success.
+fn failures_to_prepare(
+    timings: &Timings,
+    plan: &Plan,
+    steps: &[(u32, String)],
+    budget: bool,
+) -> Vec<(String, f64)> {
+    let mut failures: Vec<(String, f64)> = steps
+        .iter()
+        .map(|(index, op_id)| {
+            let call = plan.nodes[*index as usize].call.as_ref();
+            let rate = call.map_or(1.0, |call| timings.failure_rate(&called(call)));
+            (op_id.clone(), rate)
+        })
+        .filter(|(_, rate)| !budget || *rate >= MIN_FAILURE_RATE)
+        .collect();
+    if budget {
+        failures.sort_by(|a, b| b.1.total_cmp(&a.1));
+    }
+    failures.truncate(MAX_BRANCHES - 1);
+    failures
+}
+
 /// A tree's capability calls, in node order.
 fn calls(plan: &Plan) -> impl Iterator<Item = (&RtdlNode, &CapabilityCall)> {
     plan.nodes
@@ -391,16 +448,20 @@ impl Speculation {
             }
         }
         let steps = steps_in_order(plan);
-        let outcomes = std::iter::once(Outcome::Succeeded)
-            .chain(
-                steps
-                    .iter()
-                    .map(|(_, op_id)| Outcome::Failed(op_id.clone())),
-            )
-            .take(MAX_BRANCHES);
+        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
+        let failures = failures_to_prepare(
+            &timings(),
+            plan,
+            &steps,
+            context["branch_budget"].as_bool().unwrap_or(true),
+        );
+        let outcomes = std::iter::once(Outcome::Succeeded).chain(
+            failures
+                .iter()
+                .map(|(op_id, _)| Outcome::Failed(op_id.clone())),
+        );
         // Only a decision model reading the real results can choose between situations.
         let situations = DECISION_MODEL.is_some();
-        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let listed = context["read_only"].as_array();
         let contracts = listed.into_iter().flatten().filter_map(Value::as_str);
         let reads: Arc<HashSet<String>> =
@@ -420,10 +481,7 @@ impl Speculation {
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
-        let lookahead = context
-            .get("lookahead")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
+        let lookahead = context["lookahead"].as_u64().unwrap_or(LOOKAHEAD);
         let tree = format!(
             "RTDL plan {} ({:?})",
             plan.plan_id, plan.nodes[0].description
@@ -462,6 +520,7 @@ impl Speculation {
                 "event": "start",
                 "plan_id": plan.plan_id,
                 "branches": branches.iter().map(|b| b.outcome.label()).collect::<Vec<_>>(),
+                "failure_rates": failures.iter().cloned().collect::<HashMap<_, _>>(),
                 "decision_model": DECISION_MODEL.as_ref().map(|m| &m.model),
                 "tau_choice": tau_choice,
                 "tau_done": tau_done,
@@ -1667,6 +1726,45 @@ mod tests {
         };
         assert_eq!(timings.expected(["a", "b", "a"]), Some(seconds(32)));
         assert_eq!(timings.expected(["a", "never seen"]), None);
+    }
+
+    #[test]
+    fn only_the_failures_of_steps_that_fail_often_enough_are_prepared_for() {
+        let step = |contract: &str| RtdlNode {
+            node_kind: RTDL_DO,
+            call: Some(CapabilityCall {
+                provider_id: "x".into(),
+                contract_id: contract.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = Plan {
+            nodes: vec![
+                RtdlNode::default(),
+                step("robonix/system/scene/find"),
+                step("robonix/service/navigation/navigate"),
+                step("robonix/skill/manipulation/pick"),
+            ],
+            ..Default::default()
+        };
+        let steps: Vec<(u32, String)> = (1..=3).map(|i| (i, format!("p-{i}"))).collect();
+        // find never failed in 20 calls, navigate once in 10, and pick was never seen.
+        let timings = super::Timings {
+            ended: HashMap::from([
+                ("x.scene_find".into(), (20, 0)),
+                ("x.navigation_navigate".into(), (10, 1)),
+            ]),
+            ..Default::default()
+        };
+        let picked = |budget| -> Vec<String> {
+            super::failures_to_prepare(&timings, &plan, &steps, budget)
+                .into_iter()
+                .map(|(op_id, _)| op_id)
+                .collect()
+        };
+        assert_eq!(picked(true), ["p-3", "p-2"]);
+        assert_eq!(picked(false), ["p-1", "p-2", "p-3"]);
     }
 
     #[tokio::test]

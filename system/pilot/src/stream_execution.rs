@@ -182,12 +182,21 @@ impl StreamExecution {
             None => None,
         };
         if let Some(node) = event.as_ref().and_then(|event| event.node_state.as_ref())
-            && let Some(time) = self
-                .clock
-                .ended(node.node_index, node.state, Instant::now())
             && let Some(call) = self.plan.nodes[node.node_index as usize].call.as_ref()
         {
-            crate::speculation::took(call, time);
+            if let Some(time) = self
+                .clock
+                .ended(node.node_index, node.state, Instant::now())
+            {
+                crate::speculation::took(call, time);
+            }
+            // A cancellation is Pilot's doing, not the capability failing.
+            let failed = [RtdlNodeStateEnum::Failed, RtdlNodeStateEnum::Timeout]
+                .map(|state| state as u32)
+                .contains(&node.state);
+            if failed || node.state == RtdlNodeStateEnum::Succeeded as u32 {
+                crate::speculation::finished(call, failed);
+            }
         }
         Ok(event)
     }
