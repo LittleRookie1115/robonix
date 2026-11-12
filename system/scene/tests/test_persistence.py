@@ -469,6 +469,19 @@ def test_find_filters_by_label_and_relation():
                                       anchor=sofa.object_id, edges=near)[0]] == [b.object_id]
     assert find(objs, label="lamp")[1]
 
+
+def test_find_matches_every_word_asked_for_or_the_whole_class():
+    from scene_service.find import find
+    reg = ObjectRegistry()
+    objs = {o.object_id: o for o in (_live(reg, c, float(i)) for i, c in enumerate(
+        ("red_bull", "red_bell_pepper", "black_shirt", "trash_bin")))}
+    labels = lambda query: sorted(o.label for o in find(objs, label=query)[0])
+    assert labels("red bull") == ["red_bull"]
+    assert labels("blue shirt") == []
+    assert labels("pepper") == ["red_bell_pepper"]
+    assert labels("red") == ["red_bell_pepper", "red_bull"]
+    assert labels("kitchen trash bin") == ["trash_bin"]
+
 def test_a_crop_of_the_wall_behind_is_not_a_view():
     import numpy as np
     from scene_service.object_views import looks_like
