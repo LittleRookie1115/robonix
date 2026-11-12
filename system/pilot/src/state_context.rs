@@ -44,13 +44,15 @@ fn goals() -> std::sync::MutexGuard<'static, Goals> {
 /// blocks: what changes from round to round (where the robot is and the
 /// objects Scene knows, by region), and the map's regions with a
 /// navigate-ready goal each, which a caller shows only when it changes.
-/// Without `view`, only where the robot is, and no map block.
+/// Third, those objects as the first block lists them, for checking a reply
+/// written from it. Without `view`, only where the robot is, no map block and
+/// no objects.
 pub async fn collect(
     executor: &ExecutorConn,
     atlas: &mut AtlasClient,
     caps: &[(String, atlas_pb::Capability)],
     view: bool,
-) -> (String, String) {
+) -> (String, String, Value) {
     let query = |contract: &'static str, args: Value| {
         let provider = caps
             .iter()
@@ -95,7 +97,7 @@ pub async fn collect(
     if !view {
         let scene = query(SCENE_CONTEXT, json!({})).await;
         let state = json!({"scene": scene, "provider_availability": providers});
-        return (environment(&state, ""), String::new());
+        return (environment(&state, ""), String::new(), Value::Null);
     }
     let (scene, regions) = tokio::join!(
         query(SCENE_CONTEXT, json!({})),
@@ -179,7 +181,7 @@ pub async fn collect(
          changes.\n\n{}\n",
         named(&regions, &known)
     );
-    (environment(&state, objects), map)
+    (environment(&state, objects), map, state["objects"].clone())
 }
 
 /// The environment block around `state`, with `objects` saying what its objects are.

@@ -303,6 +303,12 @@ pub(crate) struct Speculation {
     renames: Vec<(String, String)>,
     /// The task's read-only capabilities, by the name after the provider's.
     reads: Arc<HashSet<String>>,
+    /// The objects Scene knew, by region, in the state the replies were
+    /// written from: a reply that names one relies on it being there.
+    objects: Value,
+    /// Whether a reply naming an object that has since moved is cut or
+    /// dropped, rather than only logged; the task's `read_set`, on by default.
+    read_set: bool,
 }
 
 /// The `do` steps of a tree that run one after another under its root, as node
@@ -339,6 +345,8 @@ impl Speculation {
     /// `prefix` is the request the next planning round would send, up to where
     /// the tree's results would go. `None` if the tree is expected to end
     /// before a prepared reply could answer sooner than that round's request.
+    /// `objects` are Scene's objects by region in the state `prefix` shows.
+    #[allow(clippy::too_many_arguments)] // Each is a different part of the round it is started from.
     pub(crate) fn start(
         vlm: &VlmClient,
         plan: &Plan,
@@ -347,6 +355,7 @@ impl Speculation {
         messages_seen: usize,
         idle_timeout: Duration,
         reader: Reader,
+        objects: Value,
     ) -> Option<Self> {
         let names: Vec<String> = calls(plan).map(|(_, call)| called(call)).collect();
         // Long unless it is known to end before one reply could be written.
@@ -475,6 +484,8 @@ impl Speculation {
             ahead: Vec::new(),
             renames: Vec::new(),
             reads,
+            objects,
+            read_set: context["read_set"].as_bool().unwrap_or(true),
         })
     }
 
@@ -690,6 +701,52 @@ impl Speculation {
         })
     }
 
+    /// `reply` checked against the objects it was written from, which Scene
+    /// now places as `objects` says. A tree that names an object which has
+    /// since left its region, or Scene's list, is cut before the first of its
+    /// top-level nodes that names one, and comes with a note saying so; with
+    /// nothing left that acts, the reply is not used. With the task's
+    /// `read_set` off, this only logs what it would do.
+    pub(crate) fn validate(
+        &self,
+        reply: String,
+        objects: &Value,
+    ) -> Result<(String, Option<String>), String> {
+        let mut envelope: Value =
+            serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+        let moved = moved(&envelope["rtdl"], &self.objects, objects);
+        if moved.is_empty() {
+            return Ok((reply, None));
+        }
+        let kept = cut(&mut envelope["rtdl"], &moved, &self.reads);
+        info!(
+            "[pilot/segue] {}",
+            json!({
+                "event": "read_set",
+                "plan_id": self.plan_id,
+                "moved": moved,
+                "kept": kept,
+                "applied": self.read_set,
+            })
+        );
+        if !self.read_set {
+            return Ok((reply, None));
+        }
+        let changes: Vec<&str> = moved.iter().map(|(_, change)| change.as_str()).collect();
+        let changes = changes.join("; ");
+        match kept {
+            None => Err(format!("read set changed: {changes}")),
+            Some(kept) => Ok((
+                envelope.to_string(),
+                Some(format!(
+                    "Pilot dispatched only the first {kept} top-level node(s) of the tree \
+                     above: since it was written, {changes}. The rest did not run; plan it from \
+                     the current environment."
+                )),
+            )),
+        }
+    }
+
     /// Log why the prepared replies go unused; dropping them aborts their requests.
     pub(crate) fn discard(self, reason: &str) {
         info!(
@@ -846,6 +903,68 @@ async fn decide(
 /// Whether a prepared reply's RTDL tree dispatches any step.
 fn dispatches(node: &Value) -> bool {
     !do_nodes(node).is_empty()
+}
+
+/// Each object's region in `objects`, as `state_context` lists them.
+fn placed(objects: &Value) -> HashMap<&str, &str> {
+    let regions = objects.as_object().into_iter().flatten();
+    regions
+        .flat_map(|(region, listed)| {
+            let listed = listed.as_array().into_iter().flatten();
+            listed.filter_map(move |object| Some((object["id"].as_str()?, region.as_str())))
+        })
+        .collect()
+}
+
+/// The objects `tree` names that `then` placed and `now` places in another
+/// region or not at all, each with what changed. Nothing when `now` places
+/// no object, since Scene's state is then unknown rather than changed.
+fn moved(tree: &Value, then: &Value, now: &Value) -> Vec<(String, String)> {
+    let (then, now) = (placed(then), placed(now));
+    if now.is_empty() {
+        return Vec::new();
+    }
+    let text = tree.to_string();
+    let mut moved: Vec<(String, String)> = then
+        .iter()
+        .filter(|(id, _)| names(&text, id))
+        .filter(|(id, region)| now.get(*id) != Some(*region))
+        .map(|(id, region)| {
+            let change = match now.get(id) {
+                Some(now) => format!("{id} moved from {region} to {now}"),
+                None => format!("{id}, in {region} then, is no longer among Scene's objects"),
+            };
+            (id.to_string(), change)
+        })
+        .collect();
+    moved.sort();
+    moved
+}
+
+/// Whether JSON `text` has `id` as a whole string value.
+fn names(text: &str, id: &str) -> bool {
+    text.contains(&format!("\"{id}\""))
+}
+
+/// Cut `tree`, a sequence, before its first top-level node that names an
+/// object in `moved`, and return how many nodes are left. `None`, leaving
+/// `tree` whole, unless what is left calls something outside `reads`.
+fn cut(tree: &mut Value, moved: &[(String, String)], reads: &HashSet<String>) -> Option<usize> {
+    if tree["op"] != "sequence" {
+        return None;
+    }
+    let naming = |node: &Value| {
+        let text = node.to_string();
+        moved.iter().any(|(id, _)| names(&text, id))
+    };
+    let kept = tree["children"].as_array()?.iter().position(naming)?;
+    let mut left = tree.clone();
+    left["children"].as_array_mut()?.truncate(kept);
+    if !dispatches(&left) || reads_only(&left, reads) {
+        return None;
+    }
+    *tree = left;
+    Some(kept)
 }
 
 /// Whether a prepared reply declined to plan without the real outputs.
@@ -1342,6 +1461,8 @@ mod tests {
             ahead: Vec::new(),
             renames: Vec::new(),
             reads: Default::default(),
+            objects: serde_json::Value::Null,
+            read_set: true,
         }
     }
 
@@ -1648,5 +1769,93 @@ mod tests {
             &json!({"op": "sequence", "children": []})
         ));
         assert!(!super::dispatches(&serde_json::Value::Null));
+    }
+
+    /// Scene's objects by region, as `state_context` lists them.
+    fn objects(regions: &[(&str, &[&str])]) -> serde_json::Value {
+        let listed = |ids: &[&str]| -> serde_json::Value {
+            ids.iter()
+                .map(|id| serde_json::json!({"id": id, "label": "toothpaste"}))
+                .collect()
+        };
+        regions
+            .iter()
+            .map(|(region, ids)| (region.to_string(), listed(ids)))
+            .collect()
+    }
+
+    /// Go to the kitchen, approach object `o1`, pick it up.
+    fn fetch() -> serde_json::Value {
+        use serde_json::json;
+        let call =
+            |cap: &str, args: serde_json::Value| json!({"op": "do", "cap": cap, "args": args});
+        json!({"op": "sequence", "children": [
+            call("nav2.navigation_navigate", json!({"goal": {"x": 1.0}})),
+            call("scene.scene_goal_near", json!({"object_id": "o1"})),
+            call("manipulation.manipulation_pick", json!({"object": "toothpaste"})),
+        ]})
+    }
+
+    #[test]
+    fn a_tree_relies_only_on_the_objects_it_names_staying_in_their_region() {
+        let then = objects(&[("kitchen", &["o1", "o2"]), ("elsewhere", &[])]);
+        let tree = fetch();
+        assert!(super::moved(&tree, &then, &then).is_empty());
+        // Another object moving, or one appearing, changes nothing the tree read.
+        let others = objects(&[("kitchen", &["o1", "o3"]), ("elsewhere", &["o2"])]);
+        assert!(super::moved(&tree, &then, &others).is_empty());
+        let gone = objects(&[("kitchen", &["o2"]), ("elsewhere", &[])]);
+        let moved = super::moved(&tree, &then, &gone);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].0, "o1");
+        let elsewhere = objects(&[("kitchen", &["o2"]), ("bedroom", &["o1"])]);
+        assert_eq!(super::moved(&tree, &then, &elsewhere).len(), 1);
+        // With no objects known now, Scene's state is unknown rather than changed.
+        assert!(super::moved(&tree, &then, &serde_json::Value::Null).is_empty());
+        // An id inside a longer string is not a name.
+        let tree = serde_json::json!({"op": "do", "cap": "x", "args": {"note": "near o1 here"}});
+        assert!(super::moved(&tree, &then, &gone).is_empty());
+    }
+
+    #[test]
+    fn a_tree_is_cut_before_the_node_that_names_a_moved_object() {
+        let moved = [("o1".to_string(), "o1 is gone".to_string())];
+        let mut tree = fetch();
+        assert_eq!(super::cut(&mut tree, &moved, &Default::default()), Some(1));
+        assert_eq!(tree["children"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["children"][0]["cap"], "nav2.navigation_navigate");
+        // What is left only reads, so the tree stays whole and is not used.
+        let reads = ["navigation_navigate".to_string()].into_iter().collect();
+        let mut tree = fetch();
+        assert_eq!(super::cut(&mut tree, &moved, &reads), None);
+        assert_eq!(tree, fetch());
+        // Nothing is left before the first node that names it.
+        let mut tree = fetch();
+        tree["children"].as_array_mut().unwrap().remove(0);
+        assert_eq!(super::cut(&mut tree, &moved, &Default::default()), None);
+        let mut lone = fetch()["children"][1].clone();
+        assert_eq!(super::cut(&mut lone, &moved, &Default::default()), None);
+    }
+
+    #[tokio::test]
+    async fn a_reply_naming_a_moved_object_is_cut_only_with_read_set_on() {
+        let reply = serde_json::json!({"content": "", "rtdl": fetch()}).to_string();
+        let then = objects(&[("kitchen", &["o1"])]);
+        let gone = objects(&[("kitchen", &["o2"])]);
+        let spec = Speculation {
+            objects: then.clone(),
+            ..three_steps()
+        };
+        let (kept, note) = spec.validate(reply.clone(), &then).unwrap();
+        assert_eq!((kept.as_str(), note), (reply.as_str(), None));
+        let (cut, note) = spec.validate(reply.clone(), &gone).unwrap();
+        let cut: serde_json::Value = serde_json::from_str(&cut).unwrap();
+        assert_eq!(cut["rtdl"]["children"].as_array().unwrap().len(), 1);
+        assert!(note.is_some());
+        let off = Speculation {
+            read_set: false,
+            ..spec
+        };
+        assert_eq!(off.validate(reply.clone(), &gone).unwrap(), (reply, None));
     }
 }

@@ -1647,7 +1647,7 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        let (environment_block, map_regions) =
+        let (environment_block, map_regions, objects) =
             state_context::collect(executor, atlas, &cap_list, state_view).await;
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
@@ -1804,6 +1804,8 @@ pub async fn run_turn(
         let mut prepared = None;
         // What a used reply had prepared ahead for the tree it dispatches.
         let mut ahead = None;
+        // Why a used reply's tree was cut short, for the planner to read after it.
+        let mut cut_note = None;
         let mut request: Option<BoxFuture<Result<BoxStream<Result<VlmStreamItem>>>>> = None;
         if let Some((spec, settled)) = pending {
             turn_steps.extend_from_slice(spec.report());
@@ -1852,14 +1854,15 @@ pub async fn run_turn(
                             Err("request answered first".to_string())
                         }
                     };
-                    reply.map(|reply| (reply, branch))
+                    reply.and_then(|reply| Ok((spec.validate(reply, &objects)?, branch)))
                 }
             };
             match reply {
-                Ok((reply, mut branch)) => {
+                Ok(((reply, note), mut branch)) => {
                     let outputs = spec.outputs().clone();
                     ahead = spec.commit(&mut branch, waiting.elapsed());
                     prepared = Some((reply, outputs));
+                    cut_note = note;
                 }
                 Err(reason) => spec.discard(&reason),
             }
@@ -2162,6 +2165,9 @@ pub async fn run_turn(
             history.push(Message::assistant(&assistant_content));
             last_content = assistant_content.clone();
         }
+        if let Some(note) = cut_note.take() {
+            history.push(Message::user(&note));
+        }
         // File the reply's messages, attach its tree to its task, then apply
         // its updates: a task cannot close while its own tree runs.
         let (_, owner) = apply_task_fields(
@@ -2294,7 +2300,16 @@ pub async fn run_turn(
                         targets: target_map.clone(),
                         graph: executor.graph.clone(),
                     };
-                    Speculation::start(vlm, &graph, prefix, task, seen, vlm_idle_timeout(), reader)
+                    Speculation::start(
+                        vlm,
+                        &graph,
+                        prefix,
+                        task,
+                        seen,
+                        vlm_idle_timeout(),
+                        reader,
+                        objects.clone(),
+                    )
                 });
         }
     }
