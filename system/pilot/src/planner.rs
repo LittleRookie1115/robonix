@@ -641,6 +641,10 @@ async fn drive_plan(
     let mut canceled = false;
     let mut completed = false;
     let mut replan_on_completion = true;
+    // A failure under a fallback's earlier alternatives starts no round when it
+    // happens, since the fallback takes it; if the tree fails anyway, its end must.
+    let absorbed = fallback_descendants(&execution.plan);
+    let mut escalated = false;
     loop {
         let next = if let Some(event) = execution.events.pop_front() {
             Ok(Some(event))
@@ -688,7 +692,9 @@ async fn drive_plan(
                     if is_terminal_executor_state(ns.state) {
                         forest_revision.fetch_add(1, Ordering::Release);
                         if ns.leaf_result.is_some() || failed_without_leaf_result {
-                            replan_on_completion = ns.state == RtdlNodeStateEnum::Succeeded as u32;
+                            let succeeded = ns.state == RtdlNodeStateEnum::Succeeded as u32;
+                            replan_on_completion = succeeded;
+                            escalated |= !succeeded && !absorbed.contains(&ns.node_index);
                         }
                         if ns.state == RtdlNodeStateEnum::Canceled as u32 {
                             // Cancellation is not a failure to recover from — it
@@ -718,7 +724,11 @@ async fn drive_plan(
         }
     }
 
-    let replan = replan_on_completion || canceled || !completed || execution.transport_failed;
+    let replan = replan_on_completion
+        || (any_failed && !escalated)
+        || canceled
+        || !completed
+        || execution.transport_failed;
     forest_revision.fetch_add(1, Ordering::Release);
     let _ = interrupt_tx.send(TreeInterrupt::Completion {
         plan_id,
@@ -4094,6 +4104,61 @@ mod tests {
             }
             assert!(batch_seen, "failure evidence must still reach the client");
         }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_that_fails_without_its_last_alternative_replans_at_its_end() {
+        use crate::pb::executor::{RtdlEvent, RtdlPlanComplete};
+        // The first alternative fails only once verified, after the fallback has
+        // already skipped the second: nothing escalated, yet the tree failed.
+        let mut execution = crate::stream_execution::StreamExecution::default();
+        execution.plan.plan_id = "fallback".into();
+        execution.plan.nodes = vec![
+            RtdlNode {
+                node_kind: super::RTDL_FALLBACK,
+                children: vec![1, 2],
+                ..Default::default()
+            },
+            RtdlNode::default(),
+            RtdlNode::default(),
+        ];
+        let state = |node_index, state: RtdlNodeStateEnum, leaf: bool| RtdlEvent {
+            event_kind: super::RtdlEventEnum::NodeState as u32,
+            node_state: Some(RtdlNodeState {
+                node_index,
+                state: state as u32,
+                leaf_result: leaf.then(CapabilityCallResult::default),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        execution.events.extend([
+            state(2, RtdlNodeStateEnum::Canceled, false),
+            state(1, RtdlNodeStateEnum::Failed, true),
+            state(0, RtdlNodeStateEnum::Failed, false),
+            RtdlEvent {
+                event_kind: super::RtdlEventEnum::PlanComplete as u32,
+                plan_complete: Some(RtdlPlanComplete {
+                    any_failed: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ]);
+        let mut forest = super::SessionForest::default();
+        super::drive_plan(
+            execution,
+            forest.interrupt_tx.clone(),
+            forest.revision.clone(),
+        )
+        .await;
+        let mut replan = None;
+        while let Ok(event) = forest.interrupt_rx.try_recv() {
+            if let super::TreeInterrupt::Completion { replan: r, .. } = event {
+                replan = Some(r);
+            }
+        }
+        assert_eq!(replan, Some(true));
     }
 
     #[test]
