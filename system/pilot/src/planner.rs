@@ -1865,7 +1865,13 @@ pub async fn run_turn(
                             Err("request answered first".to_string())
                         }
                     };
-                    reply.and_then(|reply| Ok((spec.validate(reply, &state["objects"])?, branch)))
+                    match reply {
+                        Ok(reply) => spec
+                            .validate(reply, &state["objects"])
+                            .await
+                            .map(|checked| (checked, branch)),
+                        Err(reason) => Err(reason),
+                    }
                 }
             };
             match reply {

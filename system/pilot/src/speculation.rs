@@ -222,6 +222,15 @@ const CHOICE: &str = "The plan prepared a next move for each situation below. Us
 const NONE_OF_THEM: &str = "以上情况都不符合，或者从结果里看不出是哪一种";
 const DONE: &str = "Do the step results in State support every claim in the final reply, and \
                     does that reply finish everything the task asked for?";
+const FITS: &str = "The plan was about to search for searched_for. Does any object in \
+                    newly_listed plainly fit what the task asks to find or act on, so that \
+                    searching elsewhere is unnecessary?";
+
+/// Least p(yes) that a newly listed object fits the task for a prepared search
+/// to be set aside: setting one aside costs a planning request, while searching
+/// elsewhere for what is already listed costs a trip, so a doubt sets it aside.
+/// Not calibrated; each answer is logged as a `decide` record.
+const NEW_FITS: f64 = 0.3;
 
 /// The decision model, if `TYPESAFE_BASE_URL` names one.
 static DECISION_MODEL: LazyLock<Option<DecisionModel>> = LazyLock::new(DecisionModel::from_env);
@@ -862,7 +871,7 @@ impl Speculation {
     /// top-level nodes that names one, and comes with a note saying so; with
     /// nothing left that acts, the reply is not used. With the task's
     /// `read_set` off, this only logs what it would do.
-    pub(crate) fn validate(
+    pub(crate) async fn validate(
         &self,
         reply: String,
         objects: &Value,
@@ -870,12 +879,15 @@ impl Speculation {
         let mut envelope: Value =
             serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
         let moved = moved(&envelope["rtdl"], &self.objects, objects);
-        // A search was planned for what Scene did not list then; once Scene lists more,
-        // it may look elsewhere for what is now known, so the reply is not used.
-        let new = match searches(&envelope["rtdl"]) {
+        // A search was planned for what Scene did not list then; once Scene lists an
+        // object that fits what the task looks for, the reply is not used.
+        let mut new = match searches(&envelope["rtdl"]) {
             true => listed_since(&self.objects, objects),
             false => Vec::new(),
         };
+        if !new.is_empty() && !self.fits(&envelope["rtdl"], &new).await {
+            new.clear();
+        }
         if moved.is_empty() && new.is_empty() {
             return Ok((reply, None));
         }
@@ -915,6 +927,38 @@ impl Speculation {
                      the current environment."
                 )),
             )),
+        }
+    }
+
+    /// Whether one of the `new` objects Scene lists ("<label> in <region>") fits
+    /// what `tree`'s search or the task looks for. A label that answers to
+    /// every word searched for, or whose words the search names in full, fits
+    /// at once; otherwise the decision model judges, and without one any new
+    /// object counts.
+    async fn fits(&self, tree: &Value, new: &[String]) -> bool {
+        let searched: Vec<&str> = do_nodes(tree)
+            .into_iter()
+            .filter(|node| {
+                node["cap"]
+                    .as_str()
+                    .is_some_and(|cap| cap.ends_with("scene_find"))
+            })
+            .filter_map(|node| node["args"]["label"].as_str())
+            .filter(|label| !label.trim().is_empty())
+            .collect();
+        let mut labels = new.iter().filter_map(|listed| listed.split(" in ").next());
+        if labels.any(|label| searched.iter().any(|query| answers(label, query))) {
+            return true;
+        }
+        if DECISION_MODEL.is_none() {
+            return true;
+        }
+        let state = json!({"task": self.task, "searched_for": searched, "newly_listed": new});
+        let question = json!({"type": "noul", "instructions": FITS});
+        match decide(&self.plan_id, state, question, |_| NEW_FITS).await {
+            Ok(_) => true,
+            // Below the threshold is a "no"; a model that does not answer counts as a "yes".
+            Err(reason) => !reason.starts_with("decision model: "),
         }
     }
 
@@ -1084,6 +1128,23 @@ fn placed(objects: &Value) -> HashMap<&str, &str> {
             let listed = listed.as_array().into_iter().flatten();
             listed.filter_map(move |object| Some((object["id"].as_str()?, region.as_str())))
         })
+        .collect()
+}
+
+/// Whether an object labelled `label` answers a search for `query`, as Scene's
+/// find matches them: it has every word searched for, or the search names
+/// every word of its label.
+fn answers(label: &str, query: &str) -> bool {
+    let (label, query) = (words(label), words(query));
+    !query.is_empty() && (query.is_subset(&label) || label.is_subset(&query))
+}
+
+/// The words of a label or a search, as Scene's find splits them.
+fn words(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(String::from)
         .collect()
 }
 
@@ -2101,6 +2162,16 @@ mod tests {
         assert_eq!(super::cut(&mut lone, &moved, &Default::default()), None);
     }
 
+    #[test]
+    fn an_object_answers_a_search_as_scenes_find_matches_it() {
+        assert!(super::answers("red_bull", "red bull"));
+        assert!(!super::answers("red_bell_pepper", "red bull"));
+        assert!(super::answers("red_bell_pepper", "pepper"));
+        assert!(super::answers("trash_bin", "kitchen trash bin"));
+        assert!(!super::answers("hand_towel", "fabric"));
+        assert!(!super::answers("hand_towel", ""));
+    }
+
     #[tokio::test]
     async fn a_search_planned_before_scene_listed_more_objects_is_not_used() {
         use serde_json::json;
@@ -2131,13 +2202,13 @@ mod tests {
             objects: then,
             ..three_steps()
         };
-        assert!(spec.validate(reply(&search), &now).is_err());
-        assert_eq!(spec.validate(reply(&deliver), &now).unwrap().1, None);
+        assert!(spec.validate(reply(&search), &now).await.is_err());
+        assert_eq!(spec.validate(reply(&deliver), &now).await.unwrap().1, None);
         let off = Speculation {
             read_set: false,
             ..spec
         };
-        assert!(off.validate(reply(&search), &now).is_ok());
+        assert!(off.validate(reply(&search), &now).await.is_ok());
     }
 
     #[tokio::test]
@@ -2149,9 +2220,9 @@ mod tests {
             objects: then.clone(),
             ..three_steps()
         };
-        let (kept, note) = spec.validate(reply.clone(), &then).unwrap();
+        let (kept, note) = spec.validate(reply.clone(), &then).await.unwrap();
         assert_eq!((kept.as_str(), note), (reply.as_str(), None));
-        let (cut, note) = spec.validate(reply.clone(), &gone).unwrap();
+        let (cut, note) = spec.validate(reply.clone(), &gone).await.unwrap();
         let cut: serde_json::Value = serde_json::from_str(&cut).unwrap();
         assert_eq!(cut["rtdl"]["children"].as_array().unwrap().len(), 1);
         assert!(note.is_some());
@@ -2159,6 +2230,9 @@ mod tests {
             read_set: false,
             ..spec
         };
-        assert_eq!(off.validate(reply.clone(), &gone).unwrap(), (reply, None));
+        assert_eq!(
+            off.validate(reply.clone(), &gone).await.unwrap(),
+            (reply, None)
+        );
     }
 }
