@@ -870,16 +870,26 @@ impl Speculation {
         let mut envelope: Value =
             serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
         let moved = moved(&envelope["rtdl"], &self.objects, objects);
-        if moved.is_empty() {
+        // A search was planned for what Scene did not list then; once Scene lists more,
+        // it may look elsewhere for what is now known, so the reply is not used.
+        let new = match searches(&envelope["rtdl"]) {
+            true => listed_since(&self.objects, objects),
+            false => Vec::new(),
+        };
+        if moved.is_empty() && new.is_empty() {
             return Ok((reply, None));
         }
-        let kept = cut(&mut envelope["rtdl"], &moved, &self.reads);
+        let kept = match new.is_empty() {
+            true => cut(&mut envelope["rtdl"], &moved, &self.reads),
+            false => None,
+        };
         info!(
             "[pilot/segue] {}",
             json!({
                 "event": "read_set",
                 "plan_id": self.plan_id,
                 "moved": moved,
+                "new": new,
                 "kept": kept,
                 "applied": self.read_set,
             })
@@ -887,7 +897,13 @@ impl Speculation {
         if !self.read_set {
             return Ok((reply, None));
         }
-        let changes: Vec<&str> = moved.iter().map(|(_, change)| change.as_str()).collect();
+        let mut changes: Vec<String> = moved.into_iter().map(|(_, change)| change).collect();
+        if !new.is_empty() {
+            changes.push(format!(
+                "Scene lists objects its search did not know of ({})",
+                new.join(", ")
+            ));
+        }
         let changes = changes.join("; ");
         match kept {
             None => Err(format!("read set changed: {changes}")),
@@ -1071,6 +1087,41 @@ fn placed(objects: &Value) -> HashMap<&str, &str> {
         .collect()
 }
 
+/// Whether a reply's tree searches Scene for objects.
+fn searches(tree: &Value) -> bool {
+    do_nodes(tree)
+        .into_iter()
+        .filter_map(|node| node["cap"].as_str())
+        .any(|cap| cap.ends_with("scene_find"))
+}
+
+/// The objects `now` lists that `then` did not, as "<label> in <region>", by
+/// label and region rather than id, since perception can give an object it sees
+/// again a new id. Nothing when `then` lists none, since that state is unknown.
+fn listed_since(then: &Value, now: &Value) -> Vec<String> {
+    let listings = |objects: &Value| -> HashSet<(String, String)> {
+        let regions = objects.as_object().into_iter().flatten();
+        regions
+            .flat_map(|(region, listed)| {
+                let listed = listed.as_array().into_iter().flatten();
+                listed.filter_map(move |object| {
+                    Some((region.clone(), object["label"].as_str()?.to_string()))
+                })
+            })
+            .collect()
+    };
+    let before = listings(then);
+    if before.is_empty() {
+        return Vec::new();
+    }
+    let mut new: Vec<String> = listings(now)
+        .difference(&before)
+        .map(|(region, label)| format!("{label} in {region}"))
+        .collect();
+    new.sort();
+    new
+}
+
 /// The objects `tree` names that `then` placed and `now` places in another
 /// region or not at all, each with what changed. Nothing when `now` places
 /// no object, since Scene's state is then unknown rather than changed.
@@ -1184,8 +1235,9 @@ fn hypothesis(
              three situations rather than decline. First the bold one: what the outputs most \
              likely show, with a reply that carries the task as far from there as one tree can. \
              Then the careful one: the outputs show otherwise, or too little to act on, with a \
-             reply that still moves the task forward without relying on them, such as looking \
-             again from elsewhere or searching the next likely place. Neither reply may give the \
+             reply that still moves the task forward without relying on them: acting on an \
+             object the environment state already lists that fits the task, if there is one, \
+             else looking again from elsewhere or searching the next likely place. Neither reply may give the \
              task up or report that it cannot be done: where that is the only course, that \
              situation's reply asks for the results instead. Reporting the task done is the \
              bold course when this plan's success completes it. Answer {\"situations\": \
@@ -2047,6 +2099,45 @@ mod tests {
         assert_eq!(super::cut(&mut tree, &moved, &Default::default()), None);
         let mut lone = fetch()["children"][1].clone();
         assert_eq!(super::cut(&mut lone, &moved, &Default::default()), None);
+    }
+
+    #[tokio::test]
+    async fn a_search_planned_before_scene_listed_more_objects_is_not_used() {
+        use serde_json::json;
+        let listed = |labels: &[(&str, &str)]| -> serde_json::Value {
+            let mut regions = serde_json::Map::new();
+            for (region, label) in labels {
+                let entry = regions.entry(region.to_string()).or_insert(json!([]));
+                let id = format!("o{}", entry.as_array().unwrap().len());
+                entry
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id": id, "label": label}));
+            }
+            regions.into()
+        };
+        let then = listed(&[("laundry", "washing_machine")]);
+        let now = listed(&[("laundry", "washing_machine"), ("laundry", "hand_towel")]);
+        assert_eq!(super::listed_since(&then, &now), ["hand_towel in laundry"]);
+        // A new id for an object listed before is not a new object.
+        let again = json!({"laundry": [{"id": "o9", "label": "washing_machine"}]});
+        assert!(super::listed_since(&then, &again).is_empty());
+        let call = |cap: &str| json!({"op": "do", "cap": cap, "args": {}});
+        let search = json!({"op": "sequence", "children": [
+            call("nav2.navigation_navigate"), call("scene.scene_find"), call("tiago_camera.camera_snapshot")]});
+        let deliver = json!({"op": "sequence", "children": [call("nav2.navigation_navigate")]});
+        let reply = |tree: &serde_json::Value| json!({"content": "", "rtdl": tree}).to_string();
+        let spec = Speculation {
+            objects: then,
+            ..three_steps()
+        };
+        assert!(spec.validate(reply(&search), &now).is_err());
+        assert_eq!(spec.validate(reply(&deliver), &now).unwrap().1, None);
+        let off = Speculation {
+            read_set: false,
+            ..spec
+        };
+        assert!(off.validate(reply(&search), &now).is_ok());
     }
 
     #[tokio::test]
