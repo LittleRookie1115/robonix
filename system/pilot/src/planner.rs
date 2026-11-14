@@ -1521,6 +1521,8 @@ pub async fn run_turn(
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
+    // The robot heading where the task begins while its first plan is written.
+    let mut opening: Option<crate::opening::Opening> = None;
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
@@ -1762,6 +1764,31 @@ pub async fn run_turn(
                 .await;
             break;
         }
+        if requests == 0
+            && speculate
+            && task_switch(task, "opening", true)
+            && speculation::decision_model()
+        {
+            let context: serde_json::Value =
+                serde_json::from_str(&task.context_json).unwrap_or_default();
+            let listed = context["read_only"].as_array().into_iter().flatten();
+            let reads = listed
+                .filter_map(|c| c.as_str())
+                .map(String::from)
+                .collect();
+            let tau = context["tau_open"]
+                .as_f64()
+                .unwrap_or(crate::opening::TAU_OPEN);
+            opening = crate::opening::Opening::start(
+                &task.text,
+                &state["places"],
+                &target_map,
+                executor.graph.clone(),
+                executor.control.clone(),
+                reads,
+                tau,
+            );
+        }
         requests += 1;
         let _ = tx
             .send(Ok(service::pack(
@@ -1969,6 +1996,7 @@ pub async fn run_turn(
                                 client: &mut executor.streaming, forbidden: &forbidden,
                                 revision: &forest.revision, expected_revision: planning_revision,
                             }).await;
+                            if let Some(open) = opening.take() { opening = open.follow(&live.plan); }
                             if streamed_task.is_none() && !live.plan.nodes.is_empty() {
                                 let mut fields = parser.task_fields.clone();
                                 fields.updates.clear();

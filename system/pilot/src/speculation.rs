@@ -28,6 +28,11 @@
 //! situation whose reply only reads is used whatever the decision model's
 //! confidence, since a wrong pick costs one lookup.
 //!
+//! A decision-model question unanswered after a second is sent again, and
+//! the first answer taken. With a decision model, a prepared reply may leave
+//! an object to it: `{"choose": "<what the object must be>"}` in place of an
+//! id is filled in with the listed object the model picks.
+//!
 //! A prepared reply that would search again for what has already come back
 //! empty twice is not used: whether to look further or stop rests on what
 //! the robot has seen, which only the planning request is shown.
@@ -69,6 +74,11 @@ const LOOKAHEAD: u64 = 3;
 /// prepared for. A branch costs a request and a slot whether it is used or not,
 /// so below one use in ten it mostly delays the requests prepared ahead.
 const MIN_FAILURE_RATE: f64 = 0.1;
+
+/// How long a decision-model question waits before it is sent a second time.
+/// The hosted model answers most questions in about a second but some only
+/// after five or more, unpredictably; the second copy usually comes back first.
+const HEDGE: Duration = Duration::from_secs(1);
 
 /// Searches for one label that came back empty, after which a prepared reply
 /// may not search for it again. A reply written before the results can only
@@ -236,11 +246,29 @@ const FITS: &str = "The plan was about to search for searched_for. Does any obje
                     newly_listed plainly fit what the task asks to find or act on, so that \
                     searching elsewhere is unnecessary?";
 
+const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene's object list \
+     may show although these steps' outputs do not name it, for example because a search by a \
+     category such as \"fruit\" finds nothing under that word, write {\"choose\": \"<what the \
+     object must be>\"} in place of its id, with the same text wherever the same object is meant: \
+     Pilot puts in the id of the listed object the decision model finds fits, and does not use the \
+     reply if none does. ";
+
+const CHOOSE: &str = "The robot is about to act on the object that looking_for describes, for \
+                      the task. Which listed object is it? If none of them plainly is, pick the \
+                      last option.";
+
+const NONE_FITS: &str = "None of these objects plainly is what looking_for describes.";
+
 /// Least p(yes) that a newly listed object fits the task for a prepared search
 /// to be set aside: setting one aside costs a planning request, while searching
 /// elsewhere for what is already listed costs a trip, so a doubt sets it aside.
 /// Not calibrated; each answer is logged as a `decide` record.
 const NEW_FITS: f64 = 0.3;
+
+/// Whether a decision model is configured.
+pub(crate) fn decision_model() -> bool {
+    DECISION_MODEL.is_some()
+}
 
 /// The decision model, if `TYPESAFE_BASE_URL` names one.
 static DECISION_MODEL: LazyLock<Option<DecisionModel>> = LazyLock::new(DecisionModel::from_env);
@@ -269,16 +297,29 @@ impl DecisionModel {
         })
     }
 
-    /// Ask one question about `state` and return its answer object.
+    /// Ask one question about `state` and return its answer object. Unanswered
+    /// after [`HEDGE`], the question is sent again and the first answer taken.
     async fn ask(&self, state: &Value, question: &Value) -> Result<Value> {
         let body = json!({"model": self.model, "state": state, "questions": {"q": question}});
+        let mut first = Box::pin(self.post(&body));
+        let racing = match tokio::time::timeout(HEDGE, &mut first).await {
+            Ok(Ok(answer)) => return Ok(answer),
+            Ok(Err(_)) => vec![Box::pin(self.post(&body))],
+            Err(_) => vec![first, Box::pin(self.post(&body))],
+        };
+        let (answer, _) = futures_util::future::select_ok(racing).await?;
+        Ok(answer)
+    }
+
+    /// One request for the question in `body`.
+    async fn post(&self, body: &Value) -> Result<Value> {
         // The planning request runs alongside the question, so a late answer
         // costs nothing; past this, that request has usually answered first.
         let mut request = self
             .http
             .post(&self.url)
             .timeout(Duration::from_secs(5))
-            .json(&body);
+            .json(body);
         if let Some(key) = &self.key {
             request = request.bearer_auth(key);
         }
@@ -889,6 +930,16 @@ impl Speculation {
     ) -> Result<(String, Option<String>), String> {
         let mut envelope: Value =
             serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+        let mut wanted = Vec::new();
+        to_choose(&envelope["rtdl"], &mut wanted);
+        let reply = match wanted.is_empty() {
+            true => reply,
+            false => {
+                let picks = self.choose(&wanted, objects).await?;
+                fill(&mut envelope["rtdl"], &picks);
+                envelope.to_string()
+            }
+        };
         let moved = moved(&envelope["rtdl"], &self.objects, objects);
         // A search was planned for what Scene did not list then; once Scene lists an
         // object that fits what the task looks for, the reply is not used.
@@ -939,6 +990,51 @@ impl Speculation {
                 )),
             )),
         }
+    }
+
+    /// For each of `wanted`, what a `{"choose": ...}` in a reply asks for, the id
+    /// of the object in `objects`, Scene's current list by region, that the
+    /// decision model picks; otherwise why the reply cannot be used.
+    async fn choose(
+        &self,
+        wanted: &[String],
+        objects: &Value,
+    ) -> Result<HashMap<String, String>, String> {
+        if DECISION_MODEL.is_none() {
+            return Err("no decision model to choose an object".into());
+        }
+        let regions = objects.as_object().into_iter().flatten();
+        let listed: Vec<(String, String)> = regions
+            .flat_map(|(region, listed)| {
+                let listed = listed.as_array().into_iter().flatten();
+                listed.filter_map(move |object| {
+                    let label = object["label"].as_str()?;
+                    Some((
+                        object["id"].as_str()?.to_string(),
+                        format!("{label} in {region}"),
+                    ))
+                })
+            })
+            .collect();
+        let mut criteria: serde_json::Map<String, Value> = listed
+            .iter()
+            .enumerate()
+            .map(|(index, (_, listing))| (index.to_string(), listing.clone().into()))
+            .collect();
+        criteria.insert("none".into(), NONE_FITS.into());
+        let mut picks = HashMap::new();
+        for want in wanted {
+            let state = json!({"task": self.task, "looking_for": want});
+            let question = json!({"type": "choice", "instructions": CHOOSE, "criteria": criteria});
+            let pick = decide(&self.plan_id, state, question, |_| self.tau_choice).await?;
+            let (id, _) = pick
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| listed.get(index))
+                .ok_or_else(|| format!("decision model picked unknown object {pick}"))?;
+            picks.insert(want.clone(), id.clone());
+        }
+        Ok(picks)
     }
 
     /// Whether one of the `new` objects Scene lists ("<label> in <region>") fits
@@ -1068,7 +1164,7 @@ async fn situation(
 /// return the option it picked if that is not "none" and has at least the
 /// probability `tau` asks of that option. A yes/no question picks "yes" with
 /// p(yes).
-async fn decide(
+pub(crate) async fn decide(
     plan_id: &str,
     state: Value,
     question: Value,
@@ -1192,6 +1288,39 @@ fn searched_in_vain(tree: &Value, steps: &Value) -> bool {
         vain.count() >= VAIN_SEARCHES
     };
     searched_for(tree).into_iter().any(empty)
+}
+
+/// Add to `wanted` what each `{"choose": "<what the object must be>"}` in `value` asks for, once each.
+fn to_choose(value: &Value, wanted: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) if fields.len() == 1 && fields.contains_key("choose") => {
+            if let Some(want) = fields["choose"].as_str()
+                && !wanted.iter().any(|w| w == want)
+            {
+                wanted.push(want.into());
+            }
+        }
+        Value::Object(fields) => fields.values().for_each(|v| to_choose(v, wanted)),
+        Value::Array(items) => items.iter().for_each(|v| to_choose(v, wanted)),
+        _ => {}
+    }
+}
+
+/// Replace each `{"choose": ...}` in `value` with the id `picks` holds for what it asks for.
+fn fill(value: &mut Value, picks: &HashMap<String, String>) {
+    let picked = match &*value {
+        Value::Object(fields) if fields.len() == 1 => {
+            let want = fields.get("choose").and_then(Value::as_str);
+            want.and_then(|want| picks.get(want)).cloned()
+        }
+        _ => None,
+    };
+    match (picked, value) {
+        (Some(id), value) => *value = id.into(),
+        (None, Value::Object(fields)) => fields.values_mut().for_each(|v| fill(v, picks)),
+        (None, Value::Array(items)) => items.iter_mut().for_each(|v| fill(v, picks)),
+        _ => {}
+    }
 }
 
 /// The objects `now` lists that `then` did not, as "<label> in <region>", by
@@ -1367,12 +1496,13 @@ fn hypothesis(
         "The steps' outputs are not known yet, and the live state above was captured before \
          this plan ran."
     };
+    let choose = if situations { CHOOSE_IN_REPLY } else { "" };
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
          {known} {ask} {assume} Where the next step depends on an output of these \
          steps, refer to it as {{\"var\": \"<op_id>\", \"path\": [\"<field>\"]}} and decide \
-         with `if`. If that cannot express what the next step needs, reply with `content` \
+         with `if`. {choose}If that cannot express what the next step needs, reply with `content` \
          exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
          outcome matches its assumption."
     )
@@ -1428,26 +1558,34 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Run a reply's tree now and return what each of its steps returned, in step
-/// order. `None` unless every step succeeded with text: a reply that names an
-/// output not known yet does not parse, and an image cannot be compared later.
-async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
-    let mut parser = RtdlIncrementalParser::new(
-        reader.targets.clone(),
-        Default::default(),
-        "pilot-read-ahead".into(),
-        0,
-    );
+/// The plan for a reply's tree that Pilot runs for itself as `plan_id`, outside
+/// any planning round. `None` if the tree does not parse or is a plan-control op.
+pub(crate) fn own_plan(
+    targets: &CapabilityTargetMap,
+    reply: &Value,
+    plan_id: String,
+) -> Option<Plan> {
+    let mut parser =
+        RtdlIncrementalParser::new(targets.clone(), Default::default(), plan_id.clone(), 0);
     parser.push(&reply.to_string()).ok()?;
     let (_, None) = parser.finish().ok()? else {
         return None;
     };
     let mut plan = parser.plan;
-    plan.plan_id = format!("read-ahead-{}", uuid::Uuid::new_v4());
+    plan.plan_id = plan_id;
     let calls = plan.nodes.iter_mut().filter_map(|node| node.call.as_mut());
     for (index, call) in calls.enumerate() {
         call.call_id = format!("{}:{index}", plan.plan_id);
     }
+    Some(plan)
+}
+
+/// Run a reply's tree now and return what each of its steps returned, in step
+/// order. `None` unless every step succeeded with text: a reply that names an
+/// output not known yet does not parse, and an image cannot be compared later.
+async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
+    let plan_id = format!("read-ahead-{}", uuid::Uuid::new_v4());
+    let plan = own_plan(&reader.targets, reply, plan_id)?;
     let steps: Vec<u32> = (0..plan.nodes.len() as u32)
         .filter(|&index| plan.nodes[index as usize].node_kind == RTDL_DO)
         .collect();
@@ -1932,6 +2070,27 @@ mod tests {
             &reads
         ));
         assert!(!super::reads_only(&tree(vec![]), &reads));
+    }
+
+    #[test]
+    fn each_object_left_to_choose_is_asked_for_once_and_filled_in_everywhere() {
+        use serde_json::json;
+        let mut tree = json!({"op": "sequence", "children": [
+            {"op": "do", "cap": "scene_goal_near", "args": {"object_id": {"choose": "a fruit"}}},
+            {"op": "do", "cap": "arm_pick", "args": {"object_id": {"choose": "a fruit"}, "keep": {"choose": 1}}},
+            {"op": "do", "cap": "arm_place", "args": {"on": {"choose": "the table", "x": 1}}}]});
+        let mut wanted = Vec::new();
+        super::to_choose(&tree, &mut wanted);
+        assert_eq!(wanted, ["a fruit"]);
+        let picks = [("a fruit".to_string(), "apple_3".to_string())].into();
+        super::fill(&mut tree, &picks);
+        assert_eq!(tree["children"][0]["args"]["object_id"], "apple_3");
+        assert_eq!(tree["children"][1]["args"]["object_id"], "apple_3");
+        assert_eq!(tree["children"][1]["args"]["keep"], json!({"choose": 1}));
+        assert_eq!(
+            tree["children"][2]["args"]["on"],
+            json!({"choose": "the table", "x": 1})
+        );
     }
 
     #[test]

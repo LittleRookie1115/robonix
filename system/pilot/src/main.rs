@@ -28,6 +28,7 @@ mod experience;
 mod expression;
 mod history;
 mod memory;
+mod opening;
 mod pb;
 mod planner;
 mod prompt;

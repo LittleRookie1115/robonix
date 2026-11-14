@@ -162,7 +162,7 @@ pub async fn collect(
         }
         cache.by_region.clone()
     };
-    let state = json!({
+    let mut state = json!({
         "scene": scene,
         "objects": by_region(&everything, &rooms, &by_room),
         "provider_availability": providers,
@@ -172,6 +172,7 @@ pub async fn collect(
                    they do not show, or with `settle_s` in a tree that has just moved the \
                    robot, because perception takes a few seconds to add what the camera then \
                    sees. ";
+    let places = named(&regions, &known);
     let map = format!(
         "\n\n## Map regions\n\
          The map's regions and points of interest as Scene's list_regions returns \
@@ -180,9 +181,12 @@ pub async fn collect(
          found no reachable pose or has not answered yet. Call list_regions or \
          goal_region only for what this does not show. Shown again only when it \
          changes.\n\n{}\n",
-        named(&regions, &known)
+        places
     );
-    (environment(&state, objects), map, state)
+    let environment = environment(&state, objects);
+    // The opening move picks among them; the map block above already shows them.
+    state["places"] = places;
+    (environment, map, state)
 }
 
 /// The environment block around `state`, with `objects` saying what its objects are.
