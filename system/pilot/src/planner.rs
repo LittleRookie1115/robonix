@@ -1914,7 +1914,7 @@ pub async fn run_turn(
                     };
                     match reply {
                         Ok(reply) => spec
-                            .validate(reply, &state["objects"])
+                            .validate(reply, branch.objects(), &state["objects"])
                             .await
                             .map(|checked| (checked, branch)),
                         Err(reason) => Err(reason),
@@ -2351,9 +2351,12 @@ pub async fn run_turn(
             && !is_control_only(&graph)
         {
             let seen = tasks.messages.len();
-            speculation = ahead
-                .and_then(|ahead: Speculation| ahead.adopt(&graph, seen))
-                .or_else(|| {
+            // What a used reply prepared ahead for this tree stands as it is if it
+            // covers the tree's success; otherwise the other outcomes are asked for now.
+            let adopted = ahead.and_then(|ahead: Speculation| ahead.adopt(&graph, seen));
+            speculation = match adopted {
+                Some(adopted) if adopted.awaits_success() => Some(adopted),
+                adopted => {
                     let mut context = history.clone();
                     let board = tasks.board();
                     if !board.is_empty() {
@@ -2374,8 +2377,10 @@ pub async fn run_turn(
                         vlm_idle_timeout(),
                         reader,
                         state["objects"].clone(),
+                        adopted,
                     )
-                });
+                }
+            };
         }
     }
 
