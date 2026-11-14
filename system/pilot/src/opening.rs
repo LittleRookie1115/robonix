@@ -2,14 +2,16 @@
 //! most tasks begin by going somewhere. With a decision model, Pilot asks it
 //! which of the map's places the task begins by going to and, if it is sure,
 //! sends the robot there while the plan is written. Navigation follows the
-//! newest goal, so the plan's first navigate takes the moving robot over; a
-//! plan whose first step that moves or uses the robot is anything else stops
-//! it, and so does the end of the turn.
+//! newest goal, so the plan's first navigate takes the moving robot over when
+//! it runs. The move is stopped if the plan's first step that moves or uses
+//! the robot is anything else, if that navigate's tree ends without it having
+//! run (it may sit under an `if`), or when the turn ends.
 
 use crate::pb::contracts::robonix_system_executor_control_plan_client::RobonixSystemExecutorControlPlanClient;
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::executor::ControlPlanRequest;
-use crate::pb::pilot::Plan;
+use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
+use crate::pb::pilot::{Plan, RtdlNodeState};
 use crate::planner::CapabilityTargetMap;
 use crate::speculation::{decide, own_plan};
 use robonix_scribe::info;
@@ -40,6 +42,9 @@ const NOWHERE: &str = "The task does not begin by going to one of these places, 
 
 const NAVIGATE: &str = "/navigation/navigate";
 
+/// What the id of the plan a move runs as begins with.
+pub(crate) const PLAN_ID: &str = "opening-";
+
 /// How far the opening move has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -64,7 +69,10 @@ pub(crate) struct Opening {
     control: RobonixSystemExecutorControlPlanClient<Channel>,
     /// The task's read-only contracts: a plan step calling one leaves the move running.
     reads: HashSet<String>,
-    /// Whether a plan's navigate took the move over, so it is not stopped.
+    /// The step expected to take the move over, as its plan's id and its node
+    /// index, once the turn has dispatched one.
+    by: Option<(String, u32)>,
+    /// Whether that step ran, so the move is not stopped.
     taken_over: bool,
 }
 
@@ -103,7 +111,7 @@ impl Opening {
         criteria.insert("none".into(), NOWHERE.into());
         let question = json!({"type": "choice", "instructions": WHERE, "criteria": criteria});
         let state = json!({"task": task});
-        let plan_id = format!("opening-{}", uuid::Uuid::new_v4());
+        let plan_id = format!("{PLAN_ID}{}", uuid::Uuid::new_v4());
         let phase = Arc::new(Mutex::new(Phase::Asking));
         let (targets, shared, id) = (targets.clone(), phase.clone(), plan_id.clone());
         let task = tokio::spawn(async move {
@@ -143,23 +151,59 @@ impl Opening {
             task,
             control,
             reads,
+            by: None,
             taken_over: false,
         })
     }
 
-    /// The move once the turn has dispatched `plan` as far as it has: taken
-    /// over if the first step that moves or uses the robot navigates, stopped if
-    /// it does anything else, and still running until there is one.
+    /// The move once the turn has dispatched `plan` as far as it has: stopped
+    /// if the first step that moves or uses the robot does anything but
+    /// navigate, and otherwise left running, for that navigate to take over
+    /// when it starts.
     pub(crate) fn follow(mut self, plan: &Plan) -> Option<Self> {
-        let calls = plan.nodes.iter().filter_map(|node| node.call.as_ref());
-        let Some(first) = calls
-            .map(|call| call.contract_id.as_str())
-            .find(|contract| !self.reads.contains(*contract) && engages(contract))
-        else {
+        if self.by.is_some() {
+            return Some(self);
+        }
+        let mut calls = plan.nodes.iter().enumerate();
+        let first = calls.find_map(|(index, node)| {
+            let contract = node.call.as_ref()?.contract_id.as_str();
+            (!self.reads.contains(contract) && engages(contract)).then_some((index, contract))
+        });
+        match first {
+            None => Some(self),
+            Some((index, contract)) if contract.ends_with(NAVIGATE) => {
+                self.by = Some((plan.plan_id.clone(), index as u32));
+                Some(self)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The move once the tree `plan_id` reports `node`'s state, or has ended
+    /// if `node` is `None`: taken over once the step expected to take it over
+    /// has run, and stopped if that step fails or its tree ends without it
+    /// having run, as a navigate under an `if` whose condition fails does.
+    /// Executor reports a call only once it has ended, so that is when a move
+    /// counts as taken over; by then navigation has long followed the new goal.
+    pub(crate) fn observe(mut self, plan_id: &str, node: Option<&RtdlNodeState>) -> Option<Self> {
+        let Some((plan, index)) = &self.by else {
             return Some(self);
         };
-        self.taken_over = first.ends_with(NAVIGATE);
-        None
+        let failed = [
+            RtdlNodeStateEnum::Failed,
+            RtdlNodeStateEnum::Canceled,
+            RtdlNodeStateEnum::Timeout,
+        ];
+        match node {
+            _ if plan != plan_id => Some(self),
+            Some(node) if node.node_index != *index => Some(self),
+            Some(node) if node.state == RtdlNodeStateEnum::Pending as u32 => Some(self),
+            Some(node) => {
+                self.taken_over = !failed.map(|state| state as u32).contains(&node.state);
+                None
+            }
+            None => None,
+        }
     }
 }
 
@@ -216,8 +260,80 @@ impl Drop for Opening {
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::{CapabilityTargetMap, RTDL_DO};
+    use super::{Opening, Phase};
+    use crate::pb::contracts::robonix_system_executor_control_plan_client::RobonixSystemExecutorControlPlanClient;
+    use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
+    use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState};
+    use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_IF, RTDL_SEQUENCE};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    /// A move under way, whose stop goes nowhere.
+    fn moving() -> Opening {
+        let nowhere = tonic::transport::Channel::from_static("http://[::1]:1").connect_lazy();
+        Opening {
+            plan_id: "opening-1".into(),
+            phase: Arc::new(Mutex::new(Phase::Moving)),
+            task: tokio::spawn(async {}),
+            control: RobonixSystemExecutorControlPlanClient::new(nowhere),
+            reads: ["robonix/system/scene/goal_near".to_string()].into(),
+            by: None,
+            taken_over: false,
+        }
+    }
+
+    /// goal_near, then navigate and pick only if the goal is reachable.
+    fn approach_if_reachable() -> Plan {
+        let node = |node_kind: u32, children: &[u32], contract: &str| RtdlNode {
+            node_kind,
+            children: children.to_vec(),
+            call: (!contract.is_empty()).then(|| CapabilityCall {
+                contract_id: contract.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Plan {
+            plan_id: "p".into(),
+            nodes: vec![
+                node(RTDL_SEQUENCE, &[1, 2], ""),
+                node(RTDL_DO, &[], "robonix/system/scene/goal_near"),
+                node(RTDL_IF, &[3], ""),
+                node(RTDL_SEQUENCE, &[4, 5], ""),
+                node(RTDL_DO, &[], "robonix/service/navigation/navigate"),
+                node(RTDL_DO, &[], "robonix/skill/manipulation/pick"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_move_counts_as_taken_over_only_once_the_plans_navigate_has_run() {
+        let state = |node_index: u32, state: RtdlNodeStateEnum| RtdlNodeState {
+            node_index,
+            state: state as u32,
+            ..Default::default()
+        };
+        let followed = || moving().follow(&approach_if_reachable()).unwrap();
+        assert_eq!(followed().by, Some(("p".into(), 4)));
+        // Other trees and other steps say nothing about it.
+        let open = followed();
+        let open = open.observe("q", None).unwrap();
+        let open = open
+            .observe("p", Some(&state(1, RtdlNodeStateEnum::Succeeded)))
+            .unwrap();
+        let open = open
+            .observe("p", Some(&state(4, RtdlNodeStateEnum::Pending)))
+            .unwrap();
+        // Its first report settles the move, as does its tree ending without one.
+        let verifying = state(4, RtdlNodeStateEnum::Verifying);
+        assert!(open.observe("p", Some(&verifying)).is_none());
+        assert!(followed().observe("p", None).is_none());
+        // A plan that grasps first stops the move at once.
+        let mut grasp = approach_if_reachable();
+        grasp.nodes.swap(4, 5);
+        assert!(moving().follow(&grasp).is_none());
+    }
 
     #[test]
     fn only_steps_that_move_or_use_the_robot_decide_about_the_move() {

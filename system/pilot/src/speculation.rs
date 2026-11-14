@@ -1562,6 +1562,9 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// What the id of the plan a tree is read ahead as begins with.
+pub(crate) const READ_AHEAD: &str = "read-ahead-";
+
 /// The plan for a reply's tree that Pilot runs for itself as `plan_id`, outside
 /// any planning round. `None` if the tree does not parse or is a plan-control op.
 pub(crate) fn own_plan(
@@ -1588,7 +1591,7 @@ pub(crate) fn own_plan(
 /// order. `None` unless every step succeeded with text: a reply that names an
 /// output not known yet does not parse, and an image cannot be compared later.
 async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
-    let plan_id = format!("read-ahead-{}", uuid::Uuid::new_v4());
+    let plan_id = format!("{READ_AHEAD}{}", uuid::Uuid::new_v4());
     let plan = own_plan(&reader.targets, reply, plan_id)?;
     let steps: Vec<u32> = (0..plan.nodes.len() as u32)
         .filter(|&index| plan.nodes[index as usize].node_kind == RTDL_DO)

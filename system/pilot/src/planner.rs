@@ -326,8 +326,22 @@ fn task_switch(task: &Task, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Let a speculation see how its tree goes and ends.
-fn observe(speculation: &mut Option<Speculation>, event: &TreeInterrupt) {
+/// Let a speculation and the opening move see how a tree goes and ends.
+fn observe(
+    speculation: &mut Option<Speculation>,
+    opening: &mut Option<crate::opening::Opening>,
+    event: &TreeInterrupt,
+) {
+    if let Some(open) = opening.take() {
+        *opening = match event {
+            TreeInterrupt::NodeState {
+                plan_id,
+                node_state,
+                ..
+            } => open.observe(plan_id, Some(node_state)),
+            TreeInterrupt::Completion { plan_id, .. } => open.observe(plan_id, None),
+        };
+    }
     let Some(spec) = speculation else { return };
     match event {
         TreeInterrupt::NodeState {
@@ -1028,6 +1042,12 @@ fn executor_active_snapshot(plans_json: Option<&str>) -> (String, Option<usize>)
     let Some(plans) = value.get("plans").and_then(serde_json::Value::as_array) else {
         return executor_active_snapshot(None);
     };
+    // The plans Pilot runs for itself are not the planner's to wait for or cancel.
+    let own = |plan: &&serde_json::Value| {
+        let id = plan["plan_id"].as_str().unwrap_or_default();
+        id.starts_with(speculation::READ_AHEAD) || id.starts_with(crate::opening::PLAN_ID)
+    };
+    let plans: Vec<&serde_json::Value> = plans.iter().filter(|plan| !own(plan)).collect();
     let normalized = serde_json::json!({
         "count": plans.len(),
         "plans": plans,
@@ -1529,7 +1549,7 @@ pub async fn run_turn(
 
     'supervisor: loop {
         while let Ok(event) = forest.interrupt_rx.try_recv() {
-            observe(&mut speculation, &event);
+            observe(&mut speculation, &mut opening, &event);
             should_plan |=
                 handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
         }
@@ -1595,7 +1615,7 @@ pub async fn run_turn(
                 ev = forest.interrupt_rx.recv() => {
                     // The session holds a sender, so the channel never closes.
                     if let Some(event) = ev {
-                        observe(&mut speculation, &event);
+                        observe(&mut speculation, &mut opening, &event);
                         should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                 }
@@ -1630,7 +1650,7 @@ pub async fn run_turn(
                         break;
                     }
                     Some(event) = forest.interrupt_rx.recv() => {
-                        observe(&mut speculation, &event);
+                        observe(&mut speculation, &mut opening, &event);
                         handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                     _ = &mut settle => break,
@@ -3433,6 +3453,16 @@ mod tests {
         assert!(block.contains("\"count\":1"));
         assert!(block.contains("\"plan_id\":\"8\""));
         assert!(block.contains("long-running skills started by earlier interactions"));
+    }
+
+    #[test]
+    fn the_plans_pilot_runs_for_itself_are_not_shown_to_the_planner() {
+        let (block, count) = executor_active_snapshot(Some(
+            r#"{"plans":[{"plan_id":"opening-1f"},{"plan_id":"read-ahead-2a"},{"plan_id":"ab12-3"}]}"#,
+        ));
+        assert_eq!(count, Some(1));
+        assert!(block.contains("ab12-3"));
+        assert!(!block.contains("opening-") && !block.contains("read-ahead-"));
     }
 
     #[test]
