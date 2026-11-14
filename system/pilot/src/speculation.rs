@@ -27,6 +27,10 @@
 //! what it returned and used only if it returns the same in its turn. A
 //! situation whose reply only reads is used whatever the decision model's
 //! confidence, since a wrong pick costs one lookup.
+//!
+//! A prepared reply that would search again for what has already come back
+//! empty twice is not used: whether to look further or stop rests on what
+//! the robot has seen, which only the planning request is shown.
 
 use crate::experience::Experience;
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
@@ -65,6 +69,12 @@ const LOOKAHEAD: u64 = 3;
 /// prepared for. A branch costs a request and a slot whether it is used or not,
 /// so below one use in ten it mostly delays the requests prepared ahead.
 const MIN_FAILURE_RATE: f64 = 0.1;
+
+/// Searches for one label that came back empty, after which a prepared reply
+/// may not search for it again. A reply written before the results can only
+/// look elsewhere, while the planner, seeing the images too, stopped after
+/// one empty search for a named object about a third of the time.
+const VAIN_SEARCHES: usize = 2;
 
 /// How long things have taken in this Pilot process, which decides whether a
 /// reply can be prepared before a tree ends.
@@ -841,16 +851,17 @@ impl Speculation {
             if needs_results(&reply) {
                 return Err("reply needs results".into());
             }
+            let mut envelope: Value =
+                serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+            if searched_in_vain(&envelope["rtdl"], &state["steps"]) {
+                return Err("searches again for what came back empty twice".into());
+            }
             // A situation's reply was written for the results the decision model just matched;
             // asking again whether the results support it only adds a second, noisier answer.
-            if DECISION_MODEL.is_some() && !picked {
-                let mut envelope: Value =
-                    serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
-                if !dispatches(&envelope["rtdl"]) {
-                    state["final_reply"] = envelope["content"].take();
-                    let question = json!({"type": "noul", "instructions": DONE});
-                    decide(&plan_id, state, question, |_| tau_done).await?;
-                }
+            if DECISION_MODEL.is_some() && !picked && !dispatches(&envelope["rtdl"]) {
+                state["final_reply"] = envelope["content"].take();
+                let question = json!({"type": "noul", "instructions": DONE});
+                decide(&plan_id, state, question, |_| tau_done).await?;
             }
             Ok(Prepared {
                 text: reply,
@@ -936,16 +947,7 @@ impl Speculation {
     /// at once; otherwise the decision model judges, and without one any new
     /// object counts.
     async fn fits(&self, tree: &Value, new: &[String]) -> bool {
-        let searched: Vec<&str> = do_nodes(tree)
-            .into_iter()
-            .filter(|node| {
-                node["cap"]
-                    .as_str()
-                    .is_some_and(|cap| cap.ends_with("scene_find"))
-            })
-            .filter_map(|node| node["args"]["label"].as_str())
-            .filter(|label| !label.trim().is_empty())
-            .collect();
+        let searched = searched_for(tree);
         let mut labels = new.iter().filter_map(|listed| listed.split(" in ").next());
         if labels.any(|label| searched.iter().any(|query| answers(label, query))) {
             return true;
@@ -1154,6 +1156,42 @@ fn searches(tree: &Value) -> bool {
         .into_iter()
         .filter_map(|node| node["cap"].as_str())
         .any(|cap| cap.ends_with("scene_find"))
+}
+
+/// The labels a reply's tree searches Scene for, leaving out a search for everything.
+fn searched_for(tree: &Value) -> Vec<&str> {
+    do_nodes(tree)
+        .into_iter()
+        .filter(|node| {
+            node["cap"]
+                .as_str()
+                .is_some_and(|cap| cap.ends_with("scene_find"))
+        })
+        .filter_map(|node| node["args"]["label"].as_str())
+        .filter(|label| !label.trim().is_empty())
+        .collect()
+}
+
+/// Whether `tree` searches for a label that at least [`VAIN_SEARCHES`] of the
+/// turn's `steps`, as the decision model reads them, searched for and found nothing.
+fn searched_in_vain(tree: &Value, steps: &Value) -> bool {
+    let steps = steps.as_array().map(Vec::as_slice).unwrap_or_default();
+    let empty = |label: &str| {
+        let label = words(label);
+        let vain = steps.iter().filter(|step| {
+            step["capability"]
+                .as_str()
+                .is_some_and(|cap| cap.ends_with("/find"))
+                && step["output"]["objects"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+                && step["args"]["label"]
+                    .as_str()
+                    .is_some_and(|searched| words(searched) == label)
+        });
+        vain.count() >= VAIN_SEARCHES
+    };
+    searched_for(tree).into_iter().any(empty)
 }
 
 /// The objects `now` lists that `then` did not, as "<label> in <region>", by
@@ -1894,6 +1932,29 @@ mod tests {
             &reads
         ));
         assert!(!super::reads_only(&tree(vec![]), &reads));
+    }
+
+    #[test]
+    fn a_reply_may_not_search_a_third_time_for_what_came_back_empty_twice() {
+        use serde_json::json;
+        let search = |label: &str| {
+            json!({"op": "sequence", "children": [
+                {"op": "do", "cap": "scene.scene_find", "args": {"label": label}}]})
+        };
+        let found = |label: &str, objects: serde_json::Value| {
+            json!({"capability": "robonix/system/scene/find", "args": {"label": label},
+                   "status": "succeeded", "output": {"objects": objects}})
+        };
+        let once = json!([found("Red Bull", json!([]))]);
+        assert!(!super::searched_in_vain(&search("red_bull"), &once));
+        let twice = json!([found("Red Bull", json!([])), found("red bull", json!([]))]);
+        assert!(super::searched_in_vain(&search("red_bull"), &twice));
+        assert!(!super::searched_in_vain(&search("cup"), &twice));
+        let seen = json!([
+            found("cup", json!([])),
+            found("cup", json!([{"id": "cup_1"}]))
+        ]);
+        assert!(!super::searched_in_vain(&search("cup"), &seen));
     }
 
     #[test]
