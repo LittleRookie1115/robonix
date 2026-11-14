@@ -41,6 +41,7 @@ fn rejects_optional_request_fields(status: reqwest::StatusCode, body: &str) -> b
         "include_usage",
         "prompt_cache_key",
         "prompt_cache_options",
+        "reasoning_effort",
         "response_format",
         "json_schema",
     ]
@@ -372,6 +373,9 @@ pub struct VlmClient {
     /// refused earlier in the process. Later requests leave them out up front
     /// rather than pay the same rejected round trip on every planning round.
     refused: Arc<Mutex<HashSet<String>>>,
+    /// The `reasoning_effort` this client's requests ask for; `None` leaves it
+    /// to the provider, as planning requests do.
+    reasoning_effort: Option<String>,
 }
 
 /// What the caller wants back from one completion.
@@ -606,7 +610,16 @@ impl VlmClient {
             configured_context_window_tokens: cfg.context_window_tokens,
             prompt_cache_key: Uuid::new_v4().simple().to_string(),
             refused: Arc::default(),
+            reasoning_effort: None,
         }
+    }
+
+    /// This client asking for `effort` as its requests' `reasoning_effort`, or
+    /// for the provider's default if `effort` is empty. It shares what the
+    /// upstream has refused, so a provider that rejects the field is sent it once.
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+        self.reasoning_effort = Some(effort.to_string()).filter(|effort| !effort.is_empty());
+        self
     }
 
     /// Stable cache-routing key for this running Pilot deployment. It spans
@@ -735,6 +748,9 @@ impl VlmClient {
                 serde_json::json!({"mode": "implicit", "ttl": "30m"}),
             );
         }
+        if let (Some(effort), Some(body)) = (&self.reasoning_effort, request_body.as_object_mut()) {
+            body.insert("reasoning_effort".to_string(), effort.as_str().into());
+        }
         add_claude_cache_breakpoints(&self.model, &mut request_body);
         let refused = self.refused.lock().expect("VLM refusal lock").clone();
         if let Some(body) = request_body.as_object_mut() {
@@ -808,6 +824,7 @@ impl VlmClient {
                         ("stream_options", "include_usage"),
                         ("prompt_cache_key", "prompt_cache_key"),
                         ("prompt_cache_options", "prompt_cache_options"),
+                        ("reasoning_effort", "reasoning_effort"),
                     ] {
                         if lowered.contains(named) && body.remove(field).is_some() {
                             dropped.push(field);
@@ -1252,7 +1269,43 @@ mod tests {
             configured_context_window_tokens: None,
             prompt_cache_key: "local-test".into(),
             refused: Default::default(),
+            reasoning_effort: None,
         }
+    }
+
+    /// Only the client asked for a reasoning effort sends one.
+    #[tokio::test]
+    async fn a_reasoning_effort_is_sent_only_by_the_client_given_one() {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut efforts = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_http_request(&mut socket).await;
+                let ok = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndata: [DONE]";
+                socket.write_all(ok.as_bytes()).await.unwrap();
+                efforts.push(body.get("reasoning_effort").cloned());
+            }
+            efforts
+        });
+        let plain = local_client(address);
+        let clients = [
+            plain.clone(),
+            plain.clone().with_reasoning_effort("low"),
+            plain.with_reasoning_effort("low").with_reasoning_effort(""),
+        ];
+        for client in clients {
+            let stream = client
+                .chat_stream(&[super::Message::user("hi")], &[], None, ReplyShape::Text)
+                .await
+                .unwrap();
+            stream.collect::<Vec<_>>().await;
+        }
+        assert_eq!(server.await.unwrap(), [None, Some("low".into()), None]);
     }
 
     /// A field the upstream refused once is left out of later requests, so

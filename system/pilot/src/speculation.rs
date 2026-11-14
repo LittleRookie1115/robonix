@@ -13,13 +13,15 @@
 //! the step results. The questions start as soon as the tree ends.
 //!
 //! What to prepare follows from how long things take and how often they
-//! fail, which Pilot learns as it runs. A tree expected to end before a reply
-//! could be written is not prepared for while it runs; instead, a success reply
-//! that would dispatch such a tree has that tree's reply prepared ahead, while
-//! the tree before it still runs, up to three trees along (`lookahead` in
-//! `context_json` sets another limit). A step's failure is prepared for only if
-//! its capability has failed often enough to be worth a request
-//! (`branch_budget`).
+//! fail, which Pilot learns as it runs and keeps across restarts. A tree
+//! expected to end before a reply could be written is not prepared for while it
+//! runs; instead, a success reply that would dispatch such a tree has that
+//! tree's reply prepared ahead, while the tree before it still runs, up to
+//! three trees along (`lookahead` in `context_json` sets another limit). A
+//! step's failure is prepared for only if its capability has failed often
+//! enough to be worth a request (`branch_budget`). The requests ask for low
+//! reasoning effort (`prepared_effort`), since a reply written after its tree
+//! ends is no use.
 //!
 //! Capabilities a task lists under `read_only` in `context_json` change
 //! nothing, so a tree of them may run before its turn: a reply that would
@@ -41,7 +43,9 @@ use crate::experience::Experience;
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
-use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_REPEAT, RTDL_SEQUENCE, RTDL_WHILE};
+use crate::planner::{
+    CapabilityTargetMap, RTDL_DO, RTDL_IF, RTDL_REPEAT, RTDL_SEQUENCE, RTDL_WHILE,
+};
 use crate::rtdl_stream::{RtdlIncrementalParser, next_op_id};
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
 use anyhow::{Result, bail};
@@ -75,6 +79,13 @@ const LOOKAHEAD: u64 = 3;
 /// so below one use in ten it mostly delays the requests prepared ahead.
 const MIN_FAILURE_RATE: f64 = 0.1;
 
+/// The `reasoning_effort` a prepared-reply request asks for, unless the task's
+/// `prepared_effort` names another ("" for the provider's default). A reply is
+/// of use only if it is written before its tree ends, and thinking took about
+/// half of the 15 s a success reply needed; what a hastier reply gets wrong is
+/// still held to the real outcome before it is used.
+const PREPARED_EFFORT: &str = "low";
+
 /// How long a decision-model question waits before it is sent a second time.
 /// The hosted model answers most questions in about a second but some only
 /// after five or more, unpredictably; the second copy usually comes back first.
@@ -92,10 +103,8 @@ const VAIN_SEARCHES: usize = 2;
 struct Timings {
     /// The longest successful call of each capability, by the name a reply calls it.
     calls: HashMap<String, Duration>,
-    /// What the calls Pilot has seen took, kept across restarts.
+    /// What the calls Pilot has seen took and how often they failed, kept across restarts.
     experience: Experience,
-    /// How many calls of each capability ended, and how many of those failed.
-    ended: HashMap<String, (u32, u32)>,
     /// About how long a request takes before its reply text begins.
     first_text: Option<Duration>,
     /// About how long a prepared reply takes to write in full.
@@ -124,14 +133,6 @@ impl Timings {
             .map(|(capability, _)| self.calls.get(capability));
         (longest.sum(), None)
     }
-
-    /// How often a call of `capability` fails, estimated from its calls so far
-    /// with one failure and one success assumed beforehand, so a capability
-    /// not yet seen counts as failing half the time.
-    fn failure_rate(&self, capability: &str) -> f64 {
-        let (ended, failed) = self.ended.get(capability).copied().unwrap_or_default();
-        f64::from(failed + 1) / f64::from(ended + 2)
-    }
 }
 
 static TIMINGS: LazyLock<Mutex<Timings>> = LazyLock::new(|| {
@@ -159,15 +160,21 @@ fn called(call: &CapabilityCall) -> String {
     )
 }
 
-/// Record that this call succeeded after `time` with `output`, and keep the
-/// experience it adds to.
+/// Record that this call succeeded after `time` with `output`; [`finished`],
+/// which every ended call reaches, keeps the experience it adds to.
 pub(crate) fn took(call: &CapabilityCall, time: Duration, output: &str) {
+    let mut timings = timings();
+    let name = called(call);
+    let longest = timings.calls.entry(name.clone()).or_default();
+    *longest = time.max(*longest);
+    timings.experience.record(&name, time, output);
+}
+
+/// Record that this call ended, and whether it failed, and keep the experience.
+pub(crate) fn finished(call: &CapabilityCall, failed: bool) {
     let saved = {
         let mut timings = timings();
-        let name = called(call);
-        let longest = timings.calls.entry(name.clone()).or_default();
-        *longest = time.max(*longest);
-        timings.experience.record(&name, time, output);
+        timings.experience.finished(&called(call), failed);
         timings.experience.saved()
     };
     let path = experience_path();
@@ -214,14 +221,6 @@ fn reply_steps(tree: &Value) -> Vec<(String, Value)> {
             )
         })
         .collect()
-}
-
-/// Record that this call ended, and whether it failed.
-pub(crate) fn finished(call: &CapabilityCall, failed: bool) {
-    let mut timings = timings();
-    let (ended, failures) = timings.ended.entry(called(call)).or_default();
-    *ended += 1;
-    *failures += u32::from(failed);
 }
 
 /// What a prepared reply asks for instead of a plan when it cannot be written
@@ -434,8 +433,7 @@ pub(crate) struct Speculation {
     /// The tree the replies were written for.
     pub(crate) plan_id: String,
     /// Steps a failure hypothesis can name, in execution order, as node index
-    /// and op_id. Only a tree that runs its steps one after another has them,
-    /// because only there does "step k failed" fix what else ran.
+    /// and op_id: those for which "this step failed" fixes what else ran.
     steps: Vec<(u32, String)>,
     /// The tree's nodes by index, to name and describe the steps it reports.
     nodes: Vec<RtdlNode>,
@@ -482,25 +480,27 @@ pub(crate) struct Speculation {
     read_set: bool,
 }
 
-/// The `do` steps of a tree that run one after another under its root, as node
-/// index and op_id. Only there does "step k failed" fix what else ran.
+/// The `do` steps of a tree whose failure fixes what else ran, as node index and
+/// op_id in the order they run: those reached from the root through sequences
+/// and the branches of an `if`, up to the first node of another kind, whose
+/// steps may fail without ending the tree or run in no fixed order.
 fn steps_in_order(plan: &Plan) -> Vec<(u32, String)> {
-    let is_step = |index: &u32| {
-        plan.nodes
-            .get(*index as usize)
-            .is_some_and(|node| node.node_kind == RTDL_DO)
-    };
-    let root = &plan.nodes[0];
-    if root.node_kind == RTDL_DO {
-        vec![(0, root.op_id.clone())]
-    } else if root.node_kind == RTDL_SEQUENCE && root.children.iter().all(is_step) {
-        root.children
-            .iter()
-            .map(|&child| (child, plan.nodes[child as usize].op_id.clone()))
-            .collect()
-    } else {
-        Vec::new()
+    fn walk(plan: &Plan, index: u32, steps: &mut Vec<(u32, String)>) -> bool {
+        let Some(node) = plan.nodes.get(index as usize) else {
+            return false;
+        };
+        match node.node_kind {
+            RTDL_DO => {
+                steps.push((index, node.op_id.clone()));
+                true
+            }
+            RTDL_SEQUENCE | RTDL_IF => node.children.iter().all(|&child| walk(plan, child, steps)),
+            _ => false,
+        }
     }
+    let mut steps = Vec::new();
+    walk(plan, 0, &mut steps);
+    steps
 }
 
 /// The steps whose failure to prepare for, most likely first, as op_id and the
@@ -517,7 +517,7 @@ fn failures_to_prepare(
         .iter()
         .map(|(index, op_id)| {
             let call = plan.nodes[*index as usize].call.as_ref();
-            let rate = call.map_or(1.0, |call| timings.failure_rate(&called(call)));
+            let rate = call.map_or(1.0, |call| timings.experience.failure_rate(&called(call)));
             (op_id.clone(), rate)
         })
         .filter(|(_, rate)| !budget || *rate >= MIN_FAILURE_RATE)
@@ -609,8 +609,11 @@ impl Speculation {
         let contracts = listed.into_iter().flatten().filter_map(Value::as_str);
         let reads: Arc<HashSet<String>> =
             Arc::new(contracts.map(crate::discovery::llm_name).collect());
+        let effort = context["prepared_effort"]
+            .as_str()
+            .unwrap_or(PREPARED_EFFORT);
         let request = Arc::new(Request {
-            vlm: vlm.clone(),
+            vlm: vlm.clone().with_reasoning_effort(effort),
             shape: if situations {
                 ReplyShape::Situations
             } else {
@@ -820,9 +823,10 @@ impl Speculation {
         } else if !any_failed {
             Some(Outcome::Succeeded)
         } else {
+            // A step in an `if` branch that was not taken reports nothing.
             self.steps
                 .iter()
-                .find(|(index, _)| state(*index) != Some(succeeded))
+                .find(|(index, _)| state(*index).is_some_and(|state| state != succeeded))
                 .filter(|(index, _)| state(*index).is_some_and(failed))
                 .map(|(_, op_id)| Outcome::Failed(op_id.clone()))
         };
@@ -1428,8 +1432,8 @@ fn hypothesis(
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
         Outcome::Failed(op_id) => format!(
-            "ended because step op_id={op_id} failed (its error is not known yet); the steps \
-             before it succeeded and the steps after it did not run"
+            "ended because step op_id={op_id} failed (its error is not known yet); every step \
+             that ran before it succeeded, and nothing after it ran"
         ),
     };
     let assume_nothing = "Do not assume any output value, and do not state one in `content`.";
@@ -1860,7 +1864,7 @@ mod tests {
     use super::{Branch, Outcome, Prepared, Speculation};
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
     use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState};
-    use crate::planner::{RTDL_DO, RTDL_SEQUENCE};
+    use crate::planner::{RTDL_DO, RTDL_FALLBACK, RTDL_IF, RTDL_PARALLEL, RTDL_SEQUENCE};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -1961,6 +1965,13 @@ mod tests {
                 &["p-1"],
             ),
             (vec![(0, Failed), (1, Timeout)], true, "failed:p-1", &[]),
+            // Step 2 sat in an `if` branch that was not taken, so it reports nothing.
+            (
+                vec![(0, Failed), (1, Succeeded), (3, Failed)],
+                true,
+                "failed:p-3",
+                &["p-1"],
+            ),
         ];
         for (states, any_failed, expected, finished) in cases {
             let mut spec = three_steps();
@@ -2197,13 +2208,15 @@ mod tests {
         };
         let steps: Vec<(u32, String)> = (1..=3).map(|i| (i, format!("p-{i}"))).collect();
         // find never failed in 20 calls, navigate once in 10, and pick was never seen.
-        let timings = super::Timings {
-            ended: HashMap::from([
-                ("x.scene_find".into(), (20, 0)),
-                ("x.navigation_navigate".into(), (10, 1)),
-            ]),
-            ..Default::default()
-        };
+        let mut timings = super::Timings::default();
+        for call in 0..20 {
+            timings.experience.finished("x.scene_find", false);
+            if call < 10 {
+                timings
+                    .experience
+                    .finished("x.navigation_navigate", call == 0);
+            }
+        }
         let picked = |budget| -> Vec<String> {
             super::failures_to_prepare(&timings, &plan, &steps, budget)
                 .into_iter()
@@ -2212,6 +2225,44 @@ mod tests {
         };
         assert_eq!(picked(true), ["p-3", "p-2"]);
         assert_eq!(picked(false), ["p-1", "p-2", "p-3"]);
+    }
+
+    #[test]
+    fn a_failure_can_be_prepared_for_under_an_if_but_not_past_a_fallback() {
+        let node = |node_kind: u32, children: &[u32]| RtdlNode {
+            node_kind,
+            children: children.to_vec(),
+            ..Default::default()
+        };
+        let steps = |nodes: Vec<RtdlNode>| -> Vec<u32> {
+            let plan = Plan {
+                nodes,
+                ..Default::default()
+            };
+            let steps = super::steps_in_order(&plan);
+            steps.into_iter().map(|(index, _)| index).collect()
+        };
+        let step = || node(RTDL_DO, &[]);
+        // do, then `if` over a sequence of two: the shape of "approach it only if reachable".
+        let under_if = vec![
+            node(RTDL_SEQUENCE, &[1, 2]),
+            step(),
+            node(RTDL_IF, &[3]),
+            node(RTDL_SEQUENCE, &[4, 5]),
+            step(),
+            step(),
+        ];
+        assert_eq!(steps(under_if), [1, 4, 5]);
+        // A fallback may absorb a failure, so what follows it is not known to have failed the tree.
+        let past_fallback = vec![
+            node(RTDL_SEQUENCE, &[1, 2, 4]),
+            step(),
+            node(RTDL_FALLBACK, &[3]),
+            step(),
+            step(),
+        ];
+        assert_eq!(steps(past_fallback), [1]);
+        assert_eq!(steps(vec![node(RTDL_PARALLEL, &[1]), step()]), [0; 0]);
     }
 
     #[tokio::test]

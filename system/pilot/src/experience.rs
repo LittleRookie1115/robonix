@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-//! How long capability calls take, learned from the calls Pilot has seen and
-//! kept across restarts, so that speculation can tell how long a tree will run.
+//! How long capability calls take and how often they fail, learned from the
+//! calls Pilot has seen and kept across restarts, so that speculation can tell
+//! how long a tree will run and which of its steps' failures to prepare for.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +24,9 @@ pub(crate) struct Experience {
     /// Recent navigations, as the straight-line metres between where the robot
     /// was and where it stopped, and the seconds they took.
     moves: VecDeque<(f64, f64)>,
+    /// How many calls of each capability ended, and how many of those failed.
+    #[serde(default)]
+    ended: HashMap<String, (u32, u32)>,
     /// Where the robot was last known to be, which the next navigation's
     /// distance is measured from; not kept across restarts.
     #[serde(skip)]
@@ -88,6 +92,21 @@ impl Experience {
             }
             self.position = Some(end);
         }
+    }
+
+    /// Record that a call of `capability` ended, and whether it failed.
+    pub(crate) fn finished(&mut self, capability: &str, failed: bool) {
+        let (ended, failures) = self.ended.entry(capability.into()).or_default();
+        *ended += 1;
+        *failures += u32::from(failed);
+    }
+
+    /// How often a call of `capability` fails, estimated from its calls so far
+    /// with one failure and one success assumed beforehand, so a capability
+    /// not yet seen counts as failing half the time.
+    pub(crate) fn failure_rate(&self, capability: &str) -> f64 {
+        let (ended, failed) = self.ended.get(capability).copied().unwrap_or_default();
+        f64::from(failed + 1) / f64::from(ended + 2)
     }
 
     /// The robot is at `at`, as the state view says at the start of a round.
@@ -207,9 +226,14 @@ mod tests {
         let mut seen = Experience::default();
         seen.locate((1.0, 1.0));
         seen.record("scene.scene_find", Duration::from_secs(3), "{}");
+        for failed in [true, false, false] {
+            seen.finished("arm.manipulation_pick", failed);
+        }
         std::fs::write(&path, seen.saved()).unwrap();
         let loaded = Experience::load(&path);
         assert_eq!(loaded.typical("scene.scene_find"), Some(3.0));
+        assert_eq!(loaded.failure_rate("arm.manipulation_pick"), 0.4);
+        assert_eq!(loaded.failure_rate("never.seen"), 0.5);
         assert_eq!(loaded.position(), None);
         assert_eq!(
             Experience::load(&dir.path().join("missing")).typical("x"),
