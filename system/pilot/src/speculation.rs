@@ -1005,7 +1005,9 @@ impl Speculation {
                 envelope.to_string()
             }
         };
-        let moved = moved(&envelope["rtdl"], then, objects);
+        // The objects the tree reaches through an earlier step's output count as named.
+        let mut tree = resolved(&envelope["rtdl"], &self.outputs);
+        let moved = moved(&tree, then, objects, &returned(&self.outputs));
         // A search was planned for what Scene did not list then; once Scene lists an
         // object that fits what the task looks for, the reply is not used.
         let mut new = match searches(&envelope["rtdl"]) {
@@ -1019,7 +1021,7 @@ impl Speculation {
             return Ok((reply, None));
         }
         let kept = match new.is_empty() {
-            true => cut(&mut envelope["rtdl"], &moved, &self.reads),
+            true => cut(&mut tree, &moved, &self.reads),
             false => None,
         };
         info!(
@@ -1044,6 +1046,7 @@ impl Speculation {
             ));
         }
         let changes = changes.join("; ");
+        envelope["rtdl"] = tree;
         match kept {
             None => Err(format!("read set changed: {changes}")),
             Some(kept) => Ok((
@@ -1458,10 +1461,16 @@ fn listed_since(then: &Value, now: &Value) -> Vec<String> {
     new
 }
 
-/// The objects `tree` names that `then` placed and `now` places in another
-/// region or not at all, each with what changed. Nothing when `now` places
-/// no object, since Scene's state is then unknown rather than changed.
-fn moved(tree: &Value, then: &Value, now: &Value) -> Vec<(String, String)> {
+/// The objects `tree` names that `then` placed, or that an earlier step
+/// `returned` though `then` did not list them, and that `now` places in another
+/// region or not at all, each with what changed. Nothing when `now` places no
+/// object, since Scene's state is then unknown rather than changed.
+fn moved(
+    tree: &Value,
+    then: &Value,
+    now: &Value,
+    returned: &HashSet<String>,
+) -> Vec<(String, String)> {
     let (then, now) = (placed(then), placed(now));
     if now.is_empty() {
         return Vec::new();
@@ -1479,8 +1488,74 @@ fn moved(tree: &Value, then: &Value, now: &Value) -> Vec<(String, String)> {
             (id.to_string(), change)
         })
         .collect();
+    // Scene lists an object only once the robot has seen it, so a reply written
+    // before a search often names what the search found, which it then relies on too.
+    moved.extend(
+        returned
+            .iter()
+            .filter(|id| !then.contains_key(id.as_str()) && !now.contains_key(id.as_str()))
+            .filter(|id| names(&text, id))
+            .map(|id| {
+                let change = format!(
+                    "{id}, which an earlier step found, is no longer among Scene's objects"
+                );
+                (id.clone(), change)
+            }),
+    );
     moved.sort();
     moved
+}
+
+/// `tree` with each `{"var": "<op_id>", "path": [...]}` naming a finished step
+/// filled in from `outputs`, as the tree is filled in when it is dispatched,
+/// unless the tree binds that name itself; a reference that does not resolve
+/// stays as it is.
+fn resolved(tree: &Value, outputs: &HashMap<String, String>) -> Value {
+    fn resolve(value: &mut Value, outputs: &HashMap<String, String>, bound: &[&str]) {
+        match value {
+            Value::Object(fields) if crate::expression::is_reference(fields) => {
+                let mut filled = value.clone();
+                if crate::rtdl_stream::fill(&mut filled, outputs, bound).is_ok() {
+                    *value = filled;
+                }
+            }
+            Value::Object(fields) => fields.values_mut().for_each(|v| resolve(v, outputs, bound)),
+            Value::Array(items) => items.iter_mut().for_each(|v| resolve(v, outputs, bound)),
+            _ => {}
+        }
+    }
+    let nodes = do_nodes(tree);
+    let bound: Vec<&str> = nodes
+        .iter()
+        .filter_map(|node| node["bind"].as_str())
+        .collect();
+    let mut tree = tree.clone();
+    resolve(&mut tree, outputs, &bound);
+    tree
+}
+
+/// The ids of the objects the finished steps in `outputs` returned: every
+/// string `id` in their outputs, such as find's objects.
+fn returned(outputs: &HashMap<String, String>) -> HashSet<String> {
+    fn collect(value: &Value, ids: &mut HashSet<String>) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(id) = fields.get("id").and_then(Value::as_str) {
+                    ids.insert(id.to_string());
+                }
+                fields.values().for_each(|v| collect(v, ids));
+            }
+            Value::Array(items) => items.iter().for_each(|v| collect(v, ids)),
+            _ => {}
+        }
+    }
+    let mut ids = HashSet::new();
+    for output in outputs.values() {
+        if let Ok(value) = serde_json::from_str::<Value>(output) {
+            collect(&value, &mut ids);
+        }
+    }
+    ids
 }
 
 /// Whether JSON `text` has `id` as a whole string value.
@@ -2716,21 +2791,63 @@ mod tests {
     fn a_tree_relies_only_on_the_objects_it_names_staying_in_their_region() {
         let then = objects(&[("kitchen", &["o1", "o2"]), ("elsewhere", &[])]);
         let tree = fetch();
-        assert!(super::moved(&tree, &then, &then).is_empty());
+        let none = Default::default();
+        assert!(super::moved(&tree, &then, &then, &none).is_empty());
         // Another object moving, or one appearing, changes nothing the tree read.
         let others = objects(&[("kitchen", &["o1", "o3"]), ("elsewhere", &["o2"])]);
-        assert!(super::moved(&tree, &then, &others).is_empty());
+        assert!(super::moved(&tree, &then, &others, &none).is_empty());
         let gone = objects(&[("kitchen", &["o2"]), ("elsewhere", &[])]);
-        let moved = super::moved(&tree, &then, &gone);
+        let moved = super::moved(&tree, &then, &gone, &none);
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].0, "o1");
         let elsewhere = objects(&[("kitchen", &["o2"]), ("bedroom", &["o1"])]);
-        assert_eq!(super::moved(&tree, &then, &elsewhere).len(), 1);
+        assert_eq!(super::moved(&tree, &then, &elsewhere, &none).len(), 1);
         // With no objects known now, Scene's state is unknown rather than changed.
-        assert!(super::moved(&tree, &then, &serde_json::Value::Null).is_empty());
+        assert!(super::moved(&tree, &then, &serde_json::Value::Null, &none).is_empty());
         // An id inside a longer string is not a name.
         let tree = serde_json::json!({"op": "do", "cap": "x", "args": {"note": "near o1 here"}});
-        assert!(super::moved(&tree, &then, &gone).is_empty());
+        assert!(super::moved(&tree, &then, &gone, &none).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_object_reached_through_an_earlier_steps_output_is_checked_too() {
+        use serde_json::json;
+        // The search found o7, which the state the reply was written from did not list yet.
+        let found = json!({"objects": [{"id": "o7", "label": "apple"}]}).to_string();
+        let spec = Speculation {
+            outputs: [("p-1".to_string(), found)].into(),
+            ..three_steps()
+        };
+        let apple = json!({"var": "p-1", "path": ["objects", 0, "id"]});
+        let call =
+            |cap: &str, args: serde_json::Value| json!({"op": "do", "cap": cap, "args": args});
+        let fetch = json!({"op": "sequence", "children": [
+            call("scene.scene_goal_near", json!({"object_id": apple})),
+            call("manipulation.manipulation_pick", json!({"object": "apple"})),
+        ]});
+        let reply = json!({"content": "", "rtdl": fetch}).to_string();
+        let then = objects(&[("kitchen", &["o1"])]);
+        let still = objects(&[("kitchen", &["o1", "o7"])]);
+        let gone = objects(&[("kitchen", &["o1"])]);
+        let (kept, note) = spec.validate(reply.clone(), &then, &still).await.unwrap();
+        assert_eq!((kept, note), (reply.clone(), None));
+        let why = spec
+            .validate(reply.clone(), &then, &gone)
+            .await
+            .unwrap_err();
+        assert!(why.contains("o7, which an earlier step found"), "{why}");
+        // A reference the outputs cannot answer, or one the tree binds itself, is left alone.
+        assert_eq!(
+            super::resolved(&json!({"var": "p-9", "path": ["x"]}), &spec.outputs)["var"],
+            "p-9"
+        );
+        let bound = json!({"op": "sequence", "children": [
+            {"op": "do", "cap": "x", "bind": "p-1", "args": {}},
+            call("y", json!({"object_id": apple}))]});
+        assert_eq!(
+            super::resolved(&bound, &spec.outputs)["children"][1]["args"]["object_id"]["var"],
+            "p-1"
+        );
     }
 
     #[test]

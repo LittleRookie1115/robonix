@@ -814,7 +814,11 @@ impl RtdlIncrementalParser {
     }
 }
 
-fn fill(value: &mut Value, outputs: &HashMap<String, String>, bound: &[&str]) -> Result<()> {
+pub(crate) fn fill(
+    value: &mut Value,
+    outputs: &HashMap<String, String>,
+    bound: &[&str],
+) -> Result<()> {
     match value {
         Value::Object(map) if crate::expression::is_reference(map) => {
             let name = map["var"].as_str().unwrap_or_default();
