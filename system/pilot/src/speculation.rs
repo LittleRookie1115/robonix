@@ -252,12 +252,21 @@ const FITS: &str = "The plan was about to search for searched_for. Does any obje
                     newly_listed plainly fit what the task asks to find or act on, so that \
                     searching elsewhere is unnecessary?";
 
+/// The command is taken to be right about where its people and objects are, so a
+/// prepared reply never looks for them, or acts on a stand-in, anywhere else:
+/// not finding them where the command says is for the planning request, which
+/// sees the results, to judge.
+const NAMED_PLACES: &str = "Take the command to be right about where its people and objects are: \
+     where it names a room or a piece of furniture for one of them, a reply looks for that person \
+     or object only there, from another viewpoint if a look found nothing, and never acts on a \
+     person or object elsewhere in its place. ";
+
 const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene's object list \
      may show although these steps' outputs do not name it, for example because a search by a \
      category such as \"fruit\" finds nothing under that word, write {\"choose\": \"<what the \
      object must be>\"} in place of its id, with the same text wherever the same object is meant: \
-     Pilot puts in the id of the listed object the decision model finds fits, and does not use the \
-     reply if none does. ";
+     Pilot puts in the id of the listed object the decision model finds fits, among those in the \
+     rooms the command names if it names any, and does not use the reply if none does. ";
 
 const CHOOSE: &str = "The robot is about to act on the object that looking_for describes, for \
                       the task. Which listed object is it? If none of them plainly is, pick the \
@@ -1059,7 +1068,9 @@ impl Speculation {
         if DECISION_MODEL.is_none() {
             return Err("no decision model to choose an object".into());
         }
+        let rooms = named_rooms(&self.task, objects);
         let regions = objects.as_object().into_iter().flatten();
+        let regions = regions.filter(|(region, _)| rooms.is_empty() || rooms.contains(region));
         let listed: Vec<(String, String)> = regions
             .flat_map(|(region, listed)| {
                 let listed = listed.as_array().into_iter().flatten();
@@ -1374,6 +1385,19 @@ fn repeated_in_vain(tree: &Value, steps: &Value, reads: &HashSet<String>) -> boo
     do_nodes(tree).into_iter().any(repeats)
 }
 
+/// The rooms among `objects`' regions that `task` names, every word of each.
+fn named_rooms<'a>(task: &str, objects: &'a Value) -> Vec<&'a String> {
+    let said = words(task);
+    let regions = objects.as_object().into_iter().flatten();
+    regions
+        .map(|(region, _)| region)
+        .filter(|region| {
+            let room = words(region);
+            !room.is_empty() && room.is_subset(&said)
+        })
+        .collect()
+}
+
 /// Add to `wanted` what each `{"choose": "<what the object must be>"}` in `value` asks for, once each.
 fn to_choose(value: &Value, wanted: &mut Vec<String>) {
     match value {
@@ -1548,8 +1572,10 @@ fn hypothesis(
              likely show, with a reply that carries the task as far from there as one tree can. \
              Then the careful one: the outputs show otherwise, or too little to act on, with a \
              reply that still moves the task forward without relying on them: acting on an \
-             object the environment state already lists that fits the task, if there is one, \
-             else looking again from elsewhere or searching the next likely place. Neither reply may give the \
+             object the environment state already lists that fits the task and is in the place \
+             the command names, if it names one and there is such an object; else looking again \
+             in that place from another viewpoint; else, if the command names no place, \
+             searching the next likely place. Neither reply may give the \
              task up or report that it cannot be done: where that is the only course, that \
              situation's reply asks for the results instead. Reporting the task done is the \
              bold course when this plan's success completes it. Answer {\"situations\": \
@@ -1581,12 +1607,13 @@ fn hypothesis(
          this plan ran."
     };
     let choose = if situations { CHOOSE_IN_REPLY } else { "" };
+    let places = NAMED_PLACES;
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
          {known} {ask} {assume} Where the next step depends on an output of these \
          steps, refer to it as {{\"var\": \"<op_id>\", \"path\": [\"<field>\"]}} and decide \
-         with `if`. {choose}If that cannot express what the next step needs, reply with `content` \
+         with `if`. {places}{choose}If that cannot express what the next step needs, reply with `content` \
          exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
          outcome matches its assumption."
     )
@@ -2236,6 +2263,39 @@ mod tests {
             &reads
         ));
         assert!(!super::reads_only(&tree(vec![]), &reads));
+    }
+
+    #[test]
+    fn an_object_is_chosen_only_in_the_rooms_the_command_names() {
+        use serde_json::json;
+        let objects = json!({"bedroom": [], "laundry": [], "living room": [], "kitchen": [], "elsewhere": []});
+        let named = |task: &str| -> Vec<String> {
+            let mut rooms: Vec<String> = super::named_rooms(task, &objects)
+                .into_iter()
+                .cloned()
+                .collect();
+            rooms.sort();
+            rooms
+        };
+        let preamble =
+            "You are at the instruction point. Adel, the operator, gives you this command:\n";
+        assert_eq!(
+            named(&format!(
+                "{preamble}Go to the bedroom then meet Robin and tell the time"
+            )),
+            ["bedroom"]
+        );
+        assert_eq!(
+            named("Locate a milk in the kitchen then give it to Simone in the living room"),
+            ["kitchen", "living room"]
+        );
+        assert_eq!(
+            named("Give me a black shirt from the laundry table"),
+            ["laundry"]
+        );
+        assert!(named("Find a person and tell them the time").is_empty());
+        // "room" alone names no room.
+        assert!(named("Tell me how many people are in the room").is_empty());
     }
 
     #[test]
