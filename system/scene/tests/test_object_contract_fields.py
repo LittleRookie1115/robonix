@@ -82,6 +82,16 @@ def test_observation_count_is_published():
     assert idl.observation_count >= 1
 
 
+def test_a_restored_object_is_published_as_restored():
+    from scene_service.mcp_tools import _to_idl
+
+    registry, oid = make_registry()
+    obj = asyncio.run(_get(registry, oid))
+    assert _to_idl(obj).restored is False
+    obj.attributes["restored"] = True
+    assert _to_idl(obj).restored is True
+
+
 def test_generation_supported_reports_a_weak_epoch():
     registry, _oid = make_registry()
     assert make_coordinator(registry).generation_supported() is True

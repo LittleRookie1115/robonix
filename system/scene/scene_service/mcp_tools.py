@@ -78,6 +78,11 @@ _ANNO_STORE: "AnnotationStore | None" = None
 _OBJECT_MUTATIONS: "ObjectMutationCoordinator | None" = None
 _ROBOT_GEOMETRY: RobotGeometryState | None = None
 
+# A loaded map's objects stay hidden until the robot sees them again, unless
+# this lists them as `restored`: where the map last saw each, which a caller
+# may plan from but has to confirm.
+_LIST_RESTORED = os.environ.get("SCENE_LIST_RESTORED", "").strip().lower() in ("1", "true", "yes")
+
 # Scene Hook: when list_objects detects visible objects, automatically capture
 # the latest RGB frame and POST to memgraph's Scene Hook HTTP endpoint so the
 # robot's memory is updated without Pilot involvement. Set MEMGRAPH_HOOK_URL to
@@ -286,6 +291,7 @@ def _to_idl(o: SceneObject) -> Object:
         frame_id=frame,
         observation_count=max(0, int(o.observation_count)),
         last_seen_unix=float(o.last_seen),
+        restored=bool(o.attributes.get("restored")),
     )
 
 
@@ -419,7 +425,7 @@ async def list_objects(_req: ListObjects_Request) -> ListObjects_Response:
     Contract: robonix/system/scene/list_objects."""
     objs, map_id, generation, generation_supported = await _epoch_snapshot()
     visible = [o for o in objs.values() if not o.missing]
-    objects = [_to_idl(o) for o in visible]
+    objects = [_to_idl(o) for o in objs.values() if find_impl.listed(o, _LIST_RESTORED)]
     if _ANNO_STORE is not None:
         objects.extend(
             _annotation_to_object(annotation)
@@ -571,7 +577,9 @@ async def find(req: Find_Request) -> Find_Response:
 
     `region` is a region's name or id. With `settle_s`, the answer is given
     once it has stopped changing, and an empty one only when the time is up.
-    Use instead of list_objects when looking for something.
+    An object marked `restored` is where a saved map last saw it; the robot
+    has not seen it since. Use instead of list_objects when looking for
+    something.
     Contract: robonix/system/scene/find."""
     settle_s = min(max(float(getattr(req, "settle_s", 0.0) or 0.0), 0.0), _FIND_SETTLE_MAX_S)
     deadline = time.monotonic() + settle_s
@@ -590,7 +598,8 @@ async def find(req: Find_Request) -> Find_Response:
             objects, label=req.label or "", region=region,
             relation=req.relation or "", anchor=req.anchor or "", regions=regions,
             edges=list(snapshot.edges) if snapshot else [],
-            robot_xy=(float(robot.pose.x), float(robot.pose.y)) if robot else None)
+            robot_xy=(float(robot.pose.x), float(robot.pose.y)) if robot else None,
+            restored=_LIST_RESTORED)
         now = time.monotonic()
         ids = [o.object_id for o in matches]
         if ids != seen:
@@ -660,7 +669,7 @@ async def get_robot_context(_req: GetRobotContext_Request) -> GetRobotContext_Re
     containing.sort(key=lambda annotation: (annotation.kind, annotation.name))
     nearby = []
     for item in objects.values():
-        if item is robot or item.missing:
+        if item is robot or not find_impl.listed(item, _LIST_RESTORED):
             continue
         distance = math.hypot(float(item.pose.x) - x, float(item.pose.y) - y)
         if distance <= 3.0:

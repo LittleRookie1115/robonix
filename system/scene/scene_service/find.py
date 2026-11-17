@@ -42,12 +42,19 @@ def _edge_holds(edges: list, subject_id: str, relation: str, anchor_id: str) -> 
                and e.target_id == anchor_id and e.shown_on_map() for e in edges)
 
 
+def listed(obj: Any, restored: bool) -> bool:
+    """Whether Scene lists `obj`: it believes the object exists or, with
+    `restored`, a loaded map holds it and the robot has not seen it since."""
+    return not obj.missing or (restored and bool(obj.attributes.get("restored")))
+
+
 def find(objects: dict, *, label: str = "", region: str = "", relation: str = "",
          anchor: str = "", regions: Optional[list] = None, edges: Optional[list] = None,
-         robot_xy: Optional[tuple[float, float]] = None) -> tuple[list, str]:
+         robot_xy: Optional[tuple[float, float]] = None,
+         restored: bool = False) -> tuple[list, str]:
     """`(matches, why_empty)`; empty constraints match everything."""
     pool = [o for o in objects.values()
-            if not o.missing and not o.attributes.get("is_robot")]
+            if listed(o, restored) and not o.attributes.get("is_robot")]
     if label:
         want = _tokens(label)
         pool = [o for o in pool if _matches(want, o)]
