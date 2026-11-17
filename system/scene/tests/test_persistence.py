@@ -482,6 +482,21 @@ def test_find_matches_every_word_asked_for_or_the_whole_class():
     assert labels("red") == ["red_bell_pepper", "red_bull"]
     assert labels("kitchen trash bin") == ["trash_bin"]
 
+
+def test_find_lists_a_restored_object_only_when_asked_to():
+    from scene_service.find import find
+    reg = ObjectRegistry()
+    seen = _live(reg, "cup", 1.0)
+    prior = _make_obj("scene.object.0042", "cup")
+    prior.missing = True
+    reg.restore_object(prior)
+    gone = _live(reg, "cup", 2.0)
+    reg.soft_evict(gone)
+    objs = {o.object_id: o for o in reg.all_objects()}
+    ids = lambda restored: sorted(o.object_id for o in find(objs, label="cup", restored=restored)[0])
+    assert ids(False) == [seen.object_id]
+    assert ids(True) == sorted([seen.object_id, prior.object_id])
+
 def test_a_crop_of_the_wall_behind_is_not_a_view():
     import numpy as np
     from scene_service.object_views import looks_like

@@ -3,7 +3,9 @@
 # The robot itself appears here with its current map-frame pose;
 # yaw is meaningful for it. For passive objects yaw is the best-effort
 # orientation the registry has (0.0 if unknown). The registry only
-# emits objects it currently believes exist (no missing flag).
+# emits objects it currently believes exist, and those a saved map holds
+# that the robot has not seen again (`restored`) where Scene is set to list
+# them.
 
 string id
 string label
@@ -34,3 +36,7 @@ string frame_id
 # quantity under the same name and is already published.
 int32 observation_count
 float64 last_seen_unix
+# Loaded from a saved map and not observed since: x/y/z are where the map
+# last saw it, at last_seen_unix, and it may have moved or gone since. The
+# robot seeing it again near there clears this and keeps the id.
+bool restored

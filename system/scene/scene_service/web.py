@@ -265,6 +265,7 @@ def _state_payload(registry: ObjectRegistry,
             "confidence": o.confidence,
             "observation_count": o.observation_count,
             "missing": o.missing,
+            "restored": bool(o.attributes.get("restored", False)),
             "provisional": bool(o.attributes.get("label_provisional", False)),
         })
         if o.attributes.get("is_robot"):

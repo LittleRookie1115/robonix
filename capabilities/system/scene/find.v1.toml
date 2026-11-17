@@ -4,7 +4,7 @@ id      = "robonix/system/scene/find"
 version = "1"
 kind    = "service"
 idl     = "semantic_map/srv/Find.srv"
-description = "The objects matching a class, a region and one scene-graph relation, nearest the robot first."
+description = "The objects matching a class, a region and one scene-graph relation, nearest the robot first. An object marked `restored` is where a saved map last saw it and has not been seen since."
 
 [mode]
 type = "rpc"
