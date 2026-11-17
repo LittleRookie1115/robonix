@@ -753,7 +753,8 @@ Without the overlay, Scene falls back to static binding
 with a warning. At runtime the lifecycle watcher clears derived objects after
 a map-frame epoch change and marks annotations stale, except when the change
 is a relocalization on the saved map already localized on: that map's frame
-has not moved, so annotations stay valid. If mapping switches to
+has not moved, so annotations stay valid and the saved map's objects are
+restored again, as a load restores them. If mapping switches to
 a different named map outside Scene, it clears mis-anchored objects and blocks
 Save until an explicit Load restores a coherent binding.
 

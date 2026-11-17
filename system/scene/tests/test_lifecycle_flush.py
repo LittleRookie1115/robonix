@@ -150,8 +150,9 @@ def test_confirm_bump_and_cross_map_drift():
 
 
 def test_relocalizing_on_a_saved_map_keeps_annotations_fresh():
-    """A bump while localizing on the same saved map flushes objects but keeps
-    named places fresh, across a restart too."""
+    """A bump while localizing on the same saved map flushes what was seen,
+    puts the saved map's objects back and keeps named places fresh, across a
+    restart too."""
     service_mod = _service_mod()
     if service_mod is None:
         return
@@ -165,15 +166,26 @@ def test_relocalizing_on_a_saved_map_keeps_annotations_fresh():
         hub = FakeHub()
         live = {"map_id": "m1", "mode": "localization", "generation": 1,
                 "source": "ui_load"}
+        restored = []
+
+        async def restore(map_id):
+            restored.append(map_id)
+            async with registry.lock():
+                registry.restore_object(_obj("saved"))
+            return 1
+
         task = asyncio.create_task(service_mod._lifecycle_watch(
             hub, MapBinding(map_id="m1", source="ui_load"), anno,
             registry=registry, live_binding=live, interval_s=0.01,
+            restore=restore,
         ))
         try:
             hub.set("m1", 2, mode="localization")
             await _settle()
             assert live["generation"] == 2, live
-            assert registry._objects == {}, registry._objects
+            assert set(registry._objects) == {"saved"}, registry._objects
+            assert registry._objects["saved"].attributes["restored"]
+            assert restored == ["m1"]
             assert not anno.list()[0].stale
             reloaded = AnnotationStore(
                 os.path.join(tmp, "anno"), map_id="m1", generation=2
