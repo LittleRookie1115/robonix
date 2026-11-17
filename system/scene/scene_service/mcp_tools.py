@@ -17,7 +17,7 @@ if TYPE_CHECKING:  # pragma: no cover
 from .scene_graph.store import SceneGraphStore
 from .scene_graph.types import SceneGraphSnapshot
 from .geometry import point_in_polygon, polygon_centroid
-from .goal_planner import object_goal, pose_clear, room_goal, room_yaw_candidates
+from .goal_planner import nav_cost_ok, object_goal, pose_clear, room_goal, room_yaw_candidates
 from .robot_geometry import RobotGeometryState
 
 if TYPE_CHECKING:
@@ -880,12 +880,18 @@ async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
             yaw=0.0,
             reason="occupancy_grid frame is unknown",
         )
+    costmap = _nav_costmap(grid_frame)
     if region.kind == "poi":
         (x, y), yaw = region.points[0], float(region.theta or 0.0)
         if not pose_clear(msg, footprint, x, y, yaw):
             return GoalRegion_Response(
                 reachable=False, x=0.0, y=0.0, yaw=0.0,
                 reason=f"the robot does not fit at POI '{region.name}' ({stable_region_id})",
+            )
+        if costmap is not None and not nav_cost_ok(costmap, x, y):
+            return GoalRegion_Response(
+                reachable=False, x=0.0, y=0.0, yaw=0.0,
+                reason=f"Navigation's costmap marks POI '{region.name}' ({stable_region_id}) occupied",
             )
         return GoalRegion_Response(
             reachable=True, x=float(x), y=float(y), yaw=yaw,
@@ -896,6 +902,7 @@ async def goal_region(req: GoalRegion_Request) -> GoalRegion_Response:
         region.points,
         footprint,
         yaw_candidates=room_yaw_candidates(region.points),
+        nav_costmap=costmap,
     )
     if found is None:
         return GoalRegion_Response(

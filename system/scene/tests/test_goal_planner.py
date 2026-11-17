@@ -107,6 +107,21 @@ def test_room_goal_keeps_off_a_table_the_lidar_sees_only_the_legs_of():
     assert max(abs(x - 1.5), abs(y - 1.5)) > 0.6
 
 
+def test_room_goal_steps_off_what_navigation_now_marks_occupied():
+    """A box put down on the room's most open floor since the map was made: the
+    map still shows it free, Navigation's costmap does not, and the goal moves."""
+    grid = _grid(width=60, height=60)
+    room = [(-1.5, -1.5), (4.5, -1.5), (4.5, 4.5), (-1.5, 4.5)]
+    x, y, _yaw = room_goal(grid, room, _footprint(0.1, 0.1), yaw_candidates=(0.0,))
+    costmap = _grid(width=60, height=60)
+    marked = np.zeros((60, 60), dtype=np.int8)
+    gx, gy = round((x + 1.5) / 0.1 - 0.5), round((y + 1.5) / 0.1 - 0.5)
+    marked[gy - 3 : gy + 4, gx - 3 : gx + 4] = 100
+    costmap.data = marked.tobytes()
+    moved = room_goal(grid, room, _footprint(0.1, 0.1), yaw_candidates=(0.0,), nav_costmap=costmap)
+    assert moved is not None and math.hypot(moved[0] - x, moved[1] - y) >= 0.3
+
+
 def test_object_goal_uses_complete_polygon():
     """A returned object approach pose keeps the real footprint in bounds."""
     grid = _grid(width=12, height=12)
