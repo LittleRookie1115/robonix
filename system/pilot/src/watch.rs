@@ -15,25 +15,46 @@
 //! act that names a class (`{"object": "cornflakes"}`) relies on the objects of
 //! that class the tree knew of, once Scene lists none of that class and no step
 //! still to run searches for it. An object Scene no longer lists is not gone if
-//! Scene lists one of its class where it was: Scene folds duplicate records of
-//! one object into one, retiring all ids but one.
+//! Scene lists one of its class where it was, within 0.5 m beyond the object's
+//! own extent: Scene folds duplicate records of one object into one, retiring
+//! all ids but one, and a person's records spread over their body.
+//!
+//! A navigation still to run relies on its goal, written in its arguments or
+//! read from a finished step (goal_region's or goal_near's): Scene's
+//! goal_clear checks it against the map and Navigation's live costmap, and a
+//! goal not clear on two readings stops the tree. Where the goal was a
+//! region's, the goal the state view keeps for the region is dropped so that
+//! it is asked for again.
 //!
 //! Only a tree with a step left that does more than read (the task's
-//! `read_only`) is stopped, and only until one of its steps beyond reading,
-//! moving the robot or speaking has succeeded: from then on the tree has
-//! changed the world itself, and an object it took is expected to leave its
-//! place.
+//! `read_only`) is stopped. Once a step beyond reading, moving the robot or
+//! speaking has succeeded, in this tree or an earlier one of the turn, what it
+//! acted on (what it names, by id or class, or read from earlier steps) is no
+//! longer watched: an object the robot took is expected to leave its place,
+//! while the person it is to be handed to is still relied on.
 
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use crate::pb::pilot::{Plan, RtdlNodeState};
 use crate::planner::RTDL_DO;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// How far from where an object was another of its class may be listed and
-/// still stand for it: Scene folds records of one class within 0.35 m.
+/// still stand for it, beyond the object's own extent: Scene folds records of
+/// one class within 0.35 m, and a person's records spread over their body.
 const SAME_M: f64 = 0.5;
+
+/// What one goal is keyed by in goal_clear's answers: its position to the centimetre.
+pub(crate) fn goal_key(goal: &Value) -> Option<String> {
+    position(goal).map(|(x, y)| format!("{x:.2},{y:.2}"))
+}
+
+/// The map position of a navigation goal, a PoseStamped.
+fn position(goal: &Value) -> Option<(f64, f64)> {
+    let at = &goal["pose"]["position"];
+    Some((at["x"].as_f64()?, at["y"].as_f64()?))
+}
 
 /// What Scene says of one object, as the watch compares it.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +63,8 @@ pub(crate) struct Listing {
     pub(crate) label: String,
     /// Its map position in metres, where the source gives one.
     pub(crate) at: Option<(f64, f64)>,
+    /// The larger of its horizontal extents in metres, 0 where unknown.
+    pub(crate) size: f64,
 }
 
 /// Each object in `value` with an id and a label, by id: Scene's find output,
@@ -54,15 +77,17 @@ pub(crate) fn listings(value: &Value) -> HashMap<String, Listing> {
                 let id = fields.get("id").and_then(Value::as_str);
                 let label = fields.get("label").and_then(Value::as_str);
                 if let (Some(id), Some(label)) = (id, label) {
-                    let at = fields
-                        .get("x")
-                        .and_then(Value::as_f64)
-                        .zip(fields.get("y").and_then(Value::as_f64));
+                    let number = |key: &str| fields.get(key).and_then(Value::as_f64);
+                    let at = number("x").zip(number("y"));
+                    let size = number("size_x")
+                        .unwrap_or(0.0)
+                        .max(number("size_y").unwrap_or(0.0));
                     out.insert(
                         id.into(),
                         Listing {
                             label: label.into(),
                             at,
+                            size,
                         },
                     );
                 }
@@ -75,6 +100,13 @@ pub(crate) fn listings(value: &Value) -> HashMap<String, Listing> {
     let mut out = HashMap::new();
     collect(value, &mut out);
     out
+}
+
+/// Whether `args` names the class `class`, as `"cornflakes"` or `"red bull"`.
+fn names_class(args: &str, class: &str) -> bool {
+    [class.to_string(), class.replace('_', " ")]
+        .iter()
+        .any(|form| args.contains(&format!("\"{form}\"")))
 }
 
 /// The names `args` reads through `{"var": "<name>", ...}`.
@@ -122,22 +154,33 @@ pub(crate) struct Watch {
     outputs: HashMap<String, String>,
     /// Node indices of its steps that have ended.
     ended: HashSet<u32>,
-    /// Whether a step that may move objects has succeeded, which ends the watch.
-    acted: bool,
+    /// What this turn's own steps acted on, in this tree or an earlier one: the
+    /// ids, and the classes, named by a succeeded step that does more than read,
+    /// move the robot or speak. An object the robot took is expected to leave its
+    /// place; shared by the watches of one turn.
+    taken: Arc<Mutex<HashSet<String>>>,
     /// The task's read-only capabilities, by contract id.
     reads: Arc<HashSet<String>>,
     /// Objects found gone at the last reading, which the next must confirm.
     gone: Vec<String>,
+    /// Each region's name and goal as the state view showed them, by region id.
+    places: HashMap<String, (String, (f64, f64))>,
+    /// The goals (by [`goal_key`]) goal_clear found not clear at the last
+    /// reading, which the next must confirm.
+    blocked: Vec<String>,
 }
 
 impl Watch {
     /// Watch `plan`, written from the objects in `then`, Scene's objects by
-    /// region, which Scene's list `listed` places.
+    /// region, which Scene's list `listed` places, and the regions in `places`,
+    /// the state view's; `taken` is what the turn's steps have acted on.
     pub(crate) fn new(
         plan: &Plan,
         then: Value,
         listed: HashMap<String, Listing>,
+        places: &Value,
         reads: Arc<HashSet<String>>,
+        taken: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         let steps = plan
             .nodes
@@ -165,7 +208,20 @@ impl Watch {
             known,
             outputs: HashMap::new(),
             ended: HashSet::new(),
-            acted: false,
+            taken,
+            places: places
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|place| {
+                    let name = place["name"].as_str().unwrap_or_default();
+                    Some((
+                        place["id"].as_str()?.into(),
+                        (name.into(), position(&place["goal"])?),
+                    ))
+                })
+                .collect(),
+            blocked: Vec::new(),
             reads,
             gone: Vec::new(),
         }
@@ -195,16 +251,43 @@ impl Watch {
             self.outputs
                 .insert(step.op_id.clone(), result.output.clone());
         }
-        self.acted |= !self.reads.contains(&step.contract)
-            && !["/navigation/", "/speech/"]
-                .iter()
-                .any(|kind| step.contract.contains(kind));
+        if self.acts(step) {
+            let acted = self.acted_on(step);
+            self.taken
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(acted);
+        }
     }
 
-    /// Whether a change could still stop the tree: it has not acted on the
-    /// world itself and has a step left that does more than read.
+    /// Whether `step` may move what it names: it does more than read, move the
+    /// robot or speak.
+    fn acts(&self, step: &Step) -> bool {
+        !self.reads.contains(&step.contract)
+            && !["/navigation/", "/speech/"]
+                .iter()
+                .any(|kind| step.contract.contains(kind))
+    }
+
+    /// What `step` acts on: the objects it names, by id or class, and those it
+    /// reads from earlier steps.
+    fn acted_on(&self, step: &Step) -> HashSet<String> {
+        let mut acted = self.found(std::iter::once(step));
+        for (id, listing) in &self.known {
+            if crate::speculation::names(&step.args, id) {
+                acted.insert(id.clone());
+            }
+            if names_class(&step.args, &listing.label) {
+                acted.insert(listing.label.clone());
+            }
+        }
+        acted
+    }
+
+    /// Whether a change could still stop the tree: it has a step left that does
+    /// more than read.
     pub(crate) fn armed(&self) -> bool {
-        !self.acted && !self.left().is_empty()
+        !self.left().is_empty()
     }
 
     /// The op_ids of the steps that have not ended and do more than read.
@@ -214,34 +297,87 @@ impl Watch {
         acting.map(|step| step.op_id.as_str()).collect()
     }
 
-    fn unended(&self) -> impl Iterator<Item = &Step> {
-        self.steps
-            .iter()
-            .filter(|step| !self.ended.contains(&step.index))
-    }
-
-    /// The objects the tree relies on that `listed`, Scene's list now, lacks at
-    /// this reading and lacked at the one before, each as "<id> (<label> in
-    /// <region> when the tree was written)"; nothing unless [`Watch::armed`].
-    pub(crate) fn check(&mut self, listed: &HashMap<String, Listing>) -> Vec<String> {
-        if !self.armed() {
-            self.gone.clear();
-            return Vec::new();
-        }
-        for (id, listing) in listed {
-            if self.known.contains_key(id) {
-                self.known.insert(id.clone(), listing.clone());
+    /// The goal each navigation still to run heads for, where it can be read:
+    /// written in its arguments, or the part of a finished step's output it
+    /// reads (goal_region's or goal_near's `goal`). Each as (op_id, the goal, a
+    /// PoseStamped, and the region whose goal it is, if any: the region a
+    /// goal_region step was asked for, or one whose goal the state view showed).
+    fn destinations(&self) -> Vec<(&str, Value, Option<&str>)> {
+        let navigations = self
+            .unended()
+            .filter(|step| step.contract.ends_with("navigation/navigate"));
+        let mut out = Vec::new();
+        for step in navigations {
+            let args: Value = serde_json::from_str(&step.args).unwrap_or_default();
+            let written = &args["goal"];
+            let (goal, region) = match written["var"].as_str() {
+                Some(name) => {
+                    let Some(source) = self.steps.iter().find(|s| s.bind == name) else {
+                        continue;
+                    };
+                    let Some(output) = self.outputs.get(&source.op_id) else {
+                        continue;
+                    };
+                    let output: Value = serde_json::from_str(output).unwrap_or_default();
+                    let path = written["path"].as_array().into_iter().flatten();
+                    let goal = path.fold(&output, |value, key| match key {
+                        Value::String(key) => &value[key.as_str()],
+                        Value::Number(index) => &value[index.as_u64().unwrap_or(0) as usize],
+                        _ => &Value::Null,
+                    });
+                    let asked: Value = serde_json::from_str(&source.args).unwrap_or_default();
+                    let region = match source.contract.ends_with("scene/goal_region") {
+                        true => asked["region_id"]
+                            .as_str()
+                            .and_then(|id| self.places.get_key_value(id))
+                            .map(|(id, _)| id.as_str()),
+                        false => None,
+                    };
+                    (goal.clone(), region)
+                }
+                None => {
+                    let region = position(written).and_then(|(x, y)| {
+                        self.places
+                            .iter()
+                            .find(|(_, (_, (gx, gy)))| (gx - x).hypot(gy - y) < 0.05)
+                            .map(|(region, _)| region.as_str())
+                    });
+                    (written.clone(), region)
+                }
+            };
+            if position(&goal).is_some() {
+                out.push((step.op_id.as_str(), goal, region));
             }
         }
-        let text: String = self.steps.iter().map(|step| step.args.as_str()).collect();
-        let mut relied: HashSet<String> = self
-            .known
-            .keys()
-            .filter(|id| crate::speculation::names(&text, id))
-            .cloned()
+        out
+    }
+
+    /// The goals the navigations still to run head for, for goal_clear.
+    pub(crate) fn goals(&self) -> Vec<Value> {
+        let mut goals: Vec<Value> = self
+            .destinations()
+            .into_iter()
+            .map(|(_, goal, _)| goal)
             .collect();
-        // The finished steps whose outputs what is still to run reads, followed back.
-        let mut needed: HashSet<&str> = self.unended().flat_map(|step| vars(&step.args)).collect();
+        goals.dedup();
+        goals
+    }
+
+    /// The regions whose goal a navigation still to run heads for.
+    pub(crate) fn regions(&self) -> Vec<String> {
+        let mut regions: Vec<String> = self
+            .destinations()
+            .into_iter()
+            .filter_map(|(_, _, region)| region.map(String::from))
+            .collect();
+        regions.dedup();
+        regions
+    }
+
+    /// The objects returned by the finished steps whose outputs `steps` read,
+    /// directly or through other finished steps.
+    fn found<'a>(&'a self, steps: impl Iterator<Item = &'a Step>) -> HashSet<String> {
+        let mut needed: HashSet<&str> = steps.flat_map(|step| vars(&step.args)).collect();
         loop {
             let more: Vec<&str> = self
                 .steps
@@ -255,22 +391,73 @@ impl Watch {
             }
             needed.extend(more);
         }
-        for step in self
+        let reached = self
             .steps
             .iter()
-            .filter(|step| needed.contains(step.bind.as_str()))
-        {
-            if let Some(output) = self.outputs.get(&step.op_id) {
-                relied.extend(
-                    listings(&serde_json::from_str(output).unwrap_or_default()).into_keys(),
-                );
+            .filter(|step| needed.contains(step.bind.as_str()));
+        let outputs = reached.filter_map(|step| self.outputs.get(&step.op_id));
+        outputs
+            .flat_map(|output| {
+                listings(&serde_json::from_str(output).unwrap_or_default()).into_keys()
+            })
+            .collect()
+    }
+
+    fn unended(&self) -> impl Iterator<Item = &Step> {
+        self.steps
+            .iter()
+            .filter(|step| !self.ended.contains(&step.index))
+    }
+
+    /// What the tree relies on that has changed at this reading and the one
+    /// before: each object that `listed`, Scene's list now, lacks, as "<id>
+    /// (<label> in <region> when the tree was written)", and each goal a
+    /// navigation still to run heads for that `clear`, goal_clear's answers now
+    /// by [`goal_key`] (the reason where a goal is not clear), finds not clear;
+    /// nothing unless [`Watch::armed`].
+    pub(crate) fn check(
+        &mut self,
+        listed: &HashMap<String, Listing>,
+        clear: &HashMap<String, Option<String>>,
+    ) -> Vec<String> {
+        if !self.armed() {
+            self.gone.clear();
+            self.blocked.clear();
+            return Vec::new();
+        }
+        let mut blocked = Vec::new();
+        let mut places = Vec::new();
+        for (op_id, goal, region) in self.destinations() {
+            let Some(key) = goal_key(&goal) else { continue };
+            let Some(Some(reason)) = clear.get(&key) else {
+                continue;
+            };
+            if self.blocked.contains(&key) {
+                let (x, y) = position(&goal).unwrap_or_default();
+                let place = region
+                    .and_then(|region| self.places.get(region))
+                    .map_or(String::new(), |(name, _)| format!(" in {name}"));
+                places.push(format!(
+                    "the goal{place} at ({x:.2}, {y:.2}) that {op_id} navigates to, which is no \
+                     longer clear: {reason}"
+                ));
+            }
+            blocked.push(key);
+        }
+        self.blocked = blocked;
+        for (id, listing) in listed {
+            if self.known.contains_key(id) {
+                self.known.insert(id.clone(), listing.clone());
             }
         }
-        let names_class = |step: &Step, class: &str| {
-            [class.to_string(), class.replace('_', " ")]
-                .iter()
-                .any(|form| step.args.contains(&format!("\"{form}\"")))
-        };
+        let text: String = self.steps.iter().map(|step| step.args.as_str()).collect();
+        let mut relied: HashSet<String> = self
+            .known
+            .keys()
+            .filter(|id| crate::speculation::names(&text, id))
+            .cloned()
+            .collect();
+        relied.extend(self.found(self.unended()));
         let classes: HashSet<&str> = self
             .known
             .values()
@@ -279,7 +466,7 @@ impl Watch {
         for class in classes {
             let named = |read: bool| {
                 self.unended().any(|step| {
-                    self.reads.contains(&step.contract) == read && names_class(step, class)
+                    self.reads.contains(&step.contract) == read && names_class(&step.args, class)
                 })
             };
             if named(false)
@@ -293,10 +480,27 @@ impl Watch {
                 relied.extend(of_class.map(|(id, _)| id.clone()));
             }
         }
+        // What the turn's own steps acted on is expected to leave its place, and
+        // so is what the step running now acts on: Executor does not report a
+        // call starting, the first step not ended is running, and a pick lifts
+        // its object off before it ends.
+        let mut taken = self
+            .taken
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(running) = self.unended().next().filter(|step| self.acts(step)) {
+            taken.extend(self.acted_on(running));
+        }
+        relied.retain(|id| {
+            let class = self.known.get(id).map(|listing| listing.label.as_str());
+            !taken.contains(id) && !class.is_some_and(|class| taken.contains(class))
+        });
         let stands_in = |id: &String| {
             let Some(Listing {
                 label,
                 at: Some((x, y)),
+                size,
             }) = self.known.get(id)
             else {
                 return false;
@@ -305,7 +509,7 @@ impl Watch {
                 listing.label == *label
                     && listing
                         .at
-                        .is_some_and(|(lx, ly)| (lx - x).hypot(ly - y) <= SAME_M)
+                        .is_some_and(|(lx, ly)| (lx - x).hypot(ly - y) <= SAME_M + size)
             })
         };
         let mut gone: Vec<String> = relied
@@ -332,6 +536,7 @@ impl Watch {
                     None => format!("{id} ({label}, which an earlier step found)"),
                 }
             })
+            .chain(places)
             .collect()
     }
 }
@@ -350,6 +555,7 @@ mod tests {
     const GOAL_NEAR: &str = "robonix/system/scene/goal_near";
     const NAVIGATE: &str = "robonix/service/navigation/navigate";
     const PICK: &str = "robonix/skill/manipulation/pick";
+    const PLACE: &str = "robonix/skill/manipulation/place";
 
     /// A sequence of calls, each (contract, bind, args).
     fn tree(calls: &[(&str, &str, serde_json::Value)]) -> Plan {
@@ -397,6 +603,7 @@ mod tests {
         let listing = |label: &str, x: f64| Listing {
             label: label.into(),
             at: Some((x, 0.0)),
+            size: 0.0,
         };
         objects
             .iter()
@@ -409,7 +616,14 @@ mod tests {
         let then = json!({"living room": [{"id": "o1", "label": "cornflakes"}, {"id": "o2", "label": "sofa"}]});
         let reads = [FIND, GOAL_NEAR].map(String::from);
         let at = listed(&[("o1", "cornflakes", 1.0), ("o2", "sofa", 5.0)]);
-        Watch::new(plan, then, at, Arc::new(HashSet::from(reads)))
+        Watch::new(
+            plan,
+            then,
+            at,
+            &json!([]),
+            Arc::new(HashSet::from(reads)),
+            Arc::default(),
+        )
     }
 
     #[test]
@@ -428,27 +642,30 @@ mod tests {
         let sofa = listed(&[("o2", "sofa", 5.0)]);
         assert!(
             watch
-                .check(&listed(&[("o1", "cornflakes", 1.0), ("o2", "sofa", 5.0)]))
+                .check(
+                    &listed(&[("o1", "cornflakes", 1.0), ("o2", "sofa", 5.0)]),
+                    &HashMap::new()
+                )
                 .is_empty()
         );
         // A flicker is not enough; a second reading confirms.
-        assert!(watch.check(&sofa).is_empty());
+        assert!(watch.check(&sofa, &HashMap::new()).is_empty());
         assert!(
             watch
-                .check(&listed(&[("o1", "cornflakes", 1.0)]))
+                .check(&listed(&[("o1", "cornflakes", 1.0)]), &HashMap::new())
                 .is_empty()
         );
-        assert!(watch.check(&sofa).is_empty());
+        assert!(watch.check(&sofa, &HashMap::new()).is_empty());
         assert_eq!(
-            watch.check(&sofa),
+            watch.check(&sofa, &HashMap::new()),
             ["o1 (cornflakes in living room when the tree was written)"]
         );
         assert_eq!(watch.left(), ["p-2", "p-3"]);
         // An object the tree does not name does not count.
         let mut other = self::watch(&plan);
         let cornflakes = listed(&[("o1", "cornflakes", 1.0)]);
-        other.check(&cornflakes);
-        assert!(other.check(&cornflakes).is_empty());
+        other.check(&cornflakes, &HashMap::new());
+        assert!(other.check(&cornflakes, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -459,12 +676,12 @@ mod tests {
         ]);
         let mut watch = watch(&plan);
         let merged = listed(&[("o7", "cornflakes", 1.2)]);
-        watch.check(&merged);
-        assert!(watch.check(&merged).is_empty());
+        watch.check(&merged, &HashMap::new());
+        assert!(watch.check(&merged, &HashMap::new()).is_empty());
         // One of its class across the room does not stand for it.
         let far = listed(&[("o7", "cornflakes", 3.0)]);
-        watch.check(&far);
-        assert_eq!(watch.check(&far).len(), 1);
+        watch.check(&far, &HashMap::new());
+        assert_eq!(watch.check(&far, &HashMap::new()).len(), 1);
     }
 
     #[test]
@@ -487,50 +704,201 @@ mod tests {
         watch.progressed(&succeeded(1, cup));
         watch.progressed(&succeeded(2, json!({"reachable": true, "goal": {}})));
         let none = listed(&[("o1", "cornflakes", 1.0)]);
-        watch.check(&none);
+        watch.check(&none, &HashMap::new());
         assert_eq!(
-            watch.check(&none),
+            watch.check(&none, &HashMap::new()),
             ["o9 (cup, which an earlier step found)"]
         );
     }
 
     #[test]
     fn a_step_naming_a_class_relies_on_it_once_scene_lists_none() {
-        let pick = tree(&[(PICK, "", json!({"object": "cornflakes"}))]);
+        let pick = tree(&[
+            (NAVIGATE, "", json!({"goal": {}})),
+            (PICK, "", json!({"object": "cornflakes"})),
+        ]);
         let mut watch = watch(&pick);
         let sofa = listed(&[("o2", "sofa", 5.0)]);
-        watch.check(&sofa);
+        watch.check(&sofa, &HashMap::new());
         assert_eq!(
-            watch.check(&sofa),
+            watch.check(&sofa, &HashMap::new()),
             ["o1 (cornflakes in living room when the tree was written)"]
         );
         // Another of the class listed anywhere, or a search for it still to run, keeps it.
         let mut elsewhere = self::watch(&pick);
         let other = listed(&[("o5", "cornflakes", 9.0)]);
-        elsewhere.check(&other);
-        assert!(elsewhere.check(&other).is_empty());
+        elsewhere.check(&other, &HashMap::new());
+        assert!(elsewhere.check(&other, &HashMap::new()).is_empty());
         let search = tree(&[
             (FIND, "", json!({"label": "cornflakes"})),
             (PICK, "", json!({"object": "cornflakes"})),
         ]);
         let mut searching = self::watch(&search);
-        searching.check(&sofa);
-        assert!(searching.check(&sofa).is_empty());
+        searching.check(&sofa, &HashMap::new());
+        assert!(searching.check(&sofa, &HashMap::new()).is_empty());
     }
 
     #[test]
-    fn nothing_stops_a_tree_with_only_reads_left_or_that_has_acted_itself() {
+    fn what_an_earlier_tree_of_the_turn_picked_up_is_not_gone() {
+        let taken: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
+        let then = json!({"living room": [{"id": "o1", "label": "cornflakes"}, {"id": "o2", "label": "sofa"}]});
+        let reads = Arc::new(HashSet::from([FIND, GOAL_NEAR].map(String::from)));
+        let at = listed(&[("o1", "cornflakes", 1.0), ("o2", "sofa", 5.0)]);
+        let pick = tree(&[(PICK, "", json!({"object": "cornflakes"}))]);
+        let mut picking = Watch::new(
+            &pick,
+            then.clone(),
+            at.clone(),
+            &json!([]),
+            reads.clone(),
+            taken.clone(),
+        );
+        picking.progressed(&succeeded(1, json!({"ok": true})));
+        // The next tree places what the robot holds, which Scene no longer sees where it was.
+        let place = tree(&[
+            (NAVIGATE, "", json!({"to": "o2"})),
+            (PLACE, "", json!({"object_id": "o1", "on": "o2"})),
+        ]);
+        let mut placing = Watch::new(&place, then, at, &json!([]), reads, taken);
+        let sofa = listed(&[("o2", "sofa", 5.0)]);
+        placing.check(&sofa, &HashMap::new());
+        assert!(placing.check(&sofa, &HashMap::new()).is_empty());
+        placing.check(&HashMap::new(), &HashMap::new());
+        assert_eq!(
+            placing.check(&HashMap::new(), &HashMap::new()),
+            ["o2 (sofa in living room when the tree was written)"]
+        );
+    }
+
+    #[test]
+    fn what_the_running_pick_lifts_is_not_gone() {
+        // The pick has not ended, so it is running, and its cornflakes leave their place.
+        let plan = tree(&[
+            (PICK, "", json!({"object": "cornflakes"})),
+            (NAVIGATE, "", json!({"to": "o2"})),
+        ]);
+        let mut watch = watch(&plan);
+        let sofa = listed(&[("o2", "sofa", 5.0)]);
+        watch.check(&sofa, &HashMap::new());
+        assert!(watch.check(&sofa, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn only_reads_left_or_what_the_tree_took_itself_stops_nothing() {
         let reads = tree(&[(FIND, "", json!({"label": "cornflakes", "anchor": "o1"}))]);
         let mut reading = watch(&reads);
-        reading.check(&HashMap::new());
-        assert!(reading.check(&HashMap::new()).is_empty());
+        reading.check(&HashMap::new(), &HashMap::new());
+        assert!(reading.check(&HashMap::new(), &HashMap::new()).is_empty());
+        // After the pick, the cornflakes it took leave the watch; the sofa it still goes to does not.
         let fetch = tree(&[
             (PICK, "", json!({"object_id": "o1"})),
-            (NAVIGATE, "", json!({"goal": {}})),
+            (NAVIGATE, "", json!({"to": "o2"})),
         ]);
         let mut fetching = watch(&fetch);
         fetching.progressed(&succeeded(1, json!({"ok": true})));
-        fetching.check(&HashMap::new());
-        assert!(fetching.check(&HashMap::new()).is_empty());
+        fetching.check(&HashMap::new(), &HashMap::new());
+        assert_eq!(
+            fetching.check(&HashMap::new(), &HashMap::new()),
+            ["o2 (sofa in living room when the tree was written)"]
+        );
+    }
+
+    #[test]
+    fn a_goal_the_robot_heads_for_that_goal_clear_finds_not_clear_twice_stops_it() {
+        let places = json!([{"id": "r1", "name": "kitchen", "goal": {"pose": {"position": {"x": 1.0, "y": 2.0}}}}]);
+        let plan = tree(&[
+            (
+                "robonix/system/scene/goal_region",
+                "g",
+                json!({"region_id": "r1"}),
+            ),
+            (
+                NAVIGATE,
+                "",
+                json!({"goal": {"var": "g", "path": ["goal"]}}),
+            ),
+        ]);
+        let reads = Arc::new(HashSet::from(
+            [FIND, GOAL_NEAR, "robonix/system/scene/goal_region"].map(String::from),
+        ));
+        let mut watch = Watch::new(
+            &plan,
+            json!({}),
+            HashMap::new(),
+            &places,
+            reads.clone(),
+            Arc::default(),
+        );
+        let goal =
+            json!({"header": {"frame_id": "map"}, "pose": {"position": {"x": 1.0, "y": 2.0}}});
+        watch.progressed(&succeeded(
+            1,
+            json!({"reachable": true, "x": 1.0, "y": 2.0, "goal": goal}),
+        ));
+        assert_eq!(watch.goals(), [goal]);
+        assert_eq!(watch.regions(), ["r1"]);
+        let answer = |reason: Option<&str>| {
+            HashMap::from([("1.00,2.00".to_string(), reason.map(String::from))])
+        };
+        assert!(watch.check(&HashMap::new(), &answer(None)).is_empty());
+        let marked = answer(Some("Navigation's costmap marks it occupied"));
+        assert!(watch.check(&HashMap::new(), &marked).is_empty());
+        assert_eq!(
+            watch.check(&HashMap::new(), &marked),
+            [
+                "the goal in kitchen at (1.00, 2.00) that p-2 navigates to, which is no longer clear: \
+              Navigation's costmap marks it occupied"
+            ]
+        );
+        // A goal written out that the state view showed for a region counts as that region's.
+        let literal = tree(&[(
+            NAVIGATE,
+            "",
+            json!({"goal": {"pose": {"position": {"x": 1.0, "y": 2.0}}}}),
+        )]);
+        let mut going = Watch::new(
+            &literal,
+            json!({}),
+            HashMap::new(),
+            &places,
+            reads,
+            Arc::default(),
+        );
+        assert_eq!(going.regions(), ["r1"]);
+        going.check(&HashMap::new(), &marked);
+        assert_eq!(going.check(&HashMap::new(), &marked).len(), 1);
+    }
+
+    #[test]
+    fn another_record_of_a_person_within_their_extent_stands_for_them() {
+        let then = json!({"living room": [{"id": "h1", "label": "person"}]});
+        let at = HashMap::from([(
+            "h1".to_string(),
+            Listing {
+                label: "person".into(),
+                at: Some((0.0, 0.0)),
+                size: 0.6,
+            },
+        )]);
+        let plan = tree(&[
+            (GOAL_NEAR, "", json!({"object_id": "h1"})),
+            (NAVIGATE, "", json!({})),
+        ]);
+        let reads = Arc::new(HashSet::from([FIND, GOAL_NEAR].map(String::from)));
+        let mut watch = Watch::new(&plan, then, at, &json!([]), reads, Arc::default());
+        let moved = |x: f64| {
+            HashMap::from([(
+                "h9".to_string(),
+                Listing {
+                    label: "person".into(),
+                    at: Some((x, 0.0)),
+                    size: 0.6,
+                },
+            )])
+        };
+        watch.check(&moved(1.0), &HashMap::new());
+        assert!(watch.check(&moved(1.0), &HashMap::new()).is_empty());
+        watch.check(&moved(2.0), &HashMap::new());
+        assert_eq!(watch.check(&moved(2.0), &HashMap::new()).len(), 1);
     }
 }

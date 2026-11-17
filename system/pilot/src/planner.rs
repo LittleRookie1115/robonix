@@ -804,25 +804,47 @@ async fn cancel_forest_plans(executor: &mut ExecutorConn, forest: &HashMap<Strin
 /// way its watch ends.
 async fn check_watches(
     watches: &mut Vec<Watch>,
-    provider: &str,
+    scene: &state_context::SceneProviders,
     read_set: bool,
     executor: &mut ExecutorConn,
     forest: &mut SessionForest,
     history: &mut Vec<Message>,
 ) {
-    let Some(listed) = state_context::listed(executor, provider).await else {
+    let Some(listed) = state_context::listed(executor, &scene.find).await else {
         return;
     };
-    let mut stale = Vec::new();
-    for watch in watches.iter_mut() {
-        let gone = watch.check(&listed);
-        if !gone.is_empty() {
-            let left: Vec<String> = watch.left().into_iter().map(String::from).collect();
-            stale.push((watch.plan_id.clone(), gone, left));
+    let mut clear = HashMap::new();
+    if let Some(provider) = &scene.goal_clear {
+        let goals = watches
+            .iter()
+            .filter(|watch| watch.armed())
+            .flat_map(Watch::goals);
+        for goal in goals {
+            let Some(key) = crate::watch::goal_key(&goal) else {
+                continue;
+            };
+            if clear.contains_key(&key) {
+                continue;
+            }
+            if let Some(answer) = state_context::goal_clear(executor, provider, &goal).await {
+                clear.insert(key, answer);
+            }
         }
     }
-    for (plan_id, gone, left) in stale {
+    let mut stale = Vec::new();
+    for watch in watches.iter_mut() {
+        let gone = watch.check(&listed, &clear);
+        if !gone.is_empty() {
+            let left: Vec<String> = watch.left().into_iter().map(String::from).collect();
+            stale.push((watch.plan_id.clone(), gone, left, watch.regions()));
+        }
+    }
+    for (plan_id, gone, left, regions) in stale {
         watches.retain(|watch| watch.plan_id != plan_id);
+        // The state view would show the blocked goal again.
+        regions
+            .iter()
+            .for_each(|region| state_context::forget_goal(region));
         info!(
             "[pilot/segue] {}",
             serde_json::json!({
@@ -1613,7 +1635,10 @@ pub async fn run_turn(
     // Segue's planning context and its guidance on folding reads into trees, each
     // switchable so their share of the speedup can be measured.
     let state_view = task_switch(task, "state_view", true);
-    let protocol_prompt = rtdl_protocol(task_switch(task, "fold_reads", true));
+    let protocol_prompt = rtdl_protocol(
+        task_switch(task, "fold_reads", true),
+        task_switch(task, "reconfirm", false),
+    );
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
@@ -1712,8 +1737,8 @@ pub async fn run_turn(
                     }
                 }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
-                    if let Some(provider) = &scene_find {
-                        check_watches(&mut watches, provider, read_set, executor, forest, history).await;
+                    if let Some(scene) = &scene_providers {
+                        check_watches(&mut watches, scene, read_set, executor, forest, history).await;
                     }
                 }
             }
@@ -1778,7 +1803,7 @@ pub async fn run_turn(
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
         let (environment_block, map_regions, state) =
             state_context::collect(executor, atlas, &cap_list, state_view).await;
-        scene_find = state_context::scene_find(&cap_list);
+        scene_providers = state_context::SceneProviders::among(&cap_list);
         speculation::located(&state["scene"]);
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
@@ -2445,7 +2470,9 @@ pub async fn run_turn(
                 &graph,
                 state["objects"].clone(),
                 crate::watch::listings(&state["poses"]),
+                &state["places"],
                 watch_reads.clone(),
+                taken.clone(),
             ));
         }
         // Only while one tree runs is its report sure to start the next round.
@@ -2570,6 +2597,11 @@ Every node needs a description and op_id=0; Pilot assigns the real ID. Do not ad
 
 /// The protocol's guidance against trees that only read, which Segue adds.
 const FOLD_READS: &str = r#"A tree that only reads (look-ups, goal poses, snapshots, manuals) wastes a planning round: put each read in the tree that acts on it, bound for the steps that use it, with each course under an if. Read alone only to see a result yourself, as a camera image.
+"#;
+
+/// A comparison policy for the read set: confirm an object with a fresh look
+/// before acting on it, whatever the state view says (`"reconfirm": true`).
+const RECONFIRM: &str = r#"Before a step that picks up an object, puts something on or into one, or hands one over, look for that object again in the same tree with find (settle_s 3) right before the step, and run the step only under an if that find still returns it: where Scene or a saved map last placed an object may be out of date.
 "#;
 
 /// The protocol's rules after the node grammar.

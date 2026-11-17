@@ -21,6 +21,7 @@ const SCENE_CONTEXT: &str = "robonix/system/scene/get_robot_context";
 const SCENE_REGIONS: &str = "robonix/system/scene/list_regions";
 const SCENE_FIND: &str = "robonix/system/scene/find";
 const SCENE_GOAL: &str = "robonix/system/scene/goal_region";
+const SCENE_GOAL_CLEAR: &str = "robonix/system/scene/goal_clear";
 
 /// What goal_region answered for the regions of one map. A map's regions do
 /// not move, so an answer is kept for as long as Scene reports that map.
@@ -196,12 +197,59 @@ pub async fn collect(
     (environment, map, state)
 }
 
-/// The provider of Scene's find among `caps`, for [`listed`].
-pub fn scene_find(caps: &[(String, atlas_pb::Capability)]) -> Option<String> {
-    let found = caps
-        .iter()
-        .find(|(_, capability)| capability.contract_id == SCENE_FIND);
-    found.map(|(provider_id, _)| provider_id.clone())
+/// The providers of the Scene capabilities a watch reads while a tree runs.
+pub struct SceneProviders {
+    /// The provider of find, for [`listed`].
+    pub find: String,
+    /// The provider of goal_clear, for [`goal_clear`], where one is registered.
+    pub goal_clear: Option<String>,
+}
+
+impl SceneProviders {
+    /// The providers among `caps`; `None` without a find.
+    pub fn among(caps: &[(String, atlas_pb::Capability)]) -> Option<Self> {
+        let provider = |contract: &str| {
+            let found = caps
+                .iter()
+                .find(|(_, capability)| capability.contract_id == contract);
+            found.map(|(provider_id, _)| provider_id.clone())
+        };
+        Some(Self {
+            find: provider(SCENE_FIND)?,
+            goal_clear: provider(SCENE_GOAL_CLEAR),
+        })
+    }
+}
+
+/// goal_clear's answer for `goal`, a PoseStamped, through `provider_id`: why
+/// the goal is not clear, or `None` inside where it is; `None` when Scene does
+/// not answer.
+pub async fn goal_clear(
+    executor: &ExecutorConn,
+    provider_id: &str,
+    goal: &Value,
+) -> Option<Option<String>> {
+    let args = json!({"goal": goal});
+    let answer = query_scene(
+        executor.graph.clone(),
+        provider_id.into(),
+        SCENE_GOAL_CLEAR,
+        args,
+    )
+    .await;
+    if answer["available"] != true {
+        return None;
+    }
+    let state = &answer["state"];
+    Some(match state["clear"] == true {
+        true => None,
+        false => Some(state["reason"].as_str().unwrap_or("not clear").to_string()),
+    })
+}
+
+/// Drop the goal kept for `region_id`, so the state view asks goal_region again.
+pub fn forget_goal(region_id: &str) {
+    goals().by_region.remove(region_id);
 }
 
 /// Every object Scene's find lists now, by id, through `provider_id`; `None`
