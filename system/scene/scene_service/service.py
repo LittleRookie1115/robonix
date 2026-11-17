@@ -14,7 +14,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import uvicorn
 
@@ -1345,8 +1345,10 @@ async def _lifecycle_watch(
     ops_lock: Optional[asyncio.Lock] = None,
     semantic_hold: Optional[dict] = None,
     interval_s: float = 5.0,
+    restore: Optional[Callable[[str], Awaitable[int]]] = None,
 ) -> None:
-    """React to map-frame epoch changes and external map switches."""
+    """React to map-frame epoch changes and external map switches. `restore`
+    puts a saved map's objects back, as loading it does, and returns how many."""
     if live_binding is None:
         live_binding = {
             "map_id": binding.map_id,
@@ -1452,6 +1454,18 @@ async def _lifecycle_watch(
                 )
                 if not await _flush_registry("after epoch bump"):
                     return
+                # The saved map's objects are in that frame as well.
+                if relocalized and restore is not None:
+                    try:
+                        log.info(
+                            "[scene] restored %d object(s) of map %s after relocalizing",
+                            await restore(live_id), live_id,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.error(
+                            "[scene] restoring map %s's objects after relocalizing "
+                            "failed: %s", live_id, e,
+                        )
                 if anno_store is not None and relocalized:
                     try:
                         anno_store.rebind(
@@ -1697,6 +1711,18 @@ async def _run_active(config: dict) -> None:
             "snapshot/restore objects this session: %s",
             e,
         )
+    async def _restore_saved_objects(map_id: str) -> int:
+        meta = map_meta.read(map_id) if map_meta is not None else None
+        if meta is None or obj_store is None:
+            return 0
+        rows = await asyncio.to_thread(
+            obj_store.load_all, partition=meta.object_partition, strict=True
+        )
+        async with registry.lock():
+            for o in rows:
+                registry.restore_object(o)
+        return len(rows)
+
     mcp_tools.attach_state(
         registry=registry,
         robot_geometry=robot_geometry,
@@ -1746,6 +1772,7 @@ async def _run_active(config: dict) -> None:
                 live_binding=live_binding,
                 ops_lock=map_ops_lock,
                 semantic_hold=semantic_hold,
+                restore=_restore_saved_objects,
             ),
             name="scene-lifecycle-watch",
         ),
