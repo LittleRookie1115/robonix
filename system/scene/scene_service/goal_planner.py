@@ -200,12 +200,16 @@ def room_goal(
     footprint: RobotFootprint,
     *,
     yaw_candidates: Sequence[float],
+    nav_costmap=None,
 ) -> tuple[float, float, float] | None:
     """Choose the known-free pose fitting the real footprint that lies farthest
     from anything not known free, the centroid-nearest one among equals.
 
     A lidar sees a table's legs but not its top, so the middle of a room is
-    often under a table; the most open floor is not.
+    often under a table; the most open floor is not. `nav_costmap`, when given,
+    is Navigation's own costmap in the grid's frame, which also marks what its
+    sensors see now: a pose inside its inscribed cost, something put down
+    since the map was made for one, is skipped.
     """
     import numpy as np
     from scipy import ndimage
@@ -240,6 +244,8 @@ def room_goal(
         if not open_cells[i]:
             break
         x, y = float(xs[i]), float(ys[i])
+        if nav_costmap is not None and not nav_cost_ok(nav_costmap, x, y):
+            continue
         for yaw in headings:
             candidate = transformed_footprint(footprint, x, y, yaw)
             if not polygon_inside_polygon(candidate, room):
@@ -296,7 +302,7 @@ ROBOT_SEED_RADIUS_M = 0.5
 NAV_COSTMAP_INSCRIBED = 99
 
 
-def _nav_cost_ok(costmap, x: float, y: float) -> bool:
+def nav_cost_ok(costmap, x: float, y: float) -> bool:
     """Whether Navigation could stand the robot at (x, y): its costmap cell is
     unknown, outside the costmap, or below the inscribed cost."""
     width, height, resolution, origin_x, origin_y = _grid_metadata(costmap)
@@ -428,7 +434,7 @@ def object_goal(
                 origin_x=origin_x,
                 origin_y=origin_y,
                 polygon=candidate,
-            ) and (nav_costmap is None or _nav_cost_ok(nav_costmap, x, y)):
+            ) and (nav_costmap is None or nav_cost_ok(nav_costmap, x, y)):
                 if not is_far_side:
                     return x, y, yaw
                 far_side, far_side_ring = (x, y, yaw), ring
