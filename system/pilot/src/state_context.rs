@@ -191,7 +191,28 @@ pub async fn collect(
     let environment = environment(&state, objects);
     // The opening move picks among them; the map block above already shows them.
     state["places"] = places;
+    // Where each object is, which the prompt has no use for but a watch does.
+    state["poses"] = everything["state"]["objects"].clone();
     (environment, map, state)
+}
+
+/// The provider of Scene's find among `caps`, for [`listed`].
+pub fn scene_find(caps: &[(String, atlas_pb::Capability)]) -> Option<String> {
+    let found = caps
+        .iter()
+        .find(|(_, capability)| capability.contract_id == SCENE_FIND);
+    found.map(|(provider_id, _)| provider_id.clone())
+}
+
+/// Every object Scene's find lists now, by id, through `provider_id`; `None`
+/// when Scene does not answer.
+pub async fn listed(
+    executor: &ExecutorConn,
+    provider_id: &str,
+) -> Option<HashMap<String, crate::watch::Listing>> {
+    let args = json!({"label": "", "region": "", "relation": "", "anchor": "", "settle_s": 0.0});
+    let found = query_scene(executor.graph.clone(), provider_id.into(), SCENE_FIND, args).await;
+    Some(crate::watch::listings(found["state"].get("objects")?))
 }
 
 /// The environment block around `state`, with `objects` saying what its objects are.

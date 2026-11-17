@@ -25,6 +25,7 @@ use crate::state_context;
 use crate::tasks::{self, Applied, TaskFields, TaskTable};
 use crate::transcript::Transcript;
 use crate::vlm::{Message, ReplyShape, VlmClient, VlmStreamItem};
+use crate::watch::Watch;
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -326,12 +327,29 @@ fn task_switch(task: &Task, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Let a speculation and the opening move see how a tree goes and ends.
+/// Let a speculation, the opening move and the trees' watches see how a tree
+/// goes and ends.
 fn observe(
     speculation: &mut Option<Speculation>,
     opening: &mut Option<crate::opening::Opening>,
+    watches: &mut Vec<Watch>,
     event: &TreeInterrupt,
 ) {
+    match event {
+        TreeInterrupt::NodeState {
+            plan_id,
+            node_state,
+            ..
+        } => {
+            let watch = watches.iter_mut().find(|watch| &watch.plan_id == plan_id);
+            watch
+                .into_iter()
+                .for_each(|watch| watch.progressed(node_state));
+        }
+        TreeInterrupt::Completion { plan_id, .. } => {
+            watches.retain(|watch| &watch.plan_id != plan_id)
+        }
+    }
     if let Some(open) = opening.take() {
         *opening = match event {
             TreeInterrupt::NodeState {
@@ -776,30 +794,88 @@ async fn cancel_forest_plans(executor: &mut ExecutorConn, forest: &HashMap<Strin
         .map(|(plan_id, _)| plan_id.clone())
         .collect();
     for target in targets {
-        let cancel = executor
-            .control
-            .control_plan(Request::new(ControlPlanRequest {
-                action: "cancel".to_string(),
-                plan_id: target.clone(),
-                wait_ms: 5_000,
-            }));
-        match tokio::time::timeout(std::time::Duration::from_secs(7), cancel).await {
-            Ok(Ok(response)) => {
-                let response = response.into_inner();
-                if response.success {
-                    info!("[pilot] canceled executor plan {target} on stop");
-                } else {
-                    warn!(
-                        "[pilot] cancel executor plan {target} rejected: {}",
-                        response.error
-                    );
-                }
-            }
-            Ok(Err(error)) => {
-                warn!("[pilot] cancel executor plan {target} failed: {error}")
-            }
-            Err(_) => warn!("[pilot] cancel executor plan {target} timed out"),
+        cancel_plan(executor, &target, "on stop").await;
+    }
+}
+
+/// Read Scene's list once and check each watched tree against it. A tree whose
+/// read set has changed is stopped, as a cancellation Pilot asked for, with a
+/// note to the planner saying why; with `read_set` off it is only logged. Either
+/// way its watch ends.
+async fn check_watches(
+    watches: &mut Vec<Watch>,
+    provider: &str,
+    read_set: bool,
+    executor: &mut ExecutorConn,
+    forest: &mut SessionForest,
+    history: &mut Vec<Message>,
+) {
+    let Some(listed) = state_context::listed(executor, provider).await else {
+        return;
+    };
+    let mut stale = Vec::new();
+    for watch in watches.iter_mut() {
+        let gone = watch.check(&listed);
+        if !gone.is_empty() {
+            let left: Vec<String> = watch.left().into_iter().map(String::from).collect();
+            stale.push((watch.plan_id.clone(), gone, left));
         }
+    }
+    for (plan_id, gone, left) in stale {
+        watches.retain(|watch| watch.plan_id != plan_id);
+        info!(
+            "[pilot/segue] {}",
+            serde_json::json!({
+                "event": "read_set",
+                "plan_id": plan_id,
+                "running": true,
+                "gone": gone,
+                "left": left,
+                "applied": read_set,
+            })
+        );
+        if !read_set || !forest.trees.contains_key(&plan_id) {
+            continue;
+        }
+        cancel_plan(executor, &plan_id, "after its read set changed").await;
+        forest.kill_pending.insert(plan_id.clone());
+        history.push(Message::user(&format!(
+            "Pilot stopped RTDL plan {plan_id} before its steps {} finished: since it was written, \
+             {} no longer among Scene's objects. Plan from the current environment.",
+            left.join(", "),
+            match gone.len() {
+                1 => format!("{} is", gone[0]),
+                _ => format!("{} are", gone.join(", ")),
+            }
+        )));
+    }
+}
+
+/// Ask Executor to cancel the plan `target`, logging how it went with `why`.
+async fn cancel_plan(executor: &mut ExecutorConn, target: &str, why: &str) {
+    let cancel = executor
+        .control
+        .control_plan(Request::new(ControlPlanRequest {
+            action: "cancel".to_string(),
+            plan_id: target.to_string(),
+            wait_ms: 5_000,
+        }));
+    match tokio::time::timeout(std::time::Duration::from_secs(7), cancel).await {
+        Ok(Ok(response)) => {
+            let response = response.into_inner();
+            if response.success {
+                info!("[pilot] canceled executor plan {target} {why}");
+            } else {
+                warn!(
+                    "[pilot] cancel executor plan {target} rejected: {}",
+                    response.error
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            warn!("[pilot] cancel executor plan {target} failed: {error}")
+        }
+        Err(_) => warn!("[pilot] cancel executor plan {target} timed out"),
     }
 }
 
@@ -1543,13 +1619,27 @@ pub async fn run_turn(
     let mut speculation: Option<Speculation> = None;
     // The robot heading where the task begins while its first plan is written.
     let mut opening: Option<crate::opening::Opening> = None;
+    // Each running tree's read set, read against Scene each second; see watch.rs.
+    let mut watches: Vec<Watch> = Vec::new();
+    let read_set = task_switch(task, "read_set", true);
+    let watch_reads: Arc<HashSet<String>> = Arc::new(
+        serde_json::from_str::<serde_json::Value>(&task.context_json).unwrap_or_default()["read_only"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|contract| contract.as_str().map(String::from))
+            .collect(),
+    );
+    let mut scene_find: Option<String> = None;
+    let mut watch_tick = tokio::time::interval(Duration::from_secs(1));
+    watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
 
     'supervisor: loop {
         while let Ok(event) = forest.interrupt_rx.try_recv() {
-            observe(&mut speculation, &mut opening, &event);
+            observe(&mut speculation, &mut opening, &mut watches, &event);
             should_plan |=
                 handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
         }
@@ -1615,8 +1705,13 @@ pub async fn run_turn(
                 ev = forest.interrupt_rx.recv() => {
                     // The session holds a sender, so the channel never closes.
                     if let Some(event) = ev {
-                        observe(&mut speculation, &mut opening, &event);
+                        observe(&mut speculation, &mut opening, &mut watches, &event);
                         should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
+                    }
+                }
+                _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
+                    if let Some(provider) = &scene_find {
+                        check_watches(&mut watches, provider, read_set, executor, forest, history).await;
                     }
                 }
             }
@@ -1650,7 +1745,7 @@ pub async fn run_turn(
                         break;
                     }
                     Some(event) = forest.interrupt_rx.recv() => {
-                        observe(&mut speculation, &mut opening, &event);
+                        observe(&mut speculation, &mut opening, &mut watches, &event);
                         handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                     _ = &mut settle => break,
@@ -1681,6 +1776,7 @@ pub async fn run_turn(
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
         let (environment_block, map_regions, state) =
             state_context::collect(executor, atlas, &cap_list, state_view).await;
+        scene_find = state_context::scene_find(&cap_list);
         speculation::located(&state["scene"]);
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
             .await
@@ -2342,6 +2438,14 @@ pub async fn run_turn(
         should_plan = owner
             .as_deref()
             .is_some_and(|task| tasks.others_runnable(task));
+        if speculate && state_view && plan_open && !is_control_only(&graph) {
+            watches.push(Watch::new(
+                &graph,
+                state["objects"].clone(),
+                crate::watch::listings(&state["poses"]),
+                watch_reads.clone(),
+            ));
+        }
         // Only while one tree runs is its report sure to start the next round.
         if speculate
             && !should_plan

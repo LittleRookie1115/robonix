@@ -1293,7 +1293,7 @@ fn dispatches(node: &Value) -> bool {
 }
 
 /// Each object's region in `objects`, as `state_context` lists them.
-fn placed(objects: &Value) -> HashMap<&str, &str> {
+pub(crate) fn placed(objects: &Value) -> HashMap<&str, &str> {
     let regions = objects.as_object().into_iter().flatten();
     regions
         .flat_map(|(region, listed)| {
@@ -1540,7 +1540,7 @@ fn resolved(tree: &Value, outputs: &HashMap<String, String>) -> Value {
 
 /// The ids of the objects the finished steps in `outputs` returned: every
 /// string `id` in their outputs, such as find's objects.
-fn returned(outputs: &HashMap<String, String>) -> HashSet<String> {
+pub(crate) fn returned(outputs: &HashMap<String, String>) -> HashSet<String> {
     fn collect(value: &Value, ids: &mut HashSet<String>) {
         match value {
             Value::Object(fields) => {
@@ -1563,7 +1563,7 @@ fn returned(outputs: &HashMap<String, String>) -> HashSet<String> {
 }
 
 /// Whether JSON `text` has `id` as a whole string value.
-fn names(text: &str, id: &str) -> bool {
+pub(crate) fn names(text: &str, id: &str) -> bool {
     text.contains(&format!("\"{id}\""))
 }
 

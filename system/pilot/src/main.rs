@@ -41,6 +41,7 @@ mod stream_execution;
 mod tasks;
 mod transcript;
 mod vlm;
+mod watch;
 
 use anyhow::{Context, Result};
 use clap::Parser;
