@@ -2626,7 +2626,7 @@ fn compact_tool_result(contract_id: &str, value: &str, max_chars: usize) -> Stri
     }
 
     let projection = match contract_id {
-        "robonix/system/scene/list_objects" => Some(("objects", &["id", "label"][..])),
+        "robonix/system/scene/list_objects" => Some(("objects", &["id", "label", "restored"][..])),
         "robonix/system/scene/list_regions" => Some((
             "regions",
             &["id", "kind", "name", "stale", "stale_reason"][..],

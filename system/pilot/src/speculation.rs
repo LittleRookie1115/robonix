@@ -1079,9 +1079,13 @@ impl Speculation {
                 let listed = listed.as_array().into_iter().flatten();
                 listed.filter_map(move |object| {
                     let label = object["label"].as_str()?;
+                    let unseen = match object["restored"] == true {
+                        true => " (on the saved map, not seen since)",
+                        false => "",
+                    };
                     Some((
                         object["id"].as_str()?.to_string(),
-                        format!("{label} in {region}"),
+                        format!("{label} in {region}{unseen}"),
                     ))
                 })
             })

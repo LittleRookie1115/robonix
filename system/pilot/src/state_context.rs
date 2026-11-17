@@ -162,16 +162,21 @@ pub async fn collect(
         }
         cache.by_region.clone()
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64());
     let mut state = json!({
         "scene": scene,
-        "objects": by_region(&everything, &rooms, &by_room),
+        "objects": by_region(&everything, &rooms, &by_room, now),
         "provider_availability": providers,
     });
     let objects = "`objects` are the ids and labels of every object Scene currently knows, by \
-                   the region it is in, as Scene's find returns them: call find only for what \
-                   they do not show, or with `settle_s` in a tree that has just moved the \
-                   robot, because perception takes a few seconds to add what the camera then \
-                   sees. ";
+                   the region it is in, as Scene's find returns them, each with how many \
+                   seconds ago the robot last saw it (`seen_s_ago`) or marked `restored`: a \
+                   saved map holds it there and the robot has not seen it since, so it may \
+                   have moved or gone. Call find only for what they do not show, or with \
+                   `settle_s` in a tree that has just moved the robot, because perception \
+                   takes a few seconds to add what the camera then sees. ";
     let places = named(&regions, &known);
     let map = format!(
         "\n\n## Map regions\n\
@@ -240,17 +245,29 @@ fn named(listed: &Value, goals: &HashMap<String, Value>) -> Value {
     regions.iter().map(named).collect()
 }
 
-/// The ids and labels of the objects `find` returned for each of `rooms`, and
-/// under "elsewhere" those of `everything` in none of them.
-fn by_region(everything: &Value, rooms: &[&str], by_room: &[Value]) -> Value {
+/// The objects `find` returned for each of `rooms`, and under "elsewhere" those
+/// of `everything` in none of them: each one's id and label, and either that a
+/// saved map holds it unseen since (`restored`) or how long before `now`, in
+/// Unix seconds, the robot last saw it.
+fn by_region(everything: &Value, rooms: &[&str], by_room: &[Value], now: f64) -> Value {
+    let listed = |object: &Value| {
+        let mut listed = json!({"id": object["id"], "label": object["label"]});
+        match (
+            object["restored"] == true,
+            object["last_seen_unix"].as_f64(),
+        ) {
+            (true, _) => listed["restored"] = true.into(),
+            (false, Some(seen)) if seen > 0.0 => {
+                listed["seen_s_ago"] = ((now - seen).max(0.0).round() as u64).into();
+            }
+            _ => {}
+        }
+        listed
+    };
     let objects = |found: &Value| -> Option<Vec<Value>> {
         let objects = found["state"]["objects"].as_array()?;
         let known = objects.iter().filter(|object| object["label"] != "robot");
-        Some(
-            known
-                .map(|object| json!({"id": object["id"], "label": object["label"]}))
-                .collect(),
-        )
+        Some(known.map(listed).collect())
     };
     let Some(mut elsewhere) = objects(everything) else {
         return everything.clone();
@@ -258,7 +275,7 @@ fn by_region(everything: &Value, rooms: &[&str], by_room: &[Value]) -> Value {
     let mut regions = serde_json::Map::new();
     for (room, found) in rooms.iter().zip(by_room) {
         let inside = objects(found).unwrap_or_default();
-        elsewhere.retain(|object| !inside.contains(object));
+        elsewhere.retain(|object| inside.iter().all(|inside| inside["id"] != object["id"]));
         regions.insert(room.to_string(), inside.into());
     }
     regions.insert("elsewhere".into(), elsewhere.into());
@@ -398,27 +415,35 @@ mod tests {
     fn objects_are_listed_under_the_region_find_returned_them_for() {
         let found =
             |objects: serde_json::Value| json!({"available": true, "state": {"objects": objects}});
-        let object = |id: &str, label: &str| json!({"id": id, "label": label, "x": 1.0});
+        let object = |id: &str, label: &str, seen: f64| json!({"id": id, "label": label, "x": 1.0, "last_seen_unix": seen, "restored": false});
+        let mut sofa = object("o3", "sofa", 40.0);
+        sofa["restored"] = true.into();
         let everything = found(json!([
-            object("o1", "cup"),
-            object("o2", "robot"),
-            object("o3", "sofa"),
-            object("o4", "bowl")
+            object("o1", "cup", 98.0),
+            object("o2", "robot", 100.0),
+            sofa,
+            object("o4", "bowl", 90.0)
         ]));
-        let kitchen = found(json!([object("o4", "bowl"), object("o1", "cup")]));
+        // Scene saw the cup again between the two finds.
+        let kitchen = found(json!([
+            object("o4", "bowl", 90.0),
+            object("o1", "cup", 99.6)
+        ]));
         assert_eq!(
             by_region(
                 &everything,
                 &["kitchen", "bedroom"],
-                &[kitchen, found(json!([]))]
+                &[kitchen, found(json!([]))],
+                100.0
             ),
             json!({
-                "kitchen": [{"id": "o4", "label": "bowl"}, {"id": "o1", "label": "cup"}],
+                "kitchen": [{"id": "o4", "label": "bowl", "seen_s_ago": 10},
+                            {"id": "o1", "label": "cup", "seen_s_ago": 0}],
                 "bedroom": [],
-                "elsewhere": [{"id": "o3", "label": "sofa"}],
+                "elsewhere": [{"id": "o3", "label": "sofa", "restored": true}],
             })
         );
         let unavailable = json!({"available": false, "error": "timed out"});
-        assert_eq!(by_region(&unavailable, &[], &[]), unavailable);
+        assert_eq!(by_region(&unavailable, &[], &[], 100.0), unavailable);
     }
 }
