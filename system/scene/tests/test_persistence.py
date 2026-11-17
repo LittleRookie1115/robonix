@@ -199,6 +199,59 @@ def test_apply_snapshot_restored_survives_and_far_detection_is_new():
     print("  [PASS] test_apply_snapshot_restored_survives_and_far_detection_is_new")
 
 
+def test_a_record_whose_cloud_merged_into_a_duplicate_takes_its_place():
+    """A cleanup merge folds a record's cloud into a duplicate's: the record
+    keeps its id and stays listed under the duplicate's uuid, while a record
+    whose place the camera saw empty still goes missing."""
+    import asyncio
+    try:
+        from scene_service.ingest.perception_concept_graphs import ConceptGraphsDetector  # noqa: F401
+    except Exception as e:
+        print(f"  [SKIP] test_a_record_whose_cloud_merged_into_a_duplicate_takes_its_place ({e})")
+        return
+
+    for seen_absent, kept in ((frozenset(), True), (frozenset({"u-a"}), False)):
+        reg = ObjectRegistry()
+        p = _make_detector(reg)
+        asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0)]))
+        asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0), _snap("u-b", "cup", 1.1, 1.0)]))
+        first, twin = sorted(o.object_id for o in reg.all_objects())
+        asyncio.run(p._apply_snapshot([_snap("u-b", "cup", 1.1, 1.0)], seen_absent=seen_absent))
+        cup = reg.get_object(first)
+        assert (not cup.missing) is kept
+        if kept:
+            assert reg.get_object(twin) is None
+            assert cup.attributes["cg_uuid"] == "u-b" and p._uuid_to_oid["u-b"] == first
+            assert reg.resolve_id(twin)[0] == first
+        else:
+            assert not reg.get_object(twin).missing
+    # A young duplicate whose cloud went is folded into the record with more
+    # evidence, which keeps its id; one already missing takes nothing over.
+    reg = ObjectRegistry()
+    p = _make_detector(reg)
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0), _snap("u-b", "cup", 1.1, 1.0)]))
+    first, young = sorted(o.object_id for o in reg.all_objects())
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0)]))
+    assert [o.object_id for o in reg.all_objects()] == [first]
+    assert reg.resolve_id(young)[0] == first
+    # The other way round: the record with more evidence lost its cloud, so it
+    # stays under its id and moves to the young duplicate's cloud and pose.
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0), _snap("u-d", "cup", 1.2, 1.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-d", "cup", 1.2, 1.0)]))
+    cup = reg.get_object(first)
+    assert [o.object_id for o in reg.all_objects()] == [first]
+    assert cup.attributes["cg_uuid"] == "u-d" and abs(cup.pose.x - 1.2) < 1e-9 and not cup.missing
+    reg.get_object(first).observation_count = 1
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0), _snap("u-c", "cup", 1.1, 1.0)]))
+    third = next(o.object_id for o in reg.all_objects() if o.object_id != first)
+    reg.soft_evict(reg.get_object(third))
+    asyncio.run(p._apply_snapshot([_snap("u-a", "cup", 1.0, 1.0)]))
+    assert reg.get_object(first) is not None and reg.get_object(third).missing
+    print("  [PASS] test_a_record_whose_cloud_merged_into_a_duplicate_takes_its_place")
+
+
 def test_object_store_roundtrip():
     """persist → fresh ObjectStore → load_all preserves scalar state."""
     try:

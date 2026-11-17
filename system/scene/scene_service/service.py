@@ -51,7 +51,7 @@ from .state import (
     ObjectRegistry,
     Pose3D,
 )
-from .state.object_registry import now_unix
+from .state.object_registry import merge_gate_from_env, now_unix
 from .object_views import (
     bearing_of as _view_bearing,
     looks_like as _view_looks_like,
@@ -420,18 +420,6 @@ class _SelfTracker:
 _MERGE_EVERY_N_TICKS = 10
 
 
-def _merge_gate_from_env() -> tuple[float, float]:
-    """Floor and height gates for the duplicate collapse, in metres; a zero
-    floor gate turns the collapse off."""
-    def _read(name: str, default: float) -> float:
-        try:
-            return float(os.environ.get(name, "").strip() or default)
-        except ValueError:
-            return default
-
-    return (_read("SCENE_MERGE_XY_M", 0.35), _read("SCENE_MERGE_Z_M", 1.20))
-
-
 def declarable_scene_tools() -> list:
     """Every `@mcp_contract` handler in mcp_tools, once each, by contract id.
     Walked rather than listed, so a new tool cannot be left undeclared."""
@@ -462,7 +450,7 @@ def _declare_tools() -> None:
 
 
 async def _stale_tick(registry: ObjectRegistry, *, period_s: float = 1.0) -> None:
-    merge_xy, merge_z = _merge_gate_from_env()
+    merge_xy, merge_z = merge_gate_from_env()
     tick = 0
     while True:
         tick += 1

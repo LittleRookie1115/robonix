@@ -23,7 +23,7 @@ log = logging.getLogger("scene.ingest.cg")
 
 from .perception_vlm import _CamIntrinsics, _canon_class
 from ..state.data_assoc import Detection
-from ..state.object_registry import BBox3D, ObjectRegistry, Pose3D, SceneObject
+from ..state.object_registry import BBox3D, ObjectRegistry, Pose3D, SceneObject, merge_gate_from_env
 
 
 # ── Open-vocab class list ────────────────────────────────────────────────
@@ -1286,6 +1286,8 @@ class ConceptGraphsDetector:
                 del streak[uuid_value]
         if not doomed:
             return
+        # The registry tells these apart from clouds a cleanup merged away.
+        self._seen_absent = getattr(self, "_seen_absent", set()) | doomed
         if self._cg is not None:
             retained = self._cg.MapObjectList()
         else:  # pragma: no cover - loaders guarantee _cg by now
@@ -1945,19 +1947,23 @@ class ConceptGraphsDetector:
                 self._apply_snapshot(
                     snapshots, frozenset(getattr(self, "_held_uuids", ())),
                     expected_world_frame=snapshot_frame,
+                    seen_absent=frozenset(getattr(self, "_seen_absent", ())),
                 ),
                 self._asyncio_loop,
             )
+            self._seen_absent = set()
         except Exception as e:  # noqa: BLE001
             log.debug("schedule registry update failed: %s", e)
 
     async def _apply_snapshot(
         self, snapshots: list[dict], held: frozenset = frozenset(), *,
         expected_world_frame: Optional[str] = None,
+        seen_absent: frozenset = frozenset(),
     ) -> None:
         """Reconcile concept-graphs MapObjectList state into the registry
         **incrementally**. ``held`` are uuids the backend gated out before the
-        snapshot; like a rejected snapshot they stay live."""
+        snapshot; like a rejected snapshot they stay live. ``seen_absent`` are
+        uuids visible absence removed since the last snapshot."""
         now = time.time()
         # A rejected snapshot below is not evidence that its object is gone:
         # visible absence decides that. Its uuid stays live, so a registered
@@ -2073,7 +2079,8 @@ class ConceptGraphsDetector:
                     adopted_oids.add(obj.object_id)
 
             # Evict registry records whose source uuid is gone.
-            doomed = []
+            doomed, twins = [], []
+            gate = merge_gate_from_env()
             for oid, obj in list(self._registry._objects.items()):
                 if oid in adopted_oids:
                     continue
@@ -2095,9 +2102,43 @@ class ConceptGraphsDetector:
                             self._uuid_to_oid.pop(cg_uuid, None)
                             obj.attributes.pop("cg_uuid", None)
                         continue
-                    doomed.append(obj)
+                    # A cleanup merge often folds a record's cloud into a
+                    # duplicate's. Unless the camera saw the place empty, a live
+                    # duplicate means the object is there: the record takes its
+                    # place now rather than going missing until the duplicate
+                    # collapse folds them, under whichever id that ranks first.
+                    twin = None if obj.missing or cg_uuid in seen_absent else next((
+                        other for other in self._registry._objects.values()
+                        if other.object_id in adopted_oids and other is not obj
+                        and self._registry._same_thing(obj, other, *gate)), None)
+                    if twin is not None:
+                        twins.append((obj, twin))
+                    else:
+                        doomed.append(obj)
+                        if not obj.missing:
+                            log.info("[scene-cg] %s (%s) missing: %s", oid, obj.label,
+                                     "seen absent" if cg_uuid in seen_absent
+                                     else "its cloud went and no duplicate is live")
                     if cg_uuid is not None:
                         self._uuid_to_oid.pop(cg_uuid, None)
+            for obj, twin in twins:
+                if twin.object_id not in self._registry._objects:
+                    doomed.append(obj)
+                    continue
+                # The id with more evidence stays, as in the duplicate
+                # collapse, with the live record's cloud and pose.
+                live = twin
+                if self._registry._merge_rank(twin) > self._registry._merge_rank(obj):
+                    obj, twin = twin, obj
+                log.info("[scene-cg] merged duplicate %s into %s: a cloud went",
+                         twin.object_id, obj.object_id)
+                self._registry._absorb(obj, twin, now)
+                del self._registry._objects[twin.object_id]
+                obj.pose, obj.bbox = live.pose, live.bbox
+                uuid_ = live.attributes.get("cg_uuid")
+                if uuid_:
+                    obj.attributes["cg_uuid"] = uuid_
+                    self._uuid_to_oid[uuid_] = obj.object_id
             # Soft-evict (mark `missing`, release the uuid) rather than delete,
             # so a re-detection within SCENE_OBJECT_TTL_SEC can re-bind the
             # same id + observation_count via find_rebindable — fixing the

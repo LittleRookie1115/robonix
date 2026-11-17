@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import warnings
 import re
 import time
@@ -680,6 +681,18 @@ class ObjectRegistry:
             "objects": len(self._objects),
             "missing": sum(1 for o in self._objects.values() if o.missing),
         }
+
+
+def merge_gate_from_env() -> tuple[float, float]:
+    """Floor and height gates for the duplicate collapse, in metres; a zero
+    floor gate turns the collapse off."""
+    def _read(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, "").strip() or default)
+        except ValueError:
+            return default
+
+    return (_read("SCENE_MERGE_XY_M", 0.35), _read("SCENE_MERGE_Z_M", 1.20))
 
 
 def _circular_ema(current: float, new: float, alpha: float) -> float:
