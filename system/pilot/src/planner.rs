@@ -1630,7 +1630,9 @@ pub async fn run_turn(
             .filter_map(|contract| contract.as_str().map(String::from))
             .collect(),
     );
-    let mut scene_find: Option<String> = None;
+    let mut scene_providers: Option<state_context::SceneProviders> = None;
+    // What this turn's steps have acted on, which no watch counts as gone.
+    let taken: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
     let mut watch_tick = tokio::time::interval(Duration::from_secs(1));
     watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every step reported this turn, since a reply may close the task on
@@ -2586,9 +2588,10 @@ Copy each cap exactly from the current catalog. Scope feedback by plan_id/call_i
 
 /// The RTDL protocol text sent on every planning round, with or without
 /// Segue's guidance on folding reads into the trees that act on them.
-fn rtdl_protocol(fold_reads: bool) -> String {
+fn rtdl_protocol(fold_reads: bool, reconfirm: bool) -> String {
     let fold = if fold_reads { FOLD_READS } else { "" };
-    format!("{RTDL_PROTOCOL_REMINDER}{fold}{RTDL_PROTOCOL_RULES}")
+    let reconfirm = if reconfirm { RECONFIRM } else { "" };
+    format!("{RTDL_PROTOCOL_REMINDER}{fold}{reconfirm}{RTDL_PROTOCOL_RULES}")
 }
 
 /// One parsed RTDL envelope from the VLM.
@@ -3133,8 +3136,8 @@ for a running plan. Concretely:
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityTargetMap, CatalogView, FOLD_READS, HistoryBudget, MetaPlanOp, RTDL_DO,
-        RTDL_FALLBACK, RTDL_PARALLEL, RTDL_REPEAT, RTDL_SEQUENCE, RUN_TAG, SessionForest,
+        CapabilityTargetMap, CatalogView, FOLD_READS, HistoryBudget, MetaPlanOp, RECONFIRM,
+        RTDL_DO, RTDL_FALLBACK, RTDL_PARALLEL, RTDL_REPEAT, RTDL_SEQUENCE, RUN_TAG, SessionForest,
         TaskTable, TreeInterrupt, TreeMeta, TreeStep, UsageTotals, append_request_context,
         append_steer, assemble_planning_messages, build_capability_target_map,
         build_display_capabilities, build_forest_block, call_signature, compact_tool_result,
@@ -3379,9 +3382,10 @@ mod tests {
     fn later_round_protocol_is_compact_but_keeps_admission_rules() {
         // Upstream's limit, plus fallback and keeping reads out of trees of their
         // own, which each saved round repays many times over.
-        let protocol = rtdl_protocol(true);
+        let protocol = rtdl_protocol(true, false);
+        assert!(rtdl_protocol(true, true).contains(RECONFIRM) && !protocol.contains(RECONFIRM));
         assert!(protocol.len() < 3_600);
-        assert!(!rtdl_protocol(false).contains(FOLD_READS) && protocol.contains(FOLD_READS));
+        assert!(!rtdl_protocol(false, false).contains(FOLD_READS) && protocol.contains(FOLD_READS));
         for required in [
             "capability_name",
             "sequence",
