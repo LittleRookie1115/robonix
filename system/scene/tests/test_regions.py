@@ -139,6 +139,40 @@ def test_goal_region_returns_a_poi_pose_only_where_the_robot_fits():
     assert blocked.goal.header.frame_id == ""
 
 
+class _CostmapHub(_Hub):
+    """_Hub's map, and a Navigation costmap that marks (1.0, 1.0)."""
+
+    def has(self, name):
+        return name in ("occupancy_grid", "nav_costmap")
+
+    def latest(self, name):
+        if name == "occupancy_grid":
+            return super().latest(name)
+        data = np.zeros((80, 80), dtype=np.int8)
+        data[40, 40] = 100
+        return SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            info=SimpleNamespace(width=80, height=80, resolution=0.05,
+                                 origin=SimpleNamespace(position=SimpleNamespace(x=-1.0, y=-1.0))),
+            data=data.tobytes(),
+        ), 0.0, 1
+
+
+def test_goal_clear_checks_a_held_goal_against_the_map_and_the_live_costmap():
+    def clear(hub, x, y, frame="map"):
+        mcp_tools.attach_state(registry=_Registry(), hub=hub, robot_geometry=_Geometry())
+        goal = mcp_tools.geometry_msgs_mcp.PoseStamped()
+        goal.header.frame_id = frame
+        goal.pose.position.x, goal.pose.position.y, goal.pose.orientation.w = x, y, 1.0
+        return asyncio.run(mcp_tools.goal_clear(mcp_tools.GoalClear_Request(goal=goal)))
+
+    assert clear(_Hub(), 1.0, 1.0).clear is True
+    assert "does not fit" in clear(_Hub(), 2.1, 2.0).reason
+    marked = clear(_CostmapHub(), 1.0, 1.0)
+    assert marked.clear is False and "costmap" in marked.reason
+    assert clear(_Hub(), 0.5, 0.5, frame="odom").clear is False
+
+
 class _LateRegistry:
     """Nothing for the first two looks, then a cup: perception catching up with a new view."""
 

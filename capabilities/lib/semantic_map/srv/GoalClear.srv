@@ -1,0 +1,11 @@
+# robonix/system/scene/goal_clear - whether a navigation goal a plan already
+# holds is still a pose the robot can stand at: its footprint fits there on
+# the map, and Navigation's costmap, which marks what the robot's sensors see
+# now, does not mark it. goal_region and goal_near choose a goal; this checks
+# one.
+
+geometry_msgs/PoseStamped goal
+---
+bool clear
+# Why not, when clear is false.
+string reason

@@ -30,6 +30,8 @@ import semantic_map_mcp  # type: ignore
 from semantic_map_mcp import (  # type: ignore
     GoalNear_Request,
     GoalNear_Response,
+    GoalClear_Request,
+    GoalClear_Response,
     GoalRegion_Request,
     GoalRegion_Response,
     GoalRoom_Request,
@@ -842,6 +844,36 @@ def _nav_costmap(frame: str):
     if str(getattr(costmap.header, "frame_id", "") or "").strip() != frame:
         return None
     return costmap
+
+
+@mcp_contract(mcp, contract_id="robonix/system/scene/goal_clear")
+async def goal_clear(req: GoalClear_Request) -> GoalClear_Response:
+    """Whether a navigation goal is still a pose the robot can stand at: its
+    footprint fits there on the map, and Navigation's costmap, which marks what
+    the robot's sensors see now, does not mark it.
+    Contract: robonix/system/scene/goal_clear."""
+    footprint = _ROBOT_GEOMETRY.current() if _ROBOT_GEOMETRY is not None else None
+    if footprint is None:
+        return GoalClear_Response(clear=False, reason="Soma footprint unavailable")
+    if _HUB is None or not _HUB.has("occupancy_grid"):
+        return GoalClear_Response(clear=False, reason="no occupancy_grid available")
+    msg, _stamp, count = _HUB.latest("occupancy_grid")
+    if msg is None or count == 0 or not msg.info.width or not msg.info.height:
+        return GoalClear_Response(clear=False, reason="occupancy_grid empty")
+    frame = str(getattr(getattr(msg, "header", None), "frame_id", "") or "").strip()
+    asked = str(req.goal.header.frame_id or "").strip()
+    if asked and asked != frame:
+        return GoalClear_Response(
+            clear=False, reason=f"goal is in frame {asked!r}, the map in {frame!r}")
+    position, q = req.goal.pose.position, req.goal.pose.orientation
+    x, y = float(position.x), float(position.y)
+    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    if not pose_clear(msg, footprint, x, y, yaw):
+        return GoalClear_Response(clear=False, reason="the robot does not fit there on the map")
+    costmap = _nav_costmap(frame)
+    if costmap is not None and not nav_cost_ok(costmap, x, y):
+        return GoalClear_Response(clear=False, reason="Navigation's costmap marks it occupied")
+    return GoalClear_Response(clear=True, reason="")
 
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_region")

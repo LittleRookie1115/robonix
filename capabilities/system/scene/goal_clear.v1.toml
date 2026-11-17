@@ -1,0 +1,13 @@
+# Check a navigation goal a plan already holds against the map and Navigation's live costmap.
+[contract]
+id      = "robonix/system/scene/goal_clear"
+version = "1"
+kind    = "service"
+idl     = "semantic_map/srv/GoalClear.srv"
+description = "Whether a navigation goal is still a pose the robot can stand at: its footprint fits on the map there and Navigation's costmap, which marks what the robot's sensors see now, does not mark it."
+# Pilot checks the goals of a running tree with it; a planner chooses goals
+# with goal_region and goal_near instead.
+llm_callable = false
+
+[mode]
+type = "rpc"
