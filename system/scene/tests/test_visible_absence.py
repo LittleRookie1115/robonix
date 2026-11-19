@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from scene_service.ingest.perception_concept_graphs import (
+    _CFG_DEFAULTS,
     ConceptGraphsDetector,
     _visible_missing_uuids,
 )
@@ -125,10 +126,12 @@ def _detector_with_map(objs):
     d._cg = None
     d._tick_idx = 7
     d.cfg = {
+        **_CFG_DEFAULTS,
         "visibility_depth_margin_m": 0.10,
         "visibility_min_clear_samples": 3,
         "visibility_min_clear_fraction": 0.60,
         "visibility_miss_ticks": 3,
+        "visibility_min_extent_px": 0,  # the test camera is 64 pixels wide
     }
     return d
 
@@ -156,3 +159,30 @@ def test_one_observation_resets_the_streak():
     d._update_visible_absence(depth=_depth(10.0), K=_K(), trans_pose=CAM_TO_WORLD)
     assert len(d._map_objects) == 1
     assert d._visible_miss_streak == {}
+
+
+
+def test_a_view_of_part_of_the_object_judges_nothing():
+    # With the camera 58 cm lower the object's top row leaves the image.
+    shifted = np.array(CAM_TO_WORLD)
+    shifted[2, 3] = 0.42
+    kwargs = dict(observed_uuids=set(), depth_m=_depth(10.0), intrinsics=_K(),
+                  camera_to_world=shifted, depth_margin_m=0.10)
+    assert _visible_missing_uuids([_map_object()], **kwargs) == {"obj-1"}
+    assert _visible_missing_uuids([_map_object()], min_in_view_fraction=0.9, **kwargs) == set()
+
+
+def test_a_few_pixels_of_object_judge_nothing():
+    kwargs = dict(observed_uuids=set(), depth_m=_depth(10.0), intrinsics=_K(),
+                  camera_to_world=CAM_TO_WORLD, depth_margin_m=0.10)
+    assert _visible_missing_uuids([_map_object()], **kwargs) == {"obj-1"}
+    assert _visible_missing_uuids([_map_object()], min_extent_px=16, **kwargs) == set()
+
+
+def test_a_close_view_judges_nothing():
+    kwargs = dict(observed_uuids=set(), depth_m=_depth(10.0), intrinsics=_K(),
+                  camera_to_world=CAM_TO_WORLD, depth_margin_m=0.10)
+    assert _visible_missing_uuids([_map_object()], **kwargs) == {"obj-1"}
+    assert _visible_missing_uuids([_map_object()], min_depth_m=2.5, **kwargs) == set()
+
+
