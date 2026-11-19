@@ -116,7 +116,8 @@ def merge_obj2_into_obj1(
         "xyxy", "conf", "contain_number", "captions",
     ]
     add_attributes = ["num_detections", "num_obj_in_class"]
-    skip_attributes = ["id", "class_name", "is_background", "new_counter", "curr_obj_num", "inst_color", "mask"]
+    skip_attributes = ["id", "class_name", "is_background", "new_counter", "curr_obj_num", "inst_color", "mask",
+                       "folded_into"]
     custom_handled = ["pcd", "bbox", "clip_ft", "text_ft", "n_points"]
 
     all_handled_keys = set(extend_attributes + add_attributes + skip_attributes + custom_handled)
@@ -275,6 +276,7 @@ def merge_overlap_objects(
                     device, run_dbscan=True,
                 )
                 kept_objects[i] = False
+                objects[i]["folded_into"] = objects[j].get("id")
         else:
             break
 

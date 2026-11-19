@@ -281,7 +281,7 @@ def _cleanup_detector(objects, **cfg):
     from scene_service.ingest.perception_concept_graphs import _CFG_DEFAULTS, ConceptGraphsDetector
     d = ConceptGraphsDetector.__new__(ConceptGraphsDetector)
     d.cfg = {**_CFG_DEFAULTS, **cfg}
-    d._cg, d._device, d._cloud_fate, d._tick_idx = perception_cg_numpy, "", {}, 1
+    d._cg, d._device, d._cloud_fate, d._folded_into, d._tick_idx = perception_cg_numpy, "", {}, {}, 1
     d._map_objects = perception_cg_numpy.MapObjectList(objects)
     return d
 
