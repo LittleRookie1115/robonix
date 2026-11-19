@@ -926,6 +926,7 @@ class ConceptGraphsDetector:
             if self._tick_idx % 25 == 0:
                 log.info("[scene-cg] empty frame: no detections; rgb=%s depth=%s",
                          rgb.shape, depth.shape)
+            self._judge_absence_unobserved(depth, K, depth_msg)
             self._finish_tick()
             return
 
@@ -961,6 +962,7 @@ class ConceptGraphsDetector:
             if self._tick_idx % 25 == 0:
                 log.info("[scene-cg] empty frame: ignored classes; rgb=%s depth=%s boxes=%d",
                          rgb.shape, depth.shape, len(keep))
+            self._judge_absence_unobserved(depth, K, depth_msg)
             self._finish_tick()
             return
         xyxy = xyxy[keep]
@@ -1262,6 +1264,16 @@ class ConceptGraphsDetector:
                           (float(trans_pose[0, 3]), float(trans_pose[1, 3])), time.time())
         self._update_visible_absence(depth=depth, K=K, trans_pose=trans_pose)
         self._finish_tick(observed=True)
+
+    def _judge_absence_unobserved(self, depth, K, depth_msg) -> None:
+        """Visible absence on a frame with nothing to detect: an empty view of
+        a place is the plainest evidence that what stood there went."""
+        world_frame = str(self._world_frame_fn() or "").strip()
+        self._follow_world_frame(world_frame)
+        trans_pose = self._build_camera_to_map_transform(
+            expected_world_frame=world_frame, stamp=_header_stamp(depth_msg))
+        if trans_pose is not None and world_frame:
+            self._update_visible_absence(depth=depth, K=K, trans_pose=trans_pose)
 
     def _update_visible_absence(self, *, depth, K, trans_pose) -> None:
         """Remove map objects whose old location is verifiably empty."""
