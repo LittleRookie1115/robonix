@@ -845,32 +845,125 @@ async fn check_watches(
         regions
             .iter()
             .for_each(|region| state_context::forget_goal(region));
-        info!(
-            "[pilot/segue] {}",
-            serde_json::json!({
-                "event": "read_set",
-                "plan_id": plan_id,
-                "running": true,
-                "gone": gone,
-                "left": left,
-                "applied": read_set,
-            })
-        );
+        let note = read_set_changed(&plan_id, &gone, &left, read_set, true);
         if !read_set || !forest.trees.contains_key(&plan_id) {
             continue;
         }
         cancel_plan(executor, &plan_id, "after its read set changed").await;
         forest.kill_pending.insert(plan_id.clone());
-        history.push(Message::user(&format!(
-            "Pilot stopped RTDL plan {plan_id} before its steps {} finished: since it was written, \
-             {} no longer among Scene's objects. Plan from the current environment.",
-            left.join(", "),
-            match gone.len() {
-                1 => format!("{} is", gone[0]),
-                _ => format!("{} are", gone.join(", ")),
-            }
-        )));
+        history.push(note);
     }
+}
+
+/// Log that tree `plan_id` relies on what is `gone`, with steps `left` to
+/// finish, and return the note telling the planner that Pilot stopped it, or
+/// did not send it when none of it was `sent`.
+fn read_set_changed(
+    plan_id: &str,
+    gone: &[String],
+    left: &[String],
+    read_set: bool,
+    sent: bool,
+) -> Message {
+    info!(
+        "[pilot/segue] {}",
+        serde_json::json!({
+            "event": "read_set",
+            "plan_id": plan_id,
+            "running": true,
+            "gone": gone,
+            "left": left,
+            "applied": read_set,
+        })
+    );
+    let stopped = if sent {
+        format!(
+            "stopped RTDL plan {plan_id} before its steps {} finished",
+            left.join(", ")
+        )
+    } else {
+        format!("did not send RTDL plan {plan_id}")
+    };
+    Message::user(&format!(
+        "Pilot {stopped}: since it was written, {} no longer among Scene's objects. Plan from \
+         the current environment.",
+        match gone.len() {
+            1 => format!("{} is", gone[0]),
+            _ => format!("{} are", gone.join(", ")),
+        }
+    ))
+}
+
+/// What `plan`, a tree being streamed, relies on that Scene no longer lists,
+/// when its nodes not yet in `live` hold a step that does more than read: the
+/// gone objects as [`Watch::check`] gives them, and the steps left.
+async fn gone_at_dispatch(
+    plan: &Plan,
+    live: &crate::stream_execution::StreamExecution,
+    state: &serde_json::Value,
+    reads: &Arc<HashSet<String>>,
+    taken: &Arc<std::sync::Mutex<HashSet<String>>>,
+    scene: &state_context::SceneProviders,
+    executor: &ExecutorConn,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let sent = live.plan.nodes.len();
+    let mut calls = plan
+        .nodes
+        .iter()
+        .skip(sent)
+        .filter_map(|node| node.call.as_ref());
+    if calls.all(|call| reads.contains(&call.contract_id)) {
+        return None;
+    }
+    // A cleanup can take an object off Scene's list for a moment, so as for the
+    // watch a reading a second later must confirm what the first found gone.
+    let mut gone: Option<Vec<String>> = None;
+    let mut left = Vec::new();
+    for reading in 0..2 {
+        if reading > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let Some(listed) = state_context::listed(executor, &scene.find).await else {
+            warn!(
+                "[pilot/segue] Scene's list unread: plan {} steps sent unchecked",
+                plan.plan_id
+            );
+            return None;
+        };
+        let mut watch = state_watch(plan, state, reads, taken);
+        let states = live
+            .events
+            .iter()
+            .filter_map(|event| event.node_state.as_ref());
+        let now = watch.check_unsent(sent as u32, states, &listed);
+        let confirmed: Vec<String> = match gone {
+            None => now,
+            Some(first) => first.into_iter().filter(|id| now.contains(id)).collect(),
+        };
+        if confirmed.is_empty() {
+            return None;
+        }
+        left = watch.left().into_iter().map(String::from).collect();
+        gone = Some(confirmed);
+    }
+    gone.map(|gone| (gone, left))
+}
+
+/// The watch of `plan`, written from the state view `state`.
+fn state_watch(
+    plan: &Plan,
+    state: &serde_json::Value,
+    reads: &Arc<HashSet<String>>,
+    taken: &Arc<std::sync::Mutex<HashSet<String>>>,
+) -> Watch {
+    Watch::new(
+        plan,
+        state["objects"].clone(),
+        crate::watch::listings(&state["poses"]),
+        &state["places"],
+        reads.clone(),
+        taken.clone(),
+    )
 }
 
 /// Ask Executor to cancel the plan `target`, logging how it went with `why`.
@@ -2055,6 +2148,8 @@ pub async fn run_turn(
             }
         }
         let mut live = crate::stream_execution::StreamExecution::default();
+        // A prepared reply was just checked against this round's state view.
+        let replayed = prepared.is_some();
         let (mut stream, outputs) = match prepared {
             Some((reply, outputs)) => (speculation::replay(reply), outputs),
             None => (
@@ -2092,6 +2187,9 @@ pub async fn run_turn(
         let mut execution_failed = false;
         let mut invalid_output = false;
         let mut reasoning_bytes = 0_usize;
+        // With the read set off a change is only logged, once per reply rather
+        // than at each step sent after it.
+        let mut stale_at_dispatch = false;
         let idle = tokio::time::sleep(vlm_idle_timeout());
         tokio::pin!(idle);
 
@@ -2133,9 +2231,31 @@ pub async fn run_turn(
                     match item {
                         Some(Ok(VlmStreamItem::TextDelta(delta))) => {
                             if let Err(error) = parser.push(&delta) { invalid_output = true; stream_error = Some(error); break; }
+                            let messages = parser.take_messages();
+                            // A tree's steps run as they stream in, before its watch
+                            // starts, so steps beyond reads are first checked against Scene.
+                            if speculate && state_view && !stale_at_dispatch && !replayed
+                                && let Some(scene) = &scene_providers
+                                && let Some((gone, left)) = gone_at_dispatch(
+                                    &parser.plan, &live, &state, &watch_reads, &taken, scene, executor,
+                                ).await
+                            {
+                                stale_at_dispatch = true;
+                                let sent = !live.plan.nodes.is_empty();
+                                let note = read_set_changed(&parser.plan.plan_id, &gone, &left, read_set, sent);
+                                if read_set {
+                                    drop(stream);
+                                    let cleanup = live.cancel(&mut executor.control).await;
+                                    publish_stream(live, forest, history, tx, &session_id).await;
+                                    history.push(note);
+                                    cleanup?;
+                                    should_plan = true;
+                                    continue 'supervisor;
+                                }
+                            }
                             // Submission checks execution feedback and revision;
                             // this loop handles steer and abort after the batch returns.
-                            let submission = live.submit(parser.take_messages(), crate::stream_execution::SubmissionGuard {
+                            let submission = live.submit(messages, crate::stream_execution::SubmissionGuard {
                                 client: &mut executor.streaming, forbidden: &forbidden,
                                 revision: &forest.revision, expected_revision: planning_revision,
                             }).await;
@@ -2466,14 +2586,7 @@ pub async fn run_turn(
             .as_deref()
             .is_some_and(|task| tasks.others_runnable(task));
         if speculate && state_view && plan_open && !is_control_only(&graph) {
-            watches.push(Watch::new(
-                &graph,
-                state["objects"].clone(),
-                crate::watch::listings(&state["poses"]),
-                &state["places"],
-                watch_reads.clone(),
-                taken.clone(),
-            ));
+            watches.push(state_watch(&graph, &state, &watch_reads, &taken));
         }
         // Only while one tree runs is its report sure to start the next round.
         if speculate

@@ -14,7 +14,7 @@
 //! `{"var": ...}`, directly or through other finished steps. A step still to
 //! act that names a class (`{"object": "cornflakes"}`) relies on the objects of
 //! that class the tree knew of, once Scene lists none of that class and no step
-//! still to run searches for it. An object Scene no longer lists is not gone if
+//! still to run searches for it before the step that acts on it. An object Scene no longer lists is not gone if
 //! Scene lists one of its class where it was, within 0.5 m beyond the object's
 //! own extent: Scene folds duplicate records of one object into one, retiring
 //! all ids but one, and a person's records spread over their body.
@@ -420,6 +420,46 @@ impl Watch {
         listed: &HashMap<String, Listing>,
         clear: &HashMap<String, Option<String>>,
     ) -> Vec<String> {
+        self.read(listed, clear, true)
+    }
+
+    /// [`Watch::check`] of objects only, on one reading, for the steps from node
+    /// `first` on, about to be sent after nodes that have reported `states`.
+    pub(crate) fn check_unsent<'a>(
+        &mut self,
+        first: u32,
+        states: impl IntoIterator<Item = &'a RtdlNodeState>,
+        listed: &HashMap<String, Listing>,
+    ) -> Vec<String> {
+        // What a sent step not ended acts on may be moving now; this watch's
+        // record of it is not the turn's. No step about to be sent is running yet.
+        let taken = self
+            .taken
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.taken = Arc::new(Mutex::new(taken));
+        states.into_iter().for_each(|state| self.progressed(state));
+        let sent = self
+            .unended()
+            .filter(|step| step.index < first && self.acts(step));
+        let moving: Vec<String> = sent.flat_map(|step| self.acted_on(step)).collect();
+        self.taken
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(moving);
+        self.read(listed, &HashMap::new(), false);
+        self.read(listed, &HashMap::new(), false)
+    }
+
+    /// [`Watch::check`], where `running` says whether the first step not ended
+    /// may be running.
+    fn read(
+        &mut self,
+        listed: &HashMap<String, Listing>,
+        clear: &HashMap<String, Option<String>>,
+        running: bool,
+    ) -> Vec<String> {
         if !self.armed() {
             self.gone.clear();
             self.blocked.clear();
@@ -464,13 +504,10 @@ impl Watch {
             .map(|listing| listing.label.as_str())
             .collect();
         for class in classes {
-            let named = |read: bool| {
-                self.unended().any(|step| {
-                    self.reads.contains(&step.contract) == read && names_class(&step.args, class)
-                })
-            };
-            if named(false)
-                && !named(true)
+            // A search for the class before the step that acts on it lets the
+            // tree find another; one after it, checking a place, does not.
+            let first = self.unended().find(|step| names_class(&step.args, class));
+            if first.is_some_and(|step| !self.reads.contains(&step.contract))
                 && !listed.values().any(|listing| listing.label == class)
             {
                 let of_class = self
@@ -482,15 +519,19 @@ impl Watch {
         }
         // What the turn's own steps acted on is expected to leave its place, and
         // so is what the step running now acts on: Executor does not report a
-        // call starting, the first step not ended is running, and a pick lifts
-        // its object off before it ends.
+        // call starting, the first step not ended is running when `running`, and
+        // a pick lifts its object off before it ends.
         let mut taken = self
             .taken
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if let Some(running) = self.unended().next().filter(|step| self.acts(step)) {
-            taken.extend(self.acted_on(running));
+        let first = self
+            .unended()
+            .next()
+            .filter(|step| running && self.acts(step));
+        if let Some(step) = first {
+            taken.extend(self.acted_on(step));
         }
         relied.retain(|id| {
             let class = self.known.get(id).map(|listing| listing.label.as_str());
@@ -669,6 +710,64 @@ mod tests {
     }
 
     #[test]
+    fn one_reading_stops_a_step_about_to_be_sent() {
+        // Nodes 0 and 1, the root and the navigation, are sent; the pick is not.
+        let plan = tree(&[
+            (NAVIGATE, "", json!({"goal": [1.0, 0.0]})),
+            (PICK, "", json!({"object_id": "o1"})),
+        ]);
+        let sofa = listed(&[("o2", "sofa", 5.0)]);
+        assert_eq!(
+            watch(&plan).check_unsent(2, [], &sofa),
+            ["o1 (cornflakes in living room when the tree was written)"]
+        );
+        let cornflakes = listed(&[("o1", "cornflakes", 1.0)]);
+        assert!(watch(&plan).check_unsent(2, [], &cornflakes).is_empty());
+    }
+
+    #[test]
+    fn a_step_about_to_be_sent_relies_on_what_a_sent_step_found() {
+        let plan = tree(&[
+            (FIND, "f", json!({"label": "cup"})),
+            (
+                PICK,
+                "",
+                json!({"object_id": {"var": "f", "path": ["objects", 0, "id"]}}),
+            ),
+        ]);
+        let cup = json!({"objects": [{"id": "o9", "label": "cup", "x": 8.0, "y": 0.0}]});
+        let none = listed(&[("o1", "cornflakes", 1.0)]);
+        assert_eq!(
+            watch(&plan).check_unsent(2, [&succeeded(1, cup)], &none),
+            ["o9 (cup, which an earlier step found)"]
+        );
+    }
+
+    #[test]
+    fn what_a_sent_step_picks_up_may_leave_its_place() {
+        let plan = tree(&[
+            (PICK, "", json!({"object_id": "o1"})),
+            (PLACE, "", json!({"object_id": "o1", "on": "o2"})),
+        ]);
+        let taken = Arc::default();
+        let mut placing = Watch::new(
+            &plan,
+            json!({"living room": [{"id": "o1", "label": "cornflakes"}, {"id": "o2", "label": "sofa"}]}),
+            listed(&[("o1", "cornflakes", 1.0), ("o2", "sofa", 5.0)]),
+            &json!([]),
+            Arc::new(HashSet::from([FIND.to_string()])),
+            Arc::clone(&taken),
+        );
+        assert!(
+            placing
+                .check_unsent(2, [], &listed(&[("o2", "sofa", 5.0)]))
+                .is_empty()
+        );
+        // The turn's record of what its steps acted on waits for them to end.
+        assert!(taken.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn an_id_scene_folded_into_another_of_its_class_where_it_was_is_not_gone() {
         let plan = tree(&[
             (GOAL_NEAR, "", json!({"object_id": "o1"})),
@@ -724,7 +823,8 @@ mod tests {
             watch.check(&sofa, &HashMap::new()),
             ["o1 (cornflakes in living room when the tree was written)"]
         );
-        // Another of the class listed anywhere, or a search for it still to run, keeps it.
+        // Another of the class listed anywhere, or a search for it before the
+        // pick, keeps it; a search after the pick does not.
         let mut elsewhere = self::watch(&pick);
         let other = listed(&[("o5", "cornflakes", 9.0)]);
         elsewhere.check(&other, &HashMap::new());
@@ -736,6 +836,18 @@ mod tests {
         let mut searching = self::watch(&search);
         searching.check(&sofa, &HashMap::new());
         assert!(searching.check(&sofa, &HashMap::new()).is_empty());
+        let verify = tree(&[
+            (NAVIGATE, "", json!({"goal": {}})),
+            (PICK, "", json!({"object": "cornflakes"})),
+            (PLACE, "", json!({"target": "sofa"})),
+            (FIND, "", json!({"label": "cornflakes", "anchor": "sofa"})),
+        ]);
+        let mut verifying = self::watch(&verify);
+        verifying.check(&sofa, &HashMap::new());
+        assert_eq!(
+            verifying.check(&sofa, &HashMap::new()),
+            ["o1 (cornflakes in living room when the tree was written)"]
+        );
     }
 
     #[test]
