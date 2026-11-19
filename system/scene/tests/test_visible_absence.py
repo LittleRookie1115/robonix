@@ -186,3 +186,14 @@ def test_a_close_view_judges_nothing():
     assert _visible_missing_uuids([_map_object()], min_depth_m=2.5, **kwargs) == set()
 
 
+
+def test_an_empty_frame_in_a_new_world_frame_judges_no_old_cloud():
+    # Clouds from the old frame are dropped, not projected through the new pose.
+    obj = _map_object()
+    obj["image_idx"] = [1]
+    d = _detector_with_map([obj])
+    d._map_frame, d._world_frame_fn = "odom", lambda: "map"
+    d._vox = set()
+    d._build_camera_to_map_transform = lambda **_: CAM_TO_WORLD
+    d._judge_absence_unobserved(_depth(10.0), _K(), depth_msg=None)
+    assert d._map_objects == [] and not getattr(d, "_seen_absent", set())
