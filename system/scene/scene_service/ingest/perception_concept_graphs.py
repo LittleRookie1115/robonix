@@ -447,6 +447,7 @@ def _visible_missing_uuids(
                 occluded_samples=int(occluded),
                 similar_depth_samples=int(similar_depth),
                 clear_fraction=round(float(clear_ratio), 6),
+                expected_depth_median_m=round(float(np.median([s[2] for s in samples])), 3),
                 depth_delta_median_m=(
                     round(float(np.median(depth_deltas)), 6)
                     if depth_deltas
@@ -541,6 +542,8 @@ class ConceptGraphsDetector:
         self._inference_lock = threading.Lock()
         self._classes = _resolved_classes()
         self._tick_idx = 0
+        # Which cleanup took each cloud since the last snapshot, for the missing line.
+        self._cloud_fate: dict[str, str] = {}
         # Named for the status page, alongside what one pass through the
         # pipeline costs: comparing two backends on accuracy alone leaves out
         # half of why one would be chosen over the other.
@@ -1329,17 +1332,18 @@ class ConceptGraphsDetector:
             retained = self._cg.MapObjectList()
         else:  # pragma: no cover - loaders guarantee _cg by now
             retained = []
-        removed = 0
+        removed = []
         for obj in self._map_objects:
-            if str(obj.get("id", "") or "") in doomed:
-                removed += 1
+            uuid_value = str(obj.get("id", "") or "")
+            if uuid_value in doomed:
+                removed.append(f"{obj.get('class_name')} {diagnostics.get(uuid_value)}")
                 continue
             retained.append(obj)
         if removed:
             self._map_objects = retained
             log.info(
                 "[scene-cg] visible-absence removed %d object(s) after %d "
-                "consecutive clear ticks", removed, required,
+                "consecutive clear ticks: %s", len(removed), required, "; ".join(removed),
             )
 
     # ── Voxel pcd-overlap (replaces concept-graphs `overlap` mode) ──
@@ -1392,6 +1396,14 @@ class ConceptGraphsDetector:
         if had_objects:
             export_from_env(self._map_objects, self._clip_model_name, self._clip_pretrained)
 
+    def _note_fates(self, before, why) -> None:
+        """Record why() for each object of `before` no longer in the list, for
+        the registry's missing line."""
+        live = {id(o) for o in self._map_objects}
+        for o in before:
+            if id(o) not in live:
+                self._cloud_fate[str(o.get("id", ""))] = why(o)
+
     def _maybe_periodic_cleanup(self) -> bool:
         if self._map_objects is None or len(self._map_objects) == 0:
             return False
@@ -1409,12 +1421,15 @@ class ConceptGraphsDetector:
                     objects=self._map_objects,
                 )
                 # filter_objects drops objects with too-few points / detections
+                denoised = self._map_objects
                 self._map_objects = self._cg.filter_objects(
                     obj_min_points=self.cfg["obj_min_points"],
                     obj_min_detections=self.cfg["obj_min_detections"],
                     objects=self._map_objects,
                     keep_detections=int(self.cfg["obj_keep_detections"]),
                 )
+                self._note_fates(denoised, lambda o: (
+                    f"filtered at {len(o['pcd'].points)} points, {o['num_detections']} detections"))
                 if len(self._map_objects) != pre:
                     log.info("[scene-cg] cleanup denoise+filter: %d → %d", pre, len(self._map_objects))
                 ran_any = True
@@ -1444,7 +1459,8 @@ class ConceptGraphsDetector:
                     device=self._device,
                     cross_class_min_extent=float(self.cfg["cross_class_min_extent_m"]),
                 )
-                self._map_objects = merged_objs
+                before, self._map_objects = self._map_objects, merged_objs
+                self._note_fates(before, lambda o: "merge_overlap")
                 if len(self._map_objects) != pre:
                     log.info("[scene-cg] cleanup merge_overlap: %d → %d", pre, len(self._map_objects))
                 ran_any = True
@@ -1527,6 +1543,8 @@ class ConceptGraphsDetector:
                     log.debug("cross-class merge i=%d j=%d failed: %s", i, j, e)
                     continue
                 keep[j] = False
+                self._cloud_fate[str(objects[j].get("id", ""))] = (
+                    f"cross-class geom into {objects[i].get('class_name')}")
                 pts = np.asarray(objects[i]["pcd"].points)
                 pts = pts[np.all(np.isfinite(pts), axis=1)] if pts.size else pts
                 if pts.size:
@@ -1587,6 +1605,8 @@ class ConceptGraphsDetector:
                     log.debug("same-class merge i=%d j=%d failed: %s", i, j, e)
                     continue
                 keep[j] = False
+                self._cloud_fate[str(objects[j].get("id", ""))] = (
+                    f"same-class proximity into {objects[i].get('class_name')}")
                 centroids[i] = _centroid(objects[i])
 
         out = self._cg.MapObjectList()
@@ -1993,10 +2013,12 @@ class ConceptGraphsDetector:
                     snapshots, frozenset(getattr(self, "_held_uuids", ())) | unboxed,
                     expected_world_frame=snapshot_frame,
                     seen_absent=frozenset(getattr(self, "_seen_absent", ())),
+                    cloud_fate=self._cloud_fate,
                 ),
                 self._asyncio_loop,
             )
             self._seen_absent = set()
+            self._cloud_fate = {}
         except Exception as e:  # noqa: BLE001
             log.debug("schedule registry update failed: %s", e)
 
@@ -2004,11 +2026,13 @@ class ConceptGraphsDetector:
         self, snapshots: list[dict], held: frozenset = frozenset(), *,
         expected_world_frame: Optional[str] = None,
         seen_absent: frozenset = frozenset(),
+        cloud_fate: Optional[dict[str, str]] = None,
     ) -> None:
         """Reconcile concept-graphs MapObjectList state into the registry
         **incrementally**. ``held`` are uuids the backend gated out before the
         snapshot; like a rejected snapshot they stay live. ``seen_absent`` are
-        uuids visible absence removed since the last snapshot."""
+        uuids visible absence removed since the last snapshot, ``cloud_fate``
+        which cleanup took the others' clouds."""
         now = time.time()
         # A rejected snapshot below is not evidence that its object is gone:
         # visible absence decides that. Its uuid stays live, so a registered
@@ -2163,7 +2187,8 @@ class ConceptGraphsDetector:
                         if not obj.missing:
                             log.info("[scene-cg] %s (%s) missing: %s", oid, obj.label,
                                      "seen absent" if cg_uuid in seen_absent
-                                     else "its cloud went and no duplicate is live")
+                                     else f"its cloud went ({(cloud_fate or {}).get(cg_uuid, 'no cleanup')})"
+                                          " and no duplicate is live")
                     if cg_uuid is not None:
                         self._uuid_to_oid.pop(cg_uuid, None)
             for obj, twin in twins:
