@@ -85,6 +85,11 @@ _CFG_DEFAULTS = {
     "visibility_min_clear_samples": 3,
     "visibility_min_clear_fraction": 0.60,
     "visibility_miss_ticks": 3,
+    # Partial, tiny or close views sample the surface beside the object
+    # under pose error.
+    "visibility_min_in_view_fraction": 0.9,
+    "visibility_min_extent_px": 16,
+    "visibility_min_depth_m": 0.7,
     # Hard centroid-distance gate on the per-tick merge.
     "max_merge_dist_m": 1.5,
     # Minimum 3D points after backprojection to keep a detection.
@@ -106,6 +111,7 @@ _CFG_DEFAULTS = {
     # SCENE_CG_OBJ_MIN_POINTS (env table below).
     "obj_min_points": 20,
     "obj_min_detections": 1,
+    "obj_keep_detections": 2,
     # merge_overlap_thresh: spatial pcd-overlap ratio above which the pair is a
     # candidate (0..1). 0.5 = "half of A's volume is inside B" — more
     # aggressive than the canonical 0.7 because at this scale and this voxel
@@ -139,6 +145,7 @@ _CFG_DEFAULTS = {
     "cross_class_centroid_max_m": 0.5,
     "cross_class_iou_thresh": 0.30,
     "cross_class_overlap_thresh": 0.50,
+    "cross_class_min_extent_m": 0.4,
     "cross_class_merge_interval_ticks": 10,
     # ── Same-class lenient proximity merge (dedup) ─────────────────────
     # Folds two objects of the SAME class (or same SCENE_CG_MERGE_CLASS_GROUPS
@@ -234,9 +241,16 @@ def _visible_missing_uuids(
     upper_sample_fraction: float = 0.70,
     min_depth_margin_m: float = 0.015,
     extent_margin_scale: float = 0.30,
+    min_in_view_fraction: float = 0.0,
+    min_extent_px: int = 0,
+    min_depth_m: float = 0.0,
     diagnostics: Optional[dict[str, dict[str, Any]]] = None,
 ) -> set[str]:
-    """Return unmatched objects whose old location is visibly empty."""
+    """Return unmatched objects whose old location is visibly empty.
+
+    Only a full, large enough view from at least min_depth_m counts: in any
+    other view the stored cloud, offset by pose error, samples the surface
+    beside the object."""
     try:
         depth = np.asarray(depth_m, dtype=np.float32)
         transform = np.asarray(camera_to_world, dtype=np.float64)
@@ -340,6 +354,14 @@ def _visible_missing_uuids(
                     "out_of_view",
                     projectable_points=int(camera_points.shape[0]),
                 )
+                continue
+            in_view_fraction = float(np.mean(in_view))
+            extent_px = int(max(np.ptp(us[in_view]), np.ptp(vs[in_view])))
+            median_depth_m = float(np.median(expected_depths[in_view]))
+            if (in_view_fraction < min_in_view_fraction or extent_px < min_extent_px
+                    or median_depth_m < min_depth_m):
+                record(uuid_value, "poor_view", in_view_fraction=round(in_view_fraction, 3),
+                       extent_px=extent_px, depth_m=round(median_depth_m, 3))
                 continue
             us, vs, expected_depths = (
                 us[in_view],
@@ -1265,6 +1287,9 @@ class ConceptGraphsDetector:
             depth_margin_m=float(self.cfg["visibility_depth_margin_m"]),
             min_clear_samples=int(self.cfg["visibility_min_clear_samples"]),
             min_clear_fraction=float(self.cfg["visibility_min_clear_fraction"]),
+            min_in_view_fraction=float(self.cfg["visibility_min_in_view_fraction"]),
+            min_extent_px=int(self.cfg["visibility_min_extent_px"]),
+            min_depth_m=float(self.cfg["visibility_min_depth_m"]),
             diagnostics=diagnostics,
         )
         self._visibility_diagnostics = diagnostics
@@ -1376,6 +1401,7 @@ class ConceptGraphsDetector:
                     obj_min_points=self.cfg["obj_min_points"],
                     obj_min_detections=self.cfg["obj_min_detections"],
                     objects=self._map_objects,
+                    keep_detections=int(self.cfg["obj_keep_detections"]),
                 )
                 if len(self._map_objects) != pre:
                     log.info("[scene-cg] cleanup denoise+filter: %d → %d", pre, len(self._map_objects))
@@ -1404,6 +1430,7 @@ class ConceptGraphsDetector:
                     dbscan_min_points=self.cfg["dbscan_min_points"],
                     spatial_sim_type=self.cfg["spatial_sim_type"],
                     device=self._device,
+                    cross_class_min_extent=float(self.cfg["cross_class_min_extent_m"]),
                 )
                 self._map_objects = merged_objs
                 if len(self._map_objects) != pre:
@@ -1450,6 +1477,7 @@ class ConceptGraphsDetector:
 
         iou_thr = float(self.cfg["cross_class_iou_thresh"])
         ratio_thr = float(self.cfg["cross_class_overlap_thresh"])
+        min_extent = float(self.cfg["cross_class_min_extent_m"])
         keep = [True] * n
         for i in range(n):
             if not keep[i]:
@@ -1469,6 +1497,8 @@ class ConceptGraphsDetector:
                 iou = inter_vol / union
                 ratio = max(inter_vol / a_vol, inter_vol / b_vol)
                 if iou < iou_thr and ratio < ratio_thr:
+                    continue
+                if self._cg.kept_apart(objects[i], objects[j], min_extent):
                     continue
                 try:
                     objects[i] = merge_obj2_into_obj1(
@@ -1888,6 +1918,8 @@ class ConceptGraphsDetector:
         self._reconcile_side_tables()
         snapshot_frame = getattr(self, "_map_frame", "") or self._world_frame_fn()
         snapshots = []
+        # A cloud too thin to box this tick is not evidence the object went.
+        unboxed: set[str] = set()
         for obj in self._map_objects:
             try:
                 pcd = obj["pcd"]
@@ -1897,6 +1929,7 @@ class ConceptGraphsDetector:
                 # Yaw-only bbox via 2D PCA on the XY footprint.
                 finite_pts = pts[np.all(np.isfinite(pts), axis=1)]
                 if finite_pts.shape[0] < 4:
+                    unboxed.add(str(obj.get("id", "")))
                     continue
                 pts = finite_pts
                 obb_yaw = _yaw_from_pca_xy(pts[:, :2])
@@ -1945,7 +1978,7 @@ class ConceptGraphsDetector:
         try:
             asyncio.run_coroutine_threadsafe(
                 self._apply_snapshot(
-                    snapshots, frozenset(getattr(self, "_held_uuids", ())),
+                    snapshots, frozenset(getattr(self, "_held_uuids", ())) | unboxed,
                     expected_world_frame=snapshot_frame,
                     seen_absent=frozenset(getattr(self, "_seen_absent", ())),
                 ),

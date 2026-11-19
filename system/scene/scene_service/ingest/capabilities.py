@@ -170,6 +170,7 @@ CONCEPT_GRAPHS_KEYS: frozenset[str] = frozenset({
     "cross_class_centroid_max_m",
     "cross_class_iou_thresh",
     "cross_class_merge_interval_ticks",
+    "cross_class_min_extent_m",
     "cross_class_overlap_thresh",
     "dbscan_eps",
     "dbscan_min_points",
@@ -188,6 +189,7 @@ CONCEPT_GRAPHS_KEYS: frozenset[str] = frozenset({
     "merge_threshold",
     "merge_visual_sim_thresh",
     "min_points_threshold",
+    "obj_keep_detections",
     "obj_min_detections",
     "obj_min_points",
     "obj_pcd_max_points",
@@ -200,6 +202,9 @@ CONCEPT_GRAPHS_KEYS: frozenset[str] = frozenset({
     "visibility_depth_margin_m",
     "visibility_min_clear_fraction",
     "visibility_min_clear_samples",
+    "visibility_min_depth_m",
+    "visibility_min_extent_px",
+    "visibility_min_in_view_fraction",
     "visibility_miss_ticks",
 })
 

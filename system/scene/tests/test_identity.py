@@ -196,6 +196,25 @@ def test_apply_snapshot_keeps_objects_held_by_the_ground_gate():
     print("  [PASS] test_apply_snapshot_keeps_objects_held_by_the_ground_gate")
 
 
+def test_a_cloud_too_thin_to_box_keeps_its_record(monkeypatch):
+    """A small object's cloud can drop below the four points a box needs for a
+    tick; that is no sign it went, so its record stays listed."""
+    import types
+    import numpy as np
+    reg = ObjectRegistry()
+    det = _make_detector(reg)
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(det._apply_snapshot([_snap("u1", "sponge", (1.0, 0.0, 0.7))]))
+    det._map_objects = [{"id": "u1", "class_name": "sponge",
+                         "pcd": types.SimpleNamespace(points=np.full((3, 3), [1.0, 0.0, 0.7]))}]
+    det._asyncio_loop = loop
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe",
+                        lambda coro, _loop: _loop.run_until_complete(coro))
+    det._project_to_registry()
+    sponge = next(o for o in reg.all_objects() if o.label == "sponge")
+    assert sponge.missing is False
+
+
 def test_apply_snapshot_ttl_prune():
     """A soft-evicted object not re-detected within the TTL is hard-pruned."""
     reg = ObjectRegistry()

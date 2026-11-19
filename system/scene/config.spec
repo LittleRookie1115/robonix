@@ -352,6 +352,15 @@ properties:
             description: >-
               Point overlap a cross-class merge needs. Overridden by
               SCENE_CG_CROSS_CLASS_OVERLAP_THRESH.
+          cross_class_min_extent_m:
+            type: number
+            default: 0.4
+            x-group: Merge and identity
+            description: >-
+              A cross-class merge, in the geometric pass and in
+              merge_overlap, needs the longest box side of both objects to
+              be at least this many metres: the label flicker it corrects is
+              between furniture classes.
           cross_class_merge_interval_ticks:
             type: integer
             default: 10
@@ -458,6 +467,13 @@ properties:
             default: 1
             x-group: Point clouds
             description: Detections before an object is kept.
+          obj_keep_detections:
+            type: integer
+            default: 2
+            x-group: Point clouds
+            description: >-
+              An object detected this many times is kept below
+              obj_min_points. 0 drops every sparse cloud.
           floor_z_m:
             type: number
             default: 0.0
@@ -526,6 +542,27 @@ properties:
             description: >-
               The measured surface must be this far behind the object for a
               view to count as a miss.
+          visibility_min_in_view_fraction:
+            type: number
+            default: 0.9
+            x-group: Visibility
+            description: >-
+              Share of the object's projected points that must fall inside
+              the image for a view to judge it missing.
+          visibility_min_extent_px:
+            type: integer
+            default: 16
+            x-group: Visibility
+            description: >-
+              Pixels the object must span for a view to judge it missing;
+              smaller, it is too far for the detector to have seen it.
+          visibility_min_depth_m:
+            type: number
+            default: 0.7
+            x-group: Visibility
+            description: >-
+              Nearer than this a view judges nothing: a few centimetres of
+              pose error move the projection off the object.
           visibility_min_clear_samples:
             type: integer
             default: 3

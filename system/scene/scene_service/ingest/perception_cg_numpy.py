@@ -215,6 +215,21 @@ def merge_detections_to_objects(
     return objects
 
 
+def _extent(obj: dict) -> float:
+    """The largest side of the object's axis-aligned box, in metres."""
+    pts = np.asarray(obj["pcd"].points)
+    pts = pts[np.all(np.isfinite(pts), axis=1)] if pts.size else pts
+    return float(np.max(pts.max(axis=0) - pts.min(axis=0))) if len(pts) else 0.0
+
+
+def kept_apart(a: dict, b: dict, min_extent: float) -> bool:
+    """Whether a cross-class pair stays two objects: only furniture-sized
+    pairs fold, since label flicker is between furniture classes and an item
+    beside or inside a larger cloud is a second object."""
+    return (a.get("class_name") != b.get("class_name")
+            and min(_extent(a), _extent(b)) < min_extent)
+
+
 def merge_overlap_objects(
     merge_overlap_thresh: float,
     merge_visual_sim_thresh: float,
@@ -228,6 +243,7 @@ def merge_overlap_objects(
     spatial_sim_type: str,
     device: str = "",
     map_edges=None,
+    cross_class_min_extent: float = 0.0,
 ):
     x, y = overlap_matrix.nonzero()
     overlap_ratio = overlap_matrix[x, y]
@@ -250,6 +266,8 @@ def merge_overlap_objects(
             # Upstream keeps text_sim == visual_sim.
             text_sim = visual_sim
             if (visual_sim > merge_visual_sim_thresh) and (text_sim > merge_text_sim_thresh):
+                if kept_apart(objects[i], objects[j], cross_class_min_extent):
+                    continue
                 objects[j] = merge_obj2_into_obj1(
                     objects[j], objects[i],
                     downsample_voxel_size, dbscan_remove_noise,
@@ -299,10 +317,14 @@ def filter_objects(
     obj_min_detections: int,
     objects: MapObjectList,
     map_edges=None,
+    keep_detections: int = 0,
 ) -> MapObjectList:
+    # A few centimetres of object at 2.5 cm voxels never reach obj_min_points;
+    # detected keep_detections times it is no noise.
     return MapObjectList(
         obj for obj in objects
-        if len(obj["pcd"].points) >= obj_min_points
+        if (len(obj["pcd"].points) >= obj_min_points
+            or 0 < keep_detections <= obj["num_detections"])
         and obj["num_detections"] >= obj_min_detections
     )
 

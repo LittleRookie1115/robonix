@@ -265,3 +265,47 @@ def test_listed_classes_keep_people(monkeypatch):
     detector._classes = ["person"]
     detector._tick_locked()
     assert segmented == [1]
+
+
+def _cloud_object(points, cls, detections=1):
+    o3d = pytest.importorskip("open3d")
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(points)
+    cloud.colors = o3d.utility.Vector3dVector(np.full((len(points), 3), .5))
+    return {"pcd": cloud, "clip_ft": np.array([1., 0.], np.float32), "num_detections": detections,
+            "image_idx": [0], "class_name": cls}
+
+
+def _cleanup_detector(objects, **cfg):
+    from scene_service.ingest import perception_cg_numpy
+    from scene_service.ingest.perception_concept_graphs import _CFG_DEFAULTS, ConceptGraphsDetector
+    d = ConceptGraphsDetector.__new__(ConceptGraphsDetector)
+    d.cfg = {**_CFG_DEFAULTS, **cfg}
+    d._cg, d._device, d._cloud_fate, d._tick_idx = perception_cg_numpy, "", {}, 1
+    d._map_objects = perception_cg_numpy.MapObjectList(objects)
+    return d
+
+
+def _box(side, centre=(0, 0, 0)):
+    g = np.linspace(-side / 2, side / 2, 4)
+    return [np.add(centre, (x, y, z)) for x in g for y in g for z in g]
+
+
+@pytest.mark.parametrize("small, merged", [(0.1, False), (0.9, True)])
+def test_cross_class_collapse_folds_only_furniture(small, merged):
+    # An item on a table stays an item; a cabinet read as a shelf folds.
+    d = _cleanup_detector([_cloud_object(_box(1.0), "table" if small < .4 else "shelf"),
+                           _cloud_object(_box(small), "seaweed" if small < .4 else "cabinet")])
+    assert (len(d._cross_class_geometric_collapse(d._map_objects)) == 1) is merged
+
+
+@pytest.mark.parametrize("detections, kept", [(1, False), (2, True)])
+def test_a_sparse_object_seen_again_survives_cleanup(detections, kept):
+    corners = [(x, y, z) for x in (0, .03) for y in (0, .03) for z in (0, .03)]  # as stored: 8 voxels
+    big = 1_000_000
+    d = _cleanup_detector([_cloud_object(corners, "dishwasher tab", detections)], denoise_interval_ticks=1,
+                          merge_overlap_interval_ticks=big, cross_class_merge_interval_ticks=big,
+                          same_class_merge_interval_ticks=big)
+    d._maybe_periodic_cleanup()
+    assert (len(d._map_objects) == 1) is kept
+

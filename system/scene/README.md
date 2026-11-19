@@ -344,7 +344,7 @@ docker run --rm --entrypoint bash <image> -lc 'ls /opt/dualmap/config >/dev/null
 
 `perception.concept_graphs` and `perception.dualmap` are each a mapping passed
 to the backend that reads them. An unknown key in either fails the boot naming
-it, so what they accept is a closed set: 39 keys for `concept_graphs`, 19 for
+it, so what they accept is a closed set: 44 keys for `concept_graphs`, 19 for
 `dualmap`. `config.spec` documents every one of them, grouped by what it does;
 this section covers the group most deployments actually reach for.
 
@@ -366,6 +366,14 @@ overlap each other, so the distance gate never gets a say. For
 These are also `SCENE_CG_*` environment variables, which is the point: the
 detector exposes them so the split can be tuned on a running robot without a
 rebuild.
+
+**When an object nobody moved goes missing.** A small object's cloud at 2.5 cm voxels stays under `obj_min_points`; it is kept
+once detected `obj_keep_detections` times. A cross-class fold needs both objects
+at least `cross_class_min_extent_m` across, so an item is not folded into the
+table or the neighbour it touches. Visible absence judges only a full view of an
+object (`visibility_min_in_view_fraction`), at least `visibility_min_extent_px`
+across and `visibility_min_depth_m` away: in other views the pose error moves the
+stored cloud onto the surface beside the object.
 
 For `dualmap` the equivalent is `merge_sim_threshold` (0.9 upstream, which
 never fires under a robot's pose error) with `merge_every_keyframes`, and

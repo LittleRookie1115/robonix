@@ -77,3 +77,26 @@ def test_unmatched_detection_is_appended_without_copying():
         agg_sim=np.array([[-np.inf]], np.float32))
     assert result is objects
     assert result[-1] is detection
+
+
+def _cube(centre, side, cls):
+    import open3d as o3d
+    cloud = o3d.geometry.PointCloud()
+    grid = np.linspace(-side / 2, side / 2, 4)
+    cloud.points = o3d.utility.Vector3dVector(
+        [np.add(centre, (x, y, z)) for x in grid for y in grid for z in grid])
+    cloud.colors = o3d.utility.Vector3dVector(np.full((64, 3), .5))
+    return {"pcd": cloud, "clip_ft": np.array([1., 0.], np.float32), "num_detections": 1,
+            "image_idx": [0], "class_name": cls}
+
+
+@pytest.mark.parametrize("small, merged", [(0.1, False), (0.9, True)])
+def test_overlap_merge_folds_classes_only_between_furniture(small, merged):
+    # An item inside a table's cloud stays an item; a cabinet read as a shelf folds.
+    objects = cg.MapObjectList([_cube((0, 0, 0), small, "cornflakes" if small < .4 else "cabinet"),
+                                _cube((0, 0, 0), 1.0, "table" if small < .4 else "shelf")])
+    overlap = np.ones((2, 2), np.float32) - np.eye(2, dtype=np.float32)
+    out, _ = cg.merge_overlap_objects(.5, .5, 0., objects, overlap, .025, False, .02, 5,
+                                      "axis_aligned", cross_class_min_extent=.4)
+    assert (len(out) == 1) is merged
+
