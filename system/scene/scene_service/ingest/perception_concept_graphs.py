@@ -542,8 +542,10 @@ class ConceptGraphsDetector:
         self._inference_lock = threading.Lock()
         self._classes = _resolved_classes()
         self._tick_idx = 0
-        # Which cleanup took each cloud since the last snapshot, for the missing line.
+        # Which cleanup took each cloud since the last snapshot, for the missing line,
+        # and the cloud a merge folded it into.
         self._cloud_fate: dict[str, str] = {}
+        self._folded_into: dict[str, str] = {}
         # Named for the status page, alongside what one pass through the
         # pipeline costs: comparing two backends on accuracy alone leaves out
         # half of why one would be chosen over the other.
@@ -1396,13 +1398,15 @@ class ConceptGraphsDetector:
         if had_objects:
             export_from_env(self._map_objects, self._clip_model_name, self._clip_pretrained)
 
-    def _note_fates(self, before, why) -> None:
+    def _note_fates(self, before, why, into=None) -> None:
         """Record why() for each object of `before` no longer in the list, for
-        the registry's missing line."""
+        the registry's missing line, and into(), the cloud it was folded into."""
         live = {id(o) for o in self._map_objects}
         for o in before:
             if id(o) not in live:
                 self._cloud_fate[str(o.get("id", ""))] = why(o)
+                if into is not None and into(o):
+                    self._folded_into[str(o.get("id", ""))] = str(into(o))
 
     def _maybe_periodic_cleanup(self) -> bool:
         if self._map_objects is None or len(self._map_objects) == 0:
@@ -1460,7 +1464,7 @@ class ConceptGraphsDetector:
                     cross_class_min_extent=float(self.cfg["cross_class_min_extent_m"]),
                 )
                 before, self._map_objects = self._map_objects, merged_objs
-                self._note_fates(before, lambda o: "merge_overlap")
+                self._note_fates(before, lambda o: "merge_overlap", into=lambda o: o.get("folded_into"))
                 if len(self._map_objects) != pre:
                     log.info("[scene-cg] cleanup merge_overlap: %d → %d", pre, len(self._map_objects))
                 ran_any = True
@@ -1545,6 +1549,7 @@ class ConceptGraphsDetector:
                 keep[j] = False
                 self._cloud_fate[str(objects[j].get("id", ""))] = (
                     f"cross-class geom into {objects[i].get('class_name')}")
+                self._folded_into[str(objects[j].get("id", ""))] = str(objects[i].get("id", ""))
                 pts = np.asarray(objects[i]["pcd"].points)
                 pts = pts[np.all(np.isfinite(pts), axis=1)] if pts.size else pts
                 if pts.size:
@@ -1607,6 +1612,7 @@ class ConceptGraphsDetector:
                 keep[j] = False
                 self._cloud_fate[str(objects[j].get("id", ""))] = (
                     f"same-class proximity into {objects[i].get('class_name')}")
+                self._folded_into[str(objects[j].get("id", ""))] = str(objects[i].get("id", ""))
                 centroids[i] = _centroid(objects[i])
 
         out = self._cg.MapObjectList()
@@ -2014,11 +2020,13 @@ class ConceptGraphsDetector:
                     expected_world_frame=snapshot_frame,
                     seen_absent=frozenset(getattr(self, "_seen_absent", ())),
                     cloud_fate=self._cloud_fate,
+                    folded_into=self._folded_into,
                 ),
                 self._asyncio_loop,
             )
             self._seen_absent = set()
             self._cloud_fate = {}
+            self._folded_into = {}
         except Exception as e:  # noqa: BLE001
             log.debug("schedule registry update failed: %s", e)
 
@@ -2027,12 +2035,14 @@ class ConceptGraphsDetector:
         expected_world_frame: Optional[str] = None,
         seen_absent: frozenset = frozenset(),
         cloud_fate: Optional[dict[str, str]] = None,
+        folded_into: Optional[dict[str, str]] = None,
     ) -> None:
         """Reconcile concept-graphs MapObjectList state into the registry
         **incrementally**. ``held`` are uuids the backend gated out before the
         snapshot; like a rejected snapshot they stay live. ``seen_absent`` are
         uuids visible absence removed since the last snapshot, ``cloud_fate``
-        which cleanup took the others' clouds."""
+        which cleanup took the others' clouds and ``folded_into`` the cloud a
+        merge folded each into."""
         now = time.time()
         # A rejected snapshot below is not evidence that its object is gone:
         # visible absence decides that. Its uuid stays live, so a registered
@@ -2149,6 +2159,14 @@ class ConceptGraphsDetector:
 
             # Evict registry records whose source uuid is gone.
             doomed, twins = [], []
+            # Where each folded cloud ended up, through folds of folds.
+            landed = {}
+            for uuid_ in folded_into or {}:
+                into, seen_ = uuid_, set()
+                while into in folded_into and into not in seen_:
+                    seen_.add(into)
+                    into = folded_into[into]
+                landed[uuid_] = into
             gate = merge_gate_from_env()
             for oid, obj in list(self._registry._objects.items()):
                 if oid in adopted_oids:
@@ -2176,10 +2194,21 @@ class ConceptGraphsDetector:
                     # duplicate means the object is there: the record takes its
                     # place now rather than going missing until the duplicate
                     # collapse folds them, under whichever id that ranks first.
-                    twin = None if obj.missing or cg_uuid in seen_absent else next((
-                        other for other in self._registry._objects.values()
-                        if other.object_id in adopted_oids and other is not obj
-                        and self._registry._same_thing(obj, other, *gate)), None)
+                    # A merge names the cloud it folded this one into, whatever
+                    # its class or distance: label flicker between furniture
+                    # classes folds one piece of furniture under two labels.
+                    absorber = self._registry._objects.get(
+                        self._uuid_to_oid.get(landed.get(cg_uuid), ""))
+                    if obj.missing or cg_uuid in seen_absent:
+                        twin = None
+                    elif (absorber is not None and absorber is not obj
+                          and absorber.object_id in adopted_oids):
+                        twin = absorber
+                    else:
+                        twin = next((
+                            other for other in self._registry._objects.values()
+                            if other.object_id in adopted_oids and other is not obj
+                            and self._registry._same_thing(obj, other, *gate)), None)
                     if twin is not None:
                         twins.append((obj, twin))
                     else:
@@ -2192,8 +2221,13 @@ class ConceptGraphsDetector:
                     if cg_uuid is not None:
                         self._uuid_to_oid.pop(cg_uuid, None)
             for obj, twin in twins:
-                if twin.object_id not in self._registry._objects:
+                # Two records may have folded into one that an earlier pair retired.
+                live_id = self._registry.resolve_id(twin.object_id)[0]
+                twin = self._registry._objects.get(live_id) if live_id else None
+                if twin is None:
                     doomed.append(obj)
+                    continue
+                if twin is obj:
                     continue
                 # The id with more evidence stays, as in the duplicate
                 # collapse, with the live record's cloud and pose.

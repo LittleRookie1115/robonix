@@ -372,7 +372,9 @@ names what took the record: `seen absent`, or the cleanup that took its cloud.
 A small object's cloud at 2.5 cm voxels stays under `obj_min_points`; it is kept
 once detected `obj_keep_detections` times. A cross-class fold needs both objects
 at least `cross_class_min_extent_m` across, so an item is not folded into the
-table or the neighbour it touches. Visible absence judges only a full view of an
+table or the neighbour it touches. A record whose cloud a merge folded into
+another object's, of any class, is merged with that object's record, and the one
+with more observations keeps its id and label. Visible absence judges only a full view of an
 object (`visibility_min_in_view_fraction`), at least `visibility_min_extent_px`
 across and `visibility_min_depth_m` away: in other views the pose error moves the
 stored cloud onto the surface beside the object.

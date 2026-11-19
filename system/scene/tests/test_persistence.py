@@ -252,6 +252,43 @@ def test_a_record_whose_cloud_merged_into_a_duplicate_takes_its_place():
     print("  [PASS] test_a_record_whose_cloud_merged_into_a_duplicate_takes_its_place")
 
 
+def test_a_record_whose_cloud_a_merge_folded_under_another_class_takes_its_place():
+    """Label flicker between furniture classes folds a shelf's cloud into a
+    cabinet's: the merge says so, and the record with more evidence stays
+    listed under the live cloud, whatever the other's class or distance."""
+    import asyncio
+    try:
+        from scene_service.ingest.perception_concept_graphs import ConceptGraphsDetector  # noqa: F401
+    except Exception as e:
+        print(f"  [SKIP] test_a_record_whose_cloud_a_merge_folded_under_another_class_takes_its_place ({e})")
+        return
+    reg = ObjectRegistry()
+    p = _make_detector(reg)
+    for _ in range(3):
+        asyncio.run(p._apply_snapshot([_snap("u-s", "shelf", 1.0, 1.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-s", "shelf", 1.0, 1.0), _snap("u-c", "cabinet", 1.8, 1.0)]))
+    shelf, cabinet = sorted(o.object_id for o in reg.all_objects())
+    asyncio.run(p._apply_snapshot([_snap("u-c", "cabinet", 1.8, 1.0)], folded_into={"u-s": "u-c"}))
+    kept = reg.get_object(shelf)
+    assert [o.object_id for o in reg.all_objects()] == [shelf]
+    assert kept.label == "shelf" and not kept.missing and kept.attributes["cg_uuid"] == "u-c"
+    assert reg.resolve_id(cabinet)[0] == shelf
+    # Two records folded into one, which the first pair retires: the second
+    # follows it to the record that took its place.
+    reg = ObjectRegistry()
+    p = _make_detector(reg)
+    for _ in range(3):
+        asyncio.run(p._apply_snapshot([_snap("u-s", "shelf", 1.0, 1.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-s", "shelf", 1.0, 1.0), _snap("u-b", "cupboard", 1.0, 2.0)]))
+    asyncio.run(p._apply_snapshot([_snap("u-s", "shelf", 1.0, 1.0), _snap("u-b", "cupboard", 1.0, 2.0),
+                                   _snap("u-c", "cabinet", 1.8, 1.0)]))
+    shelf, cupboard, cabinet = sorted(o.object_id for o in reg.all_objects())
+    asyncio.run(p._apply_snapshot([_snap("u-c", "cabinet", 1.8, 1.0)],
+                                  folded_into={"u-s": "u-c", "u-b": "u-c"}))
+    assert [o.object_id for o in reg.all_objects()] == [shelf]
+    assert reg.resolve_id(cupboard)[0] == shelf and reg.resolve_id(cabinet)[0] == shelf
+
+
 def test_object_store_roundtrip():
     """persist → fresh ObjectStore → load_all preserves scalar state."""
     try:

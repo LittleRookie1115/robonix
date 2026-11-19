@@ -57,15 +57,22 @@ def test_overlap_merge_counts_each_source_once():
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(
             [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        objects.append({"pcd": cloud, "clip_ft": np.array([1., 0.], np.float32),
+        objects.append({"id": f"u{i}", "pcd": cloud, "clip_ft": np.array([1., 0.], np.float32),
                         "num_detections": 1, "image_idx": [i]})
     overlap = np.ones((3, 3), np.float32) - np.eye(3, dtype=np.float32)
+    folded = list(objects)
     merged, indices = cg.merge_overlap_objects(
         .5, .5, 0., objects, overlap, .025, False, .02, 5, "axis_aligned")
     assert len(merged) == 1
     assert merged[0]["num_detections"] == 3
     assert sorted(merged[0]["image_idx"]) == [0, 1, 2]
     assert sorted(i for i in indices if i is not None) == [0]
+    # Each folded cloud names the one it went into, which leads to the survivor.
+    into = {o["id"]: o.get("folded_into") for o in folded}
+    for uuid in into:
+        while into.get(uuid):
+            uuid = into[uuid]
+        assert uuid == merged[0]["id"]
 
 
 def test_unmatched_detection_is_appended_without_copying():
