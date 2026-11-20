@@ -334,6 +334,7 @@ fn observe(
     opening: &mut Option<crate::opening::Opening>,
     watches: &mut Vec<Watch>,
     event: &TreeInterrupt,
+    read_set: bool,
 ) {
     match event {
         TreeInterrupt::NodeState {
@@ -347,7 +348,15 @@ fn observe(
                 .for_each(|watch| watch.progressed(node_state));
         }
         TreeInterrupt::Completion { plan_id, .. } => {
-            watches.retain(|watch| &watch.plan_id != plan_id)
+            // A tree the read set stopped had its watch ended then; one it
+            // could not stop, or with the read set only logging, says nothing
+            // of how often it stops trees.
+            if let Some(index) = watches.iter().position(|watch| &watch.plan_id == plan_id)
+                && watches.remove(index).guarded()
+                && read_set
+            {
+                speculation::watched(false);
+            }
         }
     }
     if let Some(open) = opening.take() {
@@ -801,7 +810,7 @@ async fn cancel_forest_plans(executor: &mut ExecutorConn, forest: &HashMap<Strin
 /// Read Scene's list once and check each watched tree against it. A tree whose
 /// read set has changed is stopped, as a cancellation Pilot asked for, with a
 /// note to the planner saying why; with `read_set` off it is only logged. Either
-/// way its watch ends.
+/// way its watch ends. Returns the trees stopped, each with what changed.
 async fn check_watches(
     watches: &mut Vec<Watch>,
     scene: &state_context::SceneProviders,
@@ -809,9 +818,10 @@ async fn check_watches(
     executor: &mut ExecutorConn,
     forest: &mut SessionForest,
     history: &mut Vec<Message>,
-) {
+) -> Vec<(String, Vec<String>)> {
+    let mut stopped = Vec::new();
     let Some(listed) = state_context::listed(executor, &scene.find).await else {
-        return;
+        return stopped;
     };
     let mut clear = HashMap::new();
     if let Some(provider) = &scene.goal_clear {
@@ -852,7 +862,10 @@ async fn check_watches(
         cancel_plan(executor, &plan_id, "after its read set changed").await;
         forest.kill_pending.insert(plan_id.clone());
         history.push(note);
+        speculation::watched(true);
+        stopped.push((plan_id, gone));
     }
+    stopped
 }
 
 /// Log that tree `plan_id` relies on what is `gone`, with steps `left` to
@@ -1759,7 +1772,13 @@ pub async fn run_turn(
 
     'supervisor: loop {
         while let Ok(event) = forest.interrupt_rx.try_recv() {
-            observe(&mut speculation, &mut opening, &mut watches, &event);
+            observe(
+                &mut speculation,
+                &mut opening,
+                &mut watches,
+                &event,
+                read_set,
+            );
             should_plan |=
                 handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
         }
@@ -1825,13 +1844,16 @@ pub async fn run_turn(
                 ev = forest.interrupt_rx.recv() => {
                     // The session holds a sender, so the channel never closes.
                     if let Some(event) = ev {
-                        observe(&mut speculation, &mut opening, &mut watches, &event);
+                        observe(&mut speculation, &mut opening, &mut watches, &event, read_set);
                         should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                 }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
                     if let Some(scene) = &scene_providers {
-                        check_watches(&mut watches, scene, read_set, executor, forest, history).await;
+                        let stopped = check_watches(&mut watches, scene, read_set, executor, forest, history).await;
+                        for (plan_id, changed) in stopped {
+                            speculation.iter_mut().for_each(|spec| spec.stopped(&plan_id, changed.clone()));
+                        }
                     }
                 }
             }
@@ -1865,7 +1887,7 @@ pub async fn run_turn(
                         break;
                     }
                     Some(event) = forest.interrupt_rx.recv() => {
-                        observe(&mut speculation, &mut opening, &mut watches, &event);
+                        observe(&mut speculation, &mut opening, &mut watches, &event, read_set);
                         handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                     _ = &mut settle => break,
@@ -2082,7 +2104,12 @@ pub async fn run_turn(
         let mut cut_note = None;
         let mut request: Option<BoxFuture<Result<BoxStream<Result<VlmStreamItem>>>>> = None;
         if let Some((spec, settled)) = pending {
-            turn_steps.extend_from_slice(spec.report());
+            // Pilot's note of a stop is for this round's choice, not later ones.
+            let report = spec
+                .report()
+                .iter()
+                .filter(|step| step.get("stopped_by").is_none());
+            turn_steps.extend(report.cloned());
             let branch = if compacted {
                 Err("history compacted")
             } else if !(catalog_update.is_empty()
@@ -2190,6 +2217,8 @@ pub async fn run_turn(
         // With the read set off a change is only logged, once per reply rather
         // than at each step sent after it.
         let mut stale_at_dispatch = false;
+        // When the tree's first step went to Executor, which its replies prepared ahead are timed from.
+        let mut dispatched: Option<std::time::Instant> = None;
         let idle = tokio::time::sleep(vlm_idle_timeout());
         tokio::pin!(idle);
 
@@ -2260,6 +2289,9 @@ pub async fn run_turn(
                                 revision: &forest.revision, expected_revision: planning_revision,
                             }).await;
                             if let Some(open) = opening.take() { opening = open.follow(&live.plan); }
+                            if !live.plan.nodes.is_empty() {
+                                dispatched.get_or_insert_with(std::time::Instant::now);
+                            }
                             if streamed_task.is_none() && !live.plan.nodes.is_empty() {
                                 let mut fields = parser.task_fields.clone();
                                 fields.updates.clear();
@@ -2624,6 +2656,7 @@ pub async fn run_turn(
                         reader,
                         state["objects"].clone(),
                         adopted,
+                        dispatched,
                     )
                 }
             };

@@ -76,6 +76,13 @@ static SLOTS: Semaphore = Semaphore::const_new(MAX_BRANCHES);
 /// when the tree before it is expected too short to hide its reply's writing.
 const LOOKAHEAD: u64 = 3;
 
+/// How much sooner than its write time before it is due a reply prepared ahead
+/// is started, for the error of the run-time estimates it is due by.
+const MARGIN_SLACK: Duration = Duration::from_secs(2);
+
+/// Recent write times the margin scheduler's estimate is taken from.
+const WRITES_KEPT: usize = 32;
+
 /// Least estimated failure rate of a step's capability for that failure to be
 /// prepared for. A branch costs a request and a slot whether it is used or not,
 /// so below one use in ten it mostly delays the requests prepared ahead.
@@ -113,9 +120,40 @@ struct Timings {
     first_text: Option<Duration>,
     /// About how long a prepared reply takes to write in full.
     reply: Option<Duration>,
+    /// How long recent prepared replies took from their request to their last
+    /// word, waiting for a request slot included.
+    writes: std::collections::VecDeque<Duration>,
 }
 
 impl Timings {
+    /// How long a prepared reply takes to write: with margin scheduling the
+    /// 90th percentile of recent requests, waiting for a slot included, since a
+    /// reply that comes too late is no use; otherwise the smoothed time once a
+    /// slot is held.
+    fn write_time(&self, margin: bool) -> Option<Duration> {
+        if margin && self.writes.len() >= 3 {
+            let mut seen: Vec<Duration> = self.writes.iter().copied().collect();
+            seen.sort();
+            return seen.get((seen.len() * 9).div_ceil(10) - 1).copied();
+        }
+        self.reply
+    }
+
+    /// Keep `took`, how long a prepared reply took to write, or at least took.
+    fn wrote(&mut self, took: Duration) {
+        if self.writes.len() == WRITES_KEPT {
+            self.writes.pop_front();
+        }
+        self.writes.push_back(took);
+    }
+
+    /// `run`, what a tree's steps are expected to take, scaled by the share of
+    /// it recent trees ran.
+    fn calibrated(&self, run: Option<Duration>) -> Option<Duration> {
+        let share = self.experience.run_share().unwrap_or(1.0);
+        run.map(|run| run.mul_f64(share))
+    }
+
     /// How long `steps`, each a capability and its arguments, are expected to
     /// run from `from`, and where they leave the robot: from experience, or
     /// without it from each capability's longest call this process, which knows
@@ -176,9 +214,20 @@ pub(crate) fn took(call: &CapabilityCall, time: Duration, output: &str) {
 
 /// Record that this call ended, and whether it failed, and keep the experience.
 pub(crate) fn finished(call: &CapabilityCall, failed: bool) {
+    keep(|experience| experience.finished(&called(call), failed));
+}
+
+/// Record that the read set watched a tree to its end, and whether it stopped
+/// it, and keep the experience.
+pub(crate) fn watched(stopped: bool) {
+    keep(|experience| experience.watched(stopped));
+}
+
+/// Add to the experience with `add` and save it.
+fn keep(add: impl FnOnce(&mut Experience)) {
     let saved = {
         let mut timings = timings();
-        timings.experience.finished(&called(call), failed);
+        add(&mut timings.experience);
         timings.experience.saved()
     };
     let path = experience_path();
@@ -202,6 +251,29 @@ pub(crate) fn located(scene: &Value) {
     {
         timings().experience.locate((x, y));
     }
+}
+
+/// What a stop of a tree could be about: the objects of `objects`, Scene's by
+/// region, that its steps' arguments `args` name by id or class, and the goals
+/// its navigations, by op_id, head for.
+fn relied_on<'a>(
+    args: &str,
+    navigations: impl Iterator<Item = &'a str>,
+    objects: &Value,
+) -> Vec<String> {
+    let regions = objects.as_object().into_iter().flatten();
+    let mut relied: Vec<String> = regions
+        .flat_map(|(region, listed)| {
+            let listed = listed.as_array().into_iter().flatten();
+            listed.filter_map(move |object| {
+                let (id, label) = (object["id"].as_str()?, object["label"].as_str()?);
+                (names(args, id) || names(args, label))
+                    .then(|| format!("{id} ({label} in {region})"))
+            })
+        })
+        .collect();
+    relied.extend(navigations.map(|op_id| format!("the goal step op_id={op_id} navigates to")));
+    relied
 }
 
 /// A plan's calls as capability and arguments, in node order.
@@ -260,6 +332,13 @@ const NAMED_PLACES: &str = "Take the command to be right about where its people 
      where it names a room or a piece of furniture for one of them, a reply looks for that person \
      or object only there, from another viewpoint if a look found nothing, and never acts on a \
      person or object elsewhere in its place. ";
+
+/// What margin scheduling adds to a prepared-reply request: a reply is of use
+/// only if it is written before its tree ends, its write time grows with its
+/// length, and only its first situation is prepared beyond.
+const BRIEF: &str = "Put the likeliest situation first. Write each RTDL node's description in a \
+                     few words and each reply's `content` in one sentence, since Pilot uses a \
+                     prepared reply only if it is written before the plan ends. ";
 
 const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene's object list \
      may show although these steps' outputs do not name it, for example because a search by a \
@@ -350,6 +429,9 @@ pub(crate) enum Outcome {
     Succeeded,
     /// The step with this op_id failed after every earlier step succeeded.
     Failed(String),
+    /// Pilot stopped the tree because what it was written from changed: an
+    /// object or person it relies on is gone, or a goal is no longer clear.
+    Stopped,
 }
 
 impl Outcome {
@@ -357,6 +439,7 @@ impl Outcome {
         match self {
             Self::Succeeded => "succeeded".into(),
             Self::Failed(op_id) => format!("failed:{op_id}"),
+            Self::Stopped => "stopped".into(),
         }
     }
 }
@@ -406,6 +489,8 @@ struct Ahead {
     branches: Vec<Branch>,
     /// When the requests were sent.
     started: Instant,
+    /// Wakes the requests waiting until they are due, once the tree is dispatched.
+    go: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for Branch {
@@ -501,6 +586,15 @@ pub(crate) struct Speculation {
     /// Whether a reply naming an object that has since moved is cut or
     /// dropped, rather than only logged; the task's `read_set`, on by default.
     read_set: bool,
+    /// What changed, as Pilot told the planner, once the read set stopped the tree.
+    stop: Option<Vec<String>>,
+    /// For a speculation prepared ahead, what wakes its requests that wait
+    /// until they are due once its tree is dispatched.
+    go: Option<tokio::sync::watch::Sender<bool>>,
+    /// What the tree's steps were expected to take, with margin scheduling.
+    expected: Option<Duration>,
+    /// When the tree was dispatched.
+    dispatched: Instant,
 }
 
 /// The `do` steps of a tree whose failure fixes what else ran, as node index and
@@ -579,13 +673,21 @@ impl Speculation {
         reader: Reader,
         objects: Value,
         ahead: Option<Self>,
+        dispatched: Option<Instant>,
     ) -> Option<Self> {
+        // A streamed tree's first step went out before its reply ended.
+        let dispatched = dispatched.unwrap_or_else(Instant::now);
         let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let experienced = context["experience"].as_bool().unwrap_or(true);
+        let margin = context["margin"].as_bool().unwrap_or(true);
         // Long unless it is known to end before one reply could be written.
         let long;
         // Where the robot will be once the tree ends, as far as is known.
         let end;
+        // When the tree is expected to end, which replies prepared ahead are due by.
+        let due;
+        // What the tree's steps are expected to take, for how long trees run.
+        let expected;
         {
             let timings = timings();
             // A loop runs its body any number of times, so its calls' times bound nothing.
@@ -597,11 +699,12 @@ impl Speculation {
             let run;
             (run, end) = timings.expected(&plan_steps(plan), from, experienced);
             let run = run.filter(|_| !looped);
-            long = run
-                .zip(timings.reply)
-                .is_none_or(|(run, reply)| run >= reply);
+            let write = timings.write_time(margin);
+            long = run.zip(write).is_none_or(|(run, reply)| run >= reply);
+            expected = run.filter(|_| margin);
+            due = timings.calibrated(expected).map(|run| dispatched + run);
             if let Some(run) = run
-                && let (Some(first_text), Some(reply)) = (timings.first_text, timings.reply)
+                && let (Some(first_text), Some(reply)) = (timings.first_text, write)
                 && run + first_text < reply
             {
                 info!(
@@ -614,33 +717,57 @@ impl Speculation {
                         "reply_ms": reply.as_millis() as u64,
                     })
                 );
-                return ahead;
+                return ahead.map(|ahead| Self {
+                    expected,
+                    dispatched,
+                    ..ahead
+                });
             }
         }
         let steps = steps_in_order(plan);
-        let failures = failures_to_prepare(
-            &timings(),
-            plan,
-            &steps,
-            context["branch_budget"].as_bool().unwrap_or(true),
-        );
-        let prepared = |outcome: &Outcome| {
-            let ahead = ahead.iter().flat_map(|ahead| &ahead.branches);
-            ahead.into_iter().any(|branch| &branch.outcome == outcome)
-        };
-        let failed = failures
-            .iter()
-            .map(|(op_id, _)| Outcome::Failed(op_id.clone()));
-        let outcomes: Vec<Outcome> = std::iter::once(Outcome::Succeeded)
-            .chain(failed)
-            .filter(|outcome| !prepared(outcome))
-            .collect();
-        // Only a decision model reading the real results can choose between situations.
-        let situations = DECISION_MODEL.is_some();
+        let budget = context["branch_budget"].as_bool().unwrap_or(true);
+        let failures = failures_to_prepare(&timings(), plan, &steps, budget);
         let listed = context["read_only"].as_array();
         let contracts = listed.into_iter().flatten().filter_map(Value::as_str);
         let reads: Arc<HashSet<String>> =
             Arc::new(contracts.map(crate::discovery::llm_name).collect());
+        let read_set = context["read_set"].as_bool().unwrap_or(true);
+        let mut endings: Vec<(Outcome, f64)> = failures
+            .iter()
+            .map(|(op_id, rate)| (Outcome::Failed(op_id.clone()), *rate))
+            .collect();
+        // A stop is prepared for as a failure is, by how often the read set has
+        // stopped a tree it watched; only a tree with a step beyond reads is watched.
+        let acts = calls(plan)
+            .any(|(_, call)| !reads.contains(&crate::discovery::llm_name(&call.contract_id)));
+        let stop_rate = timings().experience.stop_rate();
+        let stops = read_set
+            && context["stop_replies"].as_bool().unwrap_or(true)
+            && (!budget || stop_rate >= MIN_FAILURE_RATE);
+        if stops && acts {
+            endings.push((Outcome::Stopped, stop_rate));
+            if budget {
+                endings.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+            endings.truncate(MAX_BRANCHES - 1);
+        }
+        let prepared = |outcome: &Outcome| {
+            let ahead = ahead.iter().flat_map(|ahead| &ahead.branches);
+            ahead.into_iter().any(|branch| &branch.outcome == outcome)
+        };
+        let failure_rates: HashMap<String, f64> = endings
+            .iter()
+            .filter_map(|(outcome, rate)| match outcome {
+                Outcome::Failed(op_id) => Some((op_id.clone(), *rate)),
+                _ => None,
+            })
+            .collect();
+        let outcomes: Vec<Outcome> = std::iter::once(Outcome::Succeeded)
+            .chain(endings.into_iter().map(|(outcome, _)| outcome))
+            .filter(|outcome| !prepared(outcome))
+            .collect();
+        // Only a decision model reading the real results can choose between situations.
+        let situations = DECISION_MODEL.is_some();
         let effort = context["prepared_effort"]
             .as_str()
             .unwrap_or(PREPARED_EFFORT);
@@ -656,6 +783,8 @@ impl Speculation {
             reads: reads.clone(),
             reader,
             experienced,
+            margin,
+            stops,
             objects: Arc::new(objects),
         });
         let tau =
@@ -673,13 +802,29 @@ impl Speculation {
             .filter(|node| node.node_kind == RTDL_DO)
             .map(|node| format!("\n- op_id={}: {}", node.op_id, node.description))
             .collect();
+        // A stop's request names what the tree relies on, so that its situations
+        // can name what changed as Pilot's note will.
+        let args: String = calls(plan)
+            .map(|(_, call)| call.args_json.as_str())
+            .collect();
+        let navigations = calls(plan)
+            .filter(|(_, call)| call.contract_id.ends_with("/navigate"))
+            .map(|(node, _)| node.op_id.as_str());
+        let relied = format!(
+            "{listed}\nIt relies on: {}.",
+            relied_on(&args, navigations, &request.objects).join("; ")
+        );
         let started = Instant::now();
         let mut branches = outcomes
             .into_iter()
             .map(|outcome| {
                 let mut messages = prefix.clone();
+                let steps = match outcome {
+                    Outcome::Stopped => &relied,
+                    _ => &listed,
+                };
                 messages.push(Message::user(&hypothesis(
-                    &tree, &listed, &outcome, situations, false, long,
+                    &tree, steps, &outcome, situations, false, long, margin,
                 )));
                 // Failures are rare, so only the success path is prepared further along.
                 let ahead = if outcome == Outcome::Succeeded {
@@ -693,6 +838,8 @@ impl Speculation {
                     outcome.label(),
                     ahead,
                     end,
+                    None,
+                    due,
                 ));
                 Branch {
                     outcome,
@@ -715,7 +862,7 @@ impl Speculation {
                 "plan_id": plan.plan_id,
                 "branches": branches.iter().map(|b| b.outcome.label()).collect::<Vec<_>>(),
                 "prepared_ahead": held.iter().map(|b| b.outcome.label()).collect::<Vec<_>>(),
-                "failure_rates": failures.iter().cloned().collect::<HashMap<_, _>>(),
+                "failure_rates": failure_rates,
                 "decision_model": DECISION_MODEL.as_ref().map(|m| &m.model),
                 "tau_choice": tau_choice,
                 "tau_success": tau_success,
@@ -741,7 +888,11 @@ impl Speculation {
             ahead: Vec::new(),
             renames,
             reads,
-            read_set: context["read_set"].as_bool().unwrap_or(true),
+            read_set,
+            stop: None,
+            go: None,
+            expected,
+            dispatched,
         })
     }
 
@@ -766,6 +917,10 @@ impl Speculation {
             self.discard("user message arrived");
             return None;
         }
+        if let Some(go) = &self.go {
+            go.send_replace(true);
+        }
+        self.dispatched = Instant::now();
         let made_up = self.ahead.drain(..).map(|(op_id, _)| op_id);
         self.renames
             .extend(made_up.zip(met.into_iter().map(|(op_id, _)| op_id)));
@@ -874,8 +1029,16 @@ impl Speculation {
                 .find(|r| r.node_index == index)
                 .map(|r| r.state)
         };
+        // A stop counts only for a cancellation; one whose cancel lost the race
+        // to the tree's end is dropped with it.
+        let stop = self.stop.take();
         let outcome = if canceled {
-            None
+            // The decision model picks the situation by what Pilot found changed.
+            stop.map(|changed| {
+                self.report
+                    .push(json!({"stopped_by": "Pilot", "changed": changed}));
+                Outcome::Stopped
+            })
         } else if !any_failed {
             Some(Outcome::Succeeded)
         } else {
@@ -886,7 +1049,21 @@ impl Speculation {
                 .filter(|(index, _)| state(*index).is_some_and(failed))
                 .map(|(_, op_id)| Outcome::Failed(op_id.clone()))
         };
+        if outcome == Some(Outcome::Succeeded)
+            && let Some(expected) = self.expected.filter(|expected| !expected.is_zero())
+        {
+            let share = self.dispatched.elapsed().as_secs_f64() / expected.as_secs_f64();
+            keep(|experience| experience.ran(share));
+        }
         self.ended = Some(outcome);
+    }
+
+    /// The read set stopped the tree `plan_id` because of what `changed` says,
+    /// which the cancellation's completion will report as [`Outcome::Stopped`].
+    pub(crate) fn stopped(&mut self, plan_id: &str, changed: Vec<String>) {
+        if plan_id == self.plan_id {
+            self.stop = Some(changed);
+        }
     }
 
     /// Take the branch written for the outcome the tree actually had.
@@ -921,8 +1098,10 @@ impl Speculation {
         let mut written = self.take_branch()?;
         let (outcome, objects) = (written.outcome.clone(), written.objects.clone());
         let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
+        // A stop's situations, like a success's, are matched to text that names
+        // what happened: Pilot's note of what changed.
         let tau = match outcome {
-            Outcome::Succeeded => self.tau_success,
+            Outcome::Succeeded | Outcome::Stopped => self.tau_success,
             Outcome::Failed(_) => self.tau_choice,
         };
         let tau_done = self.tau_done;
@@ -1136,6 +1315,11 @@ impl Speculation {
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
     pub(crate) fn discard(self, reason: &str) {
+        // A reply the round's own request beat took at least this long, which
+        // the write-time estimate would miss if it counted finished replies only.
+        if reason == "request answered first" {
+            timings().wrote(self.started.elapsed());
+        }
         info!(
             "[pilot/segue] {}",
             json!({
@@ -1172,6 +1356,9 @@ impl Speculation {
             report: Vec::new(),
             started: ahead.started,
             ahead: ahead.steps,
+            go: Some(ahead.go),
+            expected: None,
+            stop: None,
             ..self
         })
     }
@@ -1197,11 +1384,17 @@ async fn situation(
     reads: &HashSet<String>,
 ) -> Result<(String, usize, bool), String> {
     let mut reply: Value = serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
+    let keys: Vec<String> = reply
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, _)| k.clone())
+        .collect();
     let situations = reply
         .get_mut("situations")
         .and_then(Value::as_array_mut)
         .filter(|situations| !situations.is_empty())
-        .ok_or("situations: none given")?;
+        .ok_or_else(|| format!("situations: none given (keys {})", keys.join(", ")))?;
     if let [only] = situations.as_mut_slice()
         && only["when"]
             .as_str()
@@ -1611,6 +1804,7 @@ fn hypothesis(
     situations: bool,
     returned: bool,
     long: bool,
+    brief: bool,
 ) -> String {
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
@@ -1618,6 +1812,13 @@ fn hypothesis(
             "ended because step op_id={op_id} failed (its error is not known yet); every step \
              that ran before it succeeded, and nothing after it ran"
         ),
+        Outcome::Stopped => "been stopped by Pilot before it finished, because something it \
+            relies on changed since it was written: Pilot reads Scene each second while a plan \
+            runs and stops it once, on two readings, an object or person it relies on is no \
+            longer among Scene's objects or a goal it navigates to is no longer clear on the \
+            map and Navigation's costmap. Pilot's note will say which, and which steps finished \
+            first"
+            .to_string(),
     };
     let assume_nothing = "Do not assume any output value, and do not state one in `content`.";
     let beyond_listed = "Beyond the outputs listed, do not assume any output value, and do not \
@@ -1643,6 +1844,17 @@ fn hypothesis(
              situation, and `reply` is the complete reply you would give once that failure is \
              reported. If the next move is the same whatever the error shows, give one situation \
              with `when` empty.",
+            assume_nothing,
+        ),
+        Outcome::Stopped => (
+            "Name one to three situations, one per change to what it relies on, listed above, \
+             that calls for a different next move (for example, the object it acts on is gone, or its navigation goal is \
+             blocked). Answer {\"situations\": [{\"when\": ..., \"reply\": ...}]}: `when` \
+             names that change as Pilot's note would, and `reply` is the complete reply you \
+             would give once that stop is reported, planned from the state without that object \
+             or goal: look for a gone object again where the command places it, or report that \
+             it is not there; reach the place of a blocked goal another way. The decision model \
+             picks the situation from Pilot's note, so do not answer NEEDS_RESULTS.",
             assume_nothing,
         ),
         Outcome::Succeeded if long => (
@@ -1687,14 +1899,29 @@ fn hypothesis(
     };
     let choose = if situations { CHOOSE_IN_REPLY } else { "" };
     let places = NAMED_PLACES;
+    let needs = match outcome {
+        Outcome::Stopped => String::new(),
+        _ => format!(
+            "If that cannot express what the next step needs, reply with `content` exactly \
+             \"{NEEDS_RESULTS}\" and an empty sequence. "
+        ),
+    };
+    // Fewer situations make a shorter reply, but never none. A stop keeps up to
+    // three, one per kind of change it may be.
+    let ask = match brief && *outcome != Outcome::Stopped {
+        true => ask
+            .replace("one to three situations", "one or two situations")
+            .replace("two or three situations", "two situations"),
+        false => ask.to_string(),
+    };
+    let brief = if brief { BRIEF } else { "" };
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
-         {known} {ask} {assume} Where the next step depends on an output of these \
+         {known} {ask} {assume} {brief}Where the next step depends on an output of these \
          steps, refer to it as {{\"var\": \"<op_id>\", \"path\": [\"<field>\"]}} and decide \
-         with `if`. {places}{choose}If that cannot express what the next step needs, reply with `content` \
-         exactly \"{NEEDS_RESULTS}\" and an empty sequence. Pilot uses a reply only if the real \
-         outcome matches its assumption."
+         with `if`. {places}{choose}{needs}Pilot uses a reply only if the real outcome matches its \
+         assumption."
     )
 }
 
@@ -1714,8 +1941,28 @@ struct Request {
     reader: Reader,
     /// Whether trees are timed from experience, the task's `experience`.
     experienced: bool,
+    /// Whether requests prepared ahead start only once due, by the time their
+    /// reply is needed, the task's `margin`.
+    margin: bool,
+    /// Whether a read-set stop is prepared for, as [`Speculation::start`]
+    /// decides for the tree it starts from.
+    stops: bool,
     /// The objects Scene knew, by region, in the state the requests are sent with.
     objects: Arc<Value>,
+}
+
+/// When a request prepared ahead is due to start, and what wakes it sooner:
+/// the tree before it being dispatched.
+type Wait = (Instant, tokio::sync::watch::Receiver<bool>);
+
+/// Return once `wait` is due or woken.
+async fn until_due((at, mut go): Wait) {
+    while !*go.borrow() {
+        tokio::select! {
+            _ = tokio::time::sleep_until(at.into()) => break,
+            changed = go.changed() => if changed.is_err() { break },
+        }
+    }
 }
 
 /// Whether a reply's tree calls something and only capabilities in `reads`.
@@ -1823,17 +2070,23 @@ async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
     steps.iter().map(|index| returned.remove(index)).collect()
 }
 
-/// Write the reply for the outcome `label` names, then, while `ahead` trees
-/// further are allowed, the replies after the trees that reply would dispatch,
-/// which start from `from` as far as is known.
+/// Write the reply for the outcome `label` names, once `wait` lets it start,
+/// then, while `ahead` trees further are allowed, the replies after the trees
+/// that reply would dispatch, which start from `from` as far as is known, once
+/// the tree this reply follows ends, expected by `due`.
 fn prepare(
     request: Arc<Request>,
     messages: Vec<Message>,
     label: String,
     ahead: u64,
     from: Option<(f64, f64)>,
+    wait: Option<Wait>,
+    due: Option<Instant>,
 ) -> BoxFuture<'static, Result<Prepared, String>> {
     async move {
+        if let Some(wait) = wait {
+            until_due(wait).await;
+        }
         let text = generate(&request, messages.clone(), &label)
             .await
             .map_err(|error| {
@@ -1845,7 +2098,7 @@ fn prepare(
             })?;
         let next = match ahead {
             0 => Vec::new(),
-            _ => look_ahead(&request, messages, &text, &label, ahead - 1, from),
+            _ => look_ahead(&request, messages, &text, &label, ahead - 1, from, due),
         };
         Ok(Prepared {
             text,
@@ -1906,6 +2159,7 @@ fn look_ahead(
     label: &str,
     ahead: u64,
     from: Option<(f64, f64)>,
+    due: Option<Instant>,
 ) -> Vec<Option<Ahead>> {
     let Ok(written) = serde_json::from_str::<Value>(text) else {
         return Vec::new();
@@ -1924,30 +2178,50 @@ fn look_ahead(
         if nodes.is_empty() {
             return None;
         }
-        let ((run, end), write, early) = {
+        // A tree that only reads is short whatever was timed, and can run now.
+        let readable = reads_only(&reply["rtdl"], &request.reads);
+        // A stop comes once the robot sees the change, often while the tree's
+        // first navigation runs, before a reply asked for at its dispatch is written.
+        let stop = request.stops && request.margin && !readable;
+        let ((run, end), first, write, early) = {
             let timings = timings();
+            let write = timings.write_time(request.margin);
             let steps = reply_steps(&reply["rtdl"]);
             let expected = |steps| timings.expected(steps, from, request.experienced);
             let straight = straight(&reply["rtdl"]);
-            let fails_early = |position: &usize| {
-                let node = nodes[*position];
+            let fails_early = |position: usize| {
+                let node = nodes[position];
                 let rate = timings
                     .experience
                     .failure_rate(node["cap"].as_str().unwrap_or(""));
-                let before = expected(&steps[..*position]).0;
-                straight.iter().any(|step| std::ptr::eq(*step, node))
+                let before = expected(&steps[..position]).0;
+                let early = straight.iter().any(|step| std::ptr::eq(*step, node))
                     && rate >= MIN_FAILURE_RATE
-                    && before
-                        .zip(timings.reply)
-                        .is_some_and(|(run, write)| run < write)
+                    && before.zip(write).is_some_and(|(run, write)| run < write);
+                early.then_some((position, before))
             };
-            let early: Vec<usize> = (0..nodes.len())
-                .filter(fails_early)
-                .take(MAX_BRANCHES - 1)
+            let early: Vec<(usize, Option<Duration>)> = (0..nodes.len())
+                .filter_map(fails_early)
+                .take(MAX_BRANCHES - 1 - usize::from(stop))
                 .collect();
-            (expected(&steps), timings.reply, early)
+            let run = expected(&steps);
+            // With margin scheduling a tree is timed as long as recent trees ran
+            // against what their steps were expected to take.
+            let first = match request.margin {
+                true => timings.calibrated(run.0),
+                false => run.0,
+            };
+            (run, first, write, early)
         };
-        let short = run.zip(write).is_some_and(|(run, write)| run < write);
+        let short = first.zip(write).is_some_and(|(run, write)| run < write);
+        // A request is due to start its write time before its reply is needed,
+        // `needed` after the tree this reply follows ends; it starts sooner if
+        // that tree is dispatched sooner.
+        let (go, wake) = tokio::sync::watch::channel(false);
+        let start = |needed: Option<Duration>| -> Option<Wait> {
+            let at = (due? + needed?).checked_sub(write? + MARGIN_SLACK)?;
+            (request.margin && at > Instant::now()).then(|| (at, wake.clone()))
+        };
         // A tree that only reads is short whatever was timed, and can run now.
         let readable = reads_only(&reply["rtdl"], &request.reads);
         info!(
@@ -1961,9 +2235,13 @@ fn look_ahead(
                 "reads_only": readable,
                 "sent": short || readable,
                 "early_failures": early.len(),
+                "stop": stop,
+                "margin": request.margin,
+                "calibrated_ms": first.map(|first| first.as_millis() as u64),
+                "start_in_ms": start(first).map(|(at, _)| (at - Instant::now()).as_millis() as u64),
             })
         );
-        if !(short || readable) && early.is_empty() {
+        if !(short || readable) && early.is_empty() && !stop {
             return None;
         }
         let steps: Vec<(String, String)> = names.map(|name| (next_op_id(), name.into())).collect();
@@ -1989,7 +2267,7 @@ fn look_ahead(
         messages.push(Message::assistant(text));
         let label = format!("{label}/{index}");
         let mut branches = Vec::new();
-        for position in early {
+        for (position, before) in early {
             let outcome = Outcome::Failed(steps[position].0.clone());
             let ask = hypothesis(
                 &tree,
@@ -1998,13 +2276,58 @@ fn look_ahead(
                 DECISION_MODEL.is_some(),
                 false,
                 false,
+                request.margin,
             );
             let mut messages = messages.clone();
             messages.push(Message::user(&ask));
             let label = format!("{label}/{}", outcome.label());
+            let wait = start(before);
             branches.push(Branch {
-                reply: tokio::spawn(prepare(request.clone(), messages, label, 0, end)),
+                reply: tokio::spawn(prepare(
+                    request.clone(),
+                    messages,
+                    label,
+                    0,
+                    end,
+                    wait,
+                    None,
+                )),
                 outcome,
+                next: None,
+                objects: request.objects.clone(),
+            });
+        }
+        if stop {
+            let args: String = nodes.iter().map(|node| node["args"].to_string()).collect();
+            let navigations = steps
+                .iter()
+                .filter(|(_, cap)| cap.ends_with("navigate"))
+                .map(|(op_id, _)| op_id.as_str());
+            let relied = relied_on(&args, navigations, &request.objects).join("; ");
+            let ask = hypothesis(
+                &tree,
+                &format!("{}\nIt relies on: {relied}.", described.concat()),
+                &Outcome::Stopped,
+                DECISION_MODEL.is_some(),
+                false,
+                false,
+                request.margin,
+            );
+            let mut messages = messages.clone();
+            messages.push(Message::user(&ask));
+            let label = format!("{label}/{}", Outcome::Stopped.label());
+            let wait = start(Some(Duration::ZERO));
+            branches.push(Branch {
+                reply: tokio::spawn(prepare(
+                    request.clone(),
+                    messages,
+                    label,
+                    0,
+                    end,
+                    wait,
+                    None,
+                )),
+                outcome: Outcome::Stopped,
                 next: None,
                 objects: request.objects.clone(),
             });
@@ -2012,6 +2335,9 @@ fn look_ahead(
         if short || readable {
             let objects = request.objects.clone();
             let (request, reply) = (request.clone(), reply.clone());
+            // A tree read ahead runs now, whenever its reply is due.
+            let wait = start(first).filter(|_| !readable);
+            let due = due.zip(first).map(|(due, first)| due + first);
             let reply = tokio::spawn(async move {
                 let read = match readable {
                     true => read_ahead(&request.reader, &reply).await,
@@ -2039,9 +2365,10 @@ fn look_ahead(
                     DECISION_MODEL.is_some(),
                     read.is_some(),
                     false,
+                    request.margin,
                 );
                 messages.push(Message::user(&ask));
-                let prepared = prepare(request, messages, label, ahead, end).await?;
+                let prepared = prepare(request, messages, label, ahead, end, wait, due).await?;
                 Ok(Prepared { read, ..prepared })
             });
             branches.push(Branch {
@@ -2055,9 +2382,17 @@ fn look_ahead(
             steps,
             branches,
             started: Instant::now(),
+            go,
         })
     };
-    replies.into_iter().enumerate().map(prepare_for).collect()
+    // With margin scheduling only the first, likeliest situation is prepared beyond.
+    let replies = replies.into_iter().enumerate();
+    replies
+        .map(|(index, reply)| match request.margin && index > 0 {
+            true => None,
+            false => prepare_for((index, reply)),
+        })
+        .collect()
 }
 
 /// Run one background request to completion and return its text.
@@ -2070,6 +2405,7 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
         ..
     } = request;
     let idle_timeout = *idle_timeout;
+    let requested = Instant::now();
     let _slot = SLOTS.acquire().await?;
     let started = Instant::now();
     let mut stream = tokio::time::timeout(
@@ -2101,6 +2437,7 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
             smooth(&mut timings.first_text, first);
         }
         smooth(&mut timings.reply, started.elapsed());
+        timings.wrote(requested.elapsed());
     }
     info!(
         "[pilot/segue] {}",
@@ -2183,6 +2520,10 @@ mod tests {
             renames: Vec::new(),
             reads: Default::default(),
             read_set: true,
+            stop: None,
+            go: None,
+            expected: None,
+            dispatched: Instant::now(),
         }
     }
 
@@ -2299,6 +2640,100 @@ mod tests {
         assert_eq!(spec.take_branch().err(), Some("outcome not speculated"));
     }
 
+    #[test]
+    fn a_tree_the_read_set_stopped_takes_the_reply_prepared_for_a_stop() {
+        use RtdlNodeStateEnum::{Canceled, Succeeded};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut spec = three_steps();
+        let stop = || Branch {
+            outcome: Outcome::Stopped,
+            reply: tokio::spawn(std::future::ready(Ok(Prepared {
+                text: "stopped".into(),
+                next: Vec::new(),
+                read: None,
+            }))),
+            next: None,
+            objects: Default::default(),
+        };
+        spec.branches.push(stop());
+        spec.stopped("other", vec!["o9".into()]);
+        spec.stopped(
+            "p",
+            vec!["o1 (cornflakes in living room when the tree was written)".into()],
+        );
+        let results = [state(1, Succeeded), state(2, Canceled), state(0, Canceled)];
+        spec.ended("p", &results, false, true);
+        assert_eq!(
+            spec.take_branch().ok().map(|branch| branch.outcome.clone()),
+            Some(Outcome::Stopped)
+        );
+        // The decision model reads what changed beside the steps that finished.
+        assert_eq!(
+            spec.report().last().unwrap()["changed"][0],
+            "o1 (cornflakes in living room when the tree was written)"
+        );
+        // A cancellation the read set did not ask for is no stop.
+        let mut spec = three_steps();
+        spec.branches.push(stop());
+        spec.ended("p", &[state(0, Canceled)], false, true);
+        assert_eq!(spec.take_branch().err(), Some("outcome not speculated"));
+    }
+
+    #[test]
+    fn margin_scheduling_times_a_reply_by_its_slow_writes() {
+        let mut timings = super::Timings {
+            reply: Some(std::time::Duration::from_secs(10)),
+            ..Default::default()
+        };
+        assert_eq!(timings.write_time(true), timings.reply);
+        // The 90th percentile of ten is the ninth, of three the longest.
+        timings.writes = (1..=10).map(std::time::Duration::from_secs).collect();
+        assert_eq!(
+            timings.write_time(true),
+            Some(std::time::Duration::from_secs(9))
+        );
+        timings.writes = (1..=3).map(std::time::Duration::from_secs).collect();
+        assert_eq!(
+            timings.write_time(true),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(timings.write_time(false), timings.reply);
+    }
+
+    #[tokio::test]
+    async fn a_request_prepared_ahead_waits_until_due_or_its_tree_is_dispatched() {
+        let ms = std::time::Duration::from_millis;
+        let (go, wake) = tokio::sync::watch::channel(false);
+        let waiting = tokio::spawn(super::until_due((Instant::now() + ms(10_000), wake)));
+        tokio::time::sleep(ms(50)).await;
+        assert!(!waiting.is_finished());
+        go.send_replace(true);
+        tokio::time::timeout(ms(1_000), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        // Unwoken, it starts when due.
+        let (_go, wake) = tokio::sync::watch::channel(false);
+        let started = Instant::now();
+        super::until_due((started + ms(200), wake)).await;
+        assert!(started.elapsed() >= ms(190));
+    }
+
+    #[test]
+    fn a_stops_request_names_the_objects_and_goals_the_tree_relies_on() {
+        let args = r#"{"goal": {}}{"object": "cornflakes"}"#;
+        let objects = serde_json::json!({"living room": [
+            {"id": "o1", "label": "cornflakes"}, {"id": "o2", "label": "sofa"}]});
+        assert_eq!(
+            super::relied_on(args, ["p-2"].into_iter(), &objects),
+            [
+                "o1 (cornflakes in living room)",
+                "the goal step op_id=p-2 navigates to"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_lone_situation_without_when_is_used_without_asking() {
         let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
@@ -2310,21 +2745,31 @@ mod tests {
     #[test]
     fn with_a_decision_model_every_outcome_asks_for_situations() {
         for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
-            let ask =
-                |situations| super::hypothesis("plan p", "", &outcome, situations, false, false);
+            let ask = |situations| {
+                super::hypothesis("plan p", "", &outcome, situations, false, false, false)
+            };
             assert!(ask(true).contains(r#"{"situations""#));
             assert!(!ask(false).contains("situations"));
         }
-        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true, false);
+        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true, false, false);
         assert!(read.contains(r#"{"when": "", "reply": ...}"#) && !read.contains("not known yet"));
     }
 
     #[test]
     fn a_long_tree_is_asked_for_a_bold_and_a_careful_course_on_success_only() {
-        let ask = |outcome, long| super::hypothesis("plan p", "", &outcome, true, false, long);
+        let ask =
+            |outcome, long| super::hypothesis("plan p", "", &outcome, true, false, long, false);
         assert!(ask(Outcome::Succeeded, true).contains("First the bold one"));
         assert!(!ask(Outcome::Succeeded, false).contains("First the bold one"));
         assert!(!ask(Outcome::Failed("p-0".into()), true).contains("First the bold one"));
+        // Margin scheduling asks for replies short enough to be written in time,
+        // with one or two situations, never none.
+        let brief = super::hypothesis("plan p", "", &Outcome::Succeeded, true, false, false, true);
+        assert!(brief.contains("one or two situations") && brief.contains("in a few words"));
+        assert!(ask(Outcome::Succeeded, false).contains("one to three situations"));
+        // A stop keeps one situation per kind of change it may be.
+        let stop = super::hypothesis("plan p", "", &Outcome::Stopped, true, false, false, true);
+        assert!(stop.contains("one to three situations") && stop.contains("in a few words"));
     }
 
     #[test]

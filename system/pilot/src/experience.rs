@@ -15,6 +15,9 @@ const KEPT: usize = 64;
 /// Recent navigations kept for the line that times one by its distance.
 const MOVES_KEPT: usize = 256;
 
+/// Recent trees kept for how long trees run against what they were expected to take.
+const RUNS_KEPT: usize = 32;
+
 /// The calls Pilot has seen, as [`Experience::estimate`] reads them.
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct Experience {
@@ -27,6 +30,15 @@ pub(crate) struct Experience {
     /// How many calls of each capability ended, and how many of those failed.
     #[serde(default)]
     ended: HashMap<String, (u32, u32)>,
+    /// How many trees the read set watched to their end, and how many of those
+    /// it stopped.
+    #[serde(default)]
+    stops: (u32, u32),
+    /// How long recent trees that succeeded ran, as a share of what their steps
+    /// were expected to take: a tree often ends at an `if` whose condition
+    /// fails, as after a search that comes back empty, short of its last step.
+    #[serde(default)]
+    runs: VecDeque<f64>,
     /// Where the robot was last known to be, which the next navigation's
     /// distance is measured from; not kept across restarts.
     #[serde(skip)]
@@ -107,6 +119,33 @@ impl Experience {
     pub(crate) fn failure_rate(&self, capability: &str) -> f64 {
         let (ended, failed) = self.ended.get(capability).copied().unwrap_or_default();
         f64::from(failed + 1) / f64::from(ended + 2)
+    }
+
+    /// Record that the read set watched a tree to its end, and whether it
+    /// stopped it.
+    pub(crate) fn watched(&mut self, stopped: bool) {
+        self.stops.0 += 1;
+        self.stops.1 += u32::from(stopped);
+    }
+
+    /// How often the read set stops a tree it watches, estimated as
+    /// [`Experience::failure_rate`] estimates failures.
+    pub(crate) fn stop_rate(&self) -> f64 {
+        f64::from(self.stops.1 + 1) / f64::from(self.stops.0 + 2)
+    }
+
+    /// Record that a tree succeeded after running `share` of the time its
+    /// steps were expected to take.
+    pub(crate) fn ran(&mut self, share: f64) {
+        push(&mut self.runs, share, RUNS_KEPT);
+    }
+
+    /// The median share of their expected time recent trees ran, once three
+    /// have; none before.
+    pub(crate) fn run_share(&self) -> Option<f64> {
+        let mut seen: Vec<f64> = self.runs.iter().copied().collect();
+        seen.sort_by(f64::total_cmp);
+        (seen.len() >= 3).then(|| seen[seen.len() / 2])
     }
 
     /// The robot is at `at`, as the state view says at the start of a round.
@@ -239,5 +278,25 @@ mod tests {
             Experience::load(&dir.path().join("missing")).typical("x"),
             None
         );
+    }
+
+    #[test]
+    fn the_stop_rate_starts_at_a_half_and_follows_the_trees_watched() {
+        let mut experience = Experience::default();
+        assert_eq!(experience.stop_rate(), 0.5);
+        for stopped in [true, false, false, false, false, false, false, false] {
+            experience.watched(stopped);
+        }
+        assert_eq!(experience.stop_rate(), 0.2);
+    }
+
+    #[test]
+    fn trees_are_timed_by_the_share_of_their_steps_recent_trees_ran() {
+        let mut experience = Experience::default();
+        experience.ran(0.2);
+        experience.ran(0.9);
+        assert_eq!(experience.run_share(), None);
+        experience.ran(0.4);
+        assert_eq!(experience.run_share(), Some(0.4));
     }
 }

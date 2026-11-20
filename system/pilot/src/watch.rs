@@ -284,6 +284,14 @@ impl Watch {
         acted
     }
 
+    /// Whether the read set could stop the tree at all: it has a step that does
+    /// more than read.
+    pub(crate) fn guarded(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| !self.reads.contains(&step.contract))
+    }
+
     /// Whether a change could still stop the tree: it has a step left that does
     /// more than read.
     pub(crate) fn armed(&self) -> bool {
