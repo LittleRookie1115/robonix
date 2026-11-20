@@ -140,19 +140,26 @@ def test_goal_region_returns_a_poi_pose_only_where_the_robot_fits():
 
 
 class _CostmapHub(_Hub):
-    """_Hub's map, and a Navigation costmap that marks (1.0, 1.0)."""
+    """_Hub's map, and a Navigation costmap that marks the cells `marked` cells
+    or fewer from (1.0, 1.0)."""
+
+    def __init__(self, marked=0, resolution=0.05):
+        self.marked = marked
+        self.resolution = resolution
 
     def has(self, name):
         return name in ("occupancy_grid", "nav_costmap")
 
     def latest(self, name):
         if name == "occupancy_grid":
-            return super().latest(name)
+            grid, stamp, count = super().latest(name)
+            grid.info.resolution = self.resolution
+            return grid, stamp, count
         data = np.zeros((80, 80), dtype=np.int8)
-        data[40, 40] = 100
+        data[40 - self.marked:41 + self.marked, 40 - self.marked:41 + self.marked] = 100
         return SimpleNamespace(
             header=SimpleNamespace(frame_id="map"),
-            info=SimpleNamespace(width=80, height=80, resolution=0.05,
+            info=SimpleNamespace(width=80, height=80, resolution=self.resolution,
                                  origin=SimpleNamespace(position=SimpleNamespace(x=-1.0, y=-1.0))),
             data=data.tobytes(),
         ), 0.0, 1
@@ -168,8 +175,12 @@ def test_goal_clear_checks_a_held_goal_against_the_map_and_the_live_costmap():
 
     assert clear(_Hub(), 1.0, 1.0).clear is True
     assert "does not fit" in clear(_Hub(), 2.1, 2.0).reason
-    marked = clear(_CostmapHub(), 1.0, 1.0)
+    marked = clear(_CostmapHub(marked=3), 1.0, 1.0)
     assert marked.clear is False and "costmap" in marked.reason
+    # Navigation plans to a free point within its tolerance of a marked goal,
+    # 0.1 m along each axis, which a float32 grid resolution must not shorten.
+    assert clear(_CostmapHub(), 1.0, 1.0).clear is True
+    assert clear(_CostmapHub(marked=1, resolution=np.float32(0.05)), 1.0, 1.0).clear is True
     assert clear(_Hub(), 0.5, 0.5, frame="odom").clear is False
 
 

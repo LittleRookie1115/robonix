@@ -302,6 +302,16 @@ ROBOT_SEED_RADIUS_M = 0.5
 NAV_COSTMAP_INSCRIBED = 99
 
 
+def positions_within(x: float, y: float, radius: float, step: float) -> Iterable[tuple[float, float]]:
+    """(x, y), then the points of a `step` grid around it within `radius` along
+    each axis, the square Navigation's planner searches, nearest first. The
+    grid's resolution comes as a float32, so cells are counted by rounding."""
+    cells = round(radius / step) if step > 0 else 0
+    offsets = [(i, j) for i in range(-cells, cells + 1) for j in range(-cells, cells + 1)]
+    for i, j in sorted(offsets, key=lambda o: math.hypot(*o)):
+        yield x + i * step, y + j * step
+
+
 def nav_cost_ok(costmap, x: float, y: float) -> bool:
     """Whether Navigation could stand the robot at (x, y): its costmap cell is
     unknown, outside the costmap, or below the inscribed cost."""

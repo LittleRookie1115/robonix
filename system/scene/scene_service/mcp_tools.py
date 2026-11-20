@@ -17,7 +17,9 @@ if TYPE_CHECKING:  # pragma: no cover
 from .scene_graph.store import SceneGraphStore
 from .scene_graph.types import SceneGraphSnapshot
 from .geometry import point_in_polygon, polygon_centroid
-from .goal_planner import nav_cost_ok, object_goal, pose_clear, room_goal, room_yaw_candidates
+from .goal_planner import (
+    nav_cost_ok, object_goal, pose_clear, positions_within, room_goal, room_yaw_candidates,
+)
 from .robot_geometry import RobotGeometryState
 
 if TYPE_CHECKING:
@@ -846,11 +848,17 @@ def _nav_costmap(frame: str):
     return costmap
 
 
+# Navigation's planner plans to a free point this close to a goal it cannot
+# reach itself (NavFn's `tolerance` in the GPSR Nav2 configuration).
+GOAL_TOLERANCE_M = 0.1
+
+
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_clear")
 async def goal_clear(req: GoalClear_Request) -> GoalClear_Response:
-    """Whether a navigation goal is still a pose the robot can stand at: its
-    footprint fits there on the map, and Navigation's costmap, which marks what
-    the robot's sensors see now, does not mark it.
+    """Whether a navigation goal is still a pose the robot can stand at, or
+    within GOAL_TOLERANCE_M of it as Navigation plans: its footprint fits there
+    on the map, and Navigation's costmap, which marks what the robot's sensors
+    see now, does not mark it.
     Contract: robonix/system/scene/goal_clear."""
     footprint = _ROBOT_GEOMETRY.current() if _ROBOT_GEOMETRY is not None else None
     if footprint is None:
@@ -868,12 +876,17 @@ async def goal_clear(req: GoalClear_Request) -> GoalClear_Response:
     position, q = req.goal.pose.position, req.goal.pose.orientation
     x, y = float(position.x), float(position.y)
     yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-    if not pose_clear(msg, footprint, x, y, yaw):
-        return GoalClear_Response(clear=False, reason="the robot does not fit there on the map")
     costmap = _nav_costmap(frame)
-    if costmap is not None and not nav_cost_ok(costmap, x, y):
-        return GoalClear_Response(clear=False, reason="Navigation's costmap marks it occupied")
-    return GoalClear_Response(clear=True, reason="")
+    fits = False
+    for px, py in positions_within(x, y, GOAL_TOLERANCE_M, float(msg.info.resolution)):
+        if not pose_clear(msg, footprint, px, py, yaw):
+            continue
+        fits = True
+        if costmap is None or nav_cost_ok(costmap, px, py):
+            return GoalClear_Response(clear=True, reason="")
+    if not fits:
+        return GoalClear_Response(clear=False, reason="the robot does not fit there on the map")
+    return GoalClear_Response(clear=False, reason="Navigation's costmap marks it occupied")
 
 
 @mcp_contract(mcp, contract_id="robonix/system/scene/goal_region")
