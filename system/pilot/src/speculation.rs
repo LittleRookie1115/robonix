@@ -757,6 +757,9 @@ struct Spending {
     /// Trees per task over the tasks this process finished, as a running mean
     /// with the count it is over.
     per_task: Option<(f64, u32)>,
+    /// What the best request of recent trees was expected to save, in seconds,
+    /// under the adaptive policy, whatever the task.
+    bests: std::collections::VecDeque<f64>,
 }
 
 static SPENDING: LazyLock<Mutex<Spending>> = LazyLock::new(Default::default);
@@ -788,6 +791,19 @@ impl Spending {
     fn reserve(&self) -> usize {
         let expected = self.per_task.map_or(TREES_PER_TASK, |(mean, _)| mean);
         (expected - self.trees as f64).ceil().max(0.0) as usize
+    }
+
+    /// Whether a tree whose best request would save `best` seconds is worth part
+    /// of a budget too small for every tree still expected: only if it saves at
+    /// least what such a request typically does (the median of the last 32).
+    fn worth(&mut self, best: f64, scarce: bool) -> bool {
+        let mut seen: Vec<f64> = self.bests.iter().copied().collect();
+        if self.bests.len() == WRITES_KEPT {
+            self.bests.pop_front();
+        }
+        self.bests.push_back(best);
+        seen.sort_by(f64::total_cmp);
+        !scarce || seen.len() < 3 || best >= seen[seen.len() / 2]
     }
 }
 
@@ -961,6 +977,8 @@ impl Speculation {
         let length = if margin { Length::Brief } else { Length::Full };
         // What each outcome's reply is expected to save, under the adaptive policy.
         let mut savings = serde_json::Map::new();
+        // What the best of them is expected to save, under the adaptive policy.
+        let mut best = None;
         let mut outcomes: Vec<(Outcome, Length)> = match (policy, estimates) {
             (Policy::Adaptive, Some((left, own, write))) => {
                 // A step fails only if every step before it succeeded; a stop
@@ -983,6 +1001,7 @@ impl Speculation {
                 }
                 candidates.insert(0, (Outcome::Succeeded, reached * (1.0 - stop)));
                 let chosen = allocate(candidates, left, own, write);
+                best = chosen.first().map(|(_, saving)| *saving);
                 for (outcome, saving) in &chosen {
                     savings.insert(outcome.label(), json!((saving * 10.0).round() / 10.0));
                 }
@@ -991,6 +1010,8 @@ impl Speculation {
                     .map(|(outcome, _)| (outcome, length))
                     .collect()
             }
+            // Until it can weigh savings, success in full, whose write times it learns.
+            (Policy::Adaptive, None) => vec![(Outcome::Succeeded, length)],
             (Policy::Current, _) => std::iter::once(Outcome::Succeeded)
                 .chain(endings.into_iter().map(|(outcome, _)| outcome))
                 .map(|outcome| (outcome, length))
@@ -1017,11 +1038,19 @@ impl Speculation {
                 let mut spending = spending();
                 let spending = spending.of(&task.task_id);
                 spending.trees += 1;
+                let left = cap.saturating_sub(spending.spent);
                 let keep = match policy {
                     Policy::Adaptive => spending.reserve(),
                     _ => 0,
                 };
-                (keep, Some(cap.saturating_sub(spending.spent)))
+                // Too little left for every tree still expected: keep it for
+                // trees whose reply saves more than this one's would.
+                if let Some(best) = best
+                    && !spending.worth(best, left <= keep)
+                {
+                    outcomes.clear();
+                }
+                (keep, Some(left))
             }
             None => (0, None),
         };
@@ -3136,6 +3165,14 @@ mod tests {
         spending.of("b").trees = 1;
         assert_eq!(spending.per_task, Some((3.0, 1)));
         assert_eq!(spending.reserve(), 2);
+        // Once three trees are seen, a scarce budget goes only to a tree whose
+        // reply saves at least the median.
+        for best in [2.0, 6.0, 4.0] {
+            assert!(spending.worth(best, true));
+        }
+        assert!(!spending.worth(3.0, true));
+        assert!(spending.worth(3.0, false));
+        assert!(spending.worth(5.0, true));
     }
 
     #[test]
