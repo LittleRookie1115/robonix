@@ -2095,6 +2095,8 @@ pub async fn run_turn(
                 }
             }))
         };
+        // When the round began, which its own request's first step is timed from.
+        let round_began = std::time::Instant::now();
         // A prepared reply stands in for this request only if it was written
         // for how the tree really ended and nothing else reached the model since.
         let mut prepared = None;
@@ -2289,8 +2291,11 @@ pub async fn run_turn(
                                 revision: &forest.revision, expected_revision: planning_revision,
                             }).await;
                             if let Some(open) = opening.take() { opening = open.follow(&live.plan); }
-                            if !live.plan.nodes.is_empty() {
-                                dispatched.get_or_insert_with(std::time::Instant::now);
+                            if !live.plan.nodes.is_empty() && dispatched.is_none() {
+                                dispatched = Some(std::time::Instant::now());
+                                if !replayed {
+                                    speculation::answered(round_began.elapsed());
+                                }
                             }
                             if streamed_task.is_none() && !live.plan.nodes.is_empty() {
                                 let mut fields = parser.task_fields.clone();

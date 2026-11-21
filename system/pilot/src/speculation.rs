@@ -83,6 +83,14 @@ const MARGIN_SLACK: Duration = Duration::from_secs(2);
 /// Recent write times the margin scheduler's estimate is taken from.
 const WRITES_KEPT: usize = 32;
 
+/// Prepared requests one task may send under margin policies `short` and
+/// `adaptive`, so that the two compare at the same cost.
+const PREPARED_PER_TASK: usize = 8;
+
+/// Least planner wait, in seconds, a request must be expected to save for the
+/// `adaptive` margin policy to send it.
+const MIN_SAVING_S: f64 = 0.5;
+
 /// Least estimated failure rate of a step's capability for that failure to be
 /// prepared for. A branch costs a request and a slot whether it is used or not,
 /// so below one use in ten it mostly delays the requests prepared ahead.
@@ -123,6 +131,12 @@ struct Timings {
     /// How long recent prepared replies took from their request to their last
     /// word, waiting for a request slot included.
     writes: std::collections::VecDeque<Duration>,
+    /// The same for replies asked in the short form, one situation and the
+    /// shortest plan that carries on.
+    short_writes: std::collections::VecDeque<Duration>,
+    /// About how long a round takes from its start to its first step when its
+    /// own request, not a prepared reply, serves it.
+    answered: Option<Duration>,
 }
 
 impl Timings {
@@ -139,12 +153,23 @@ impl Timings {
         self.reply
     }
 
+    /// The 90th percentile of recent short-form write times, once there are three.
+    fn short_write_time(&self) -> Option<Duration> {
+        let mut seen: Vec<Duration> = self.short_writes.iter().copied().collect();
+        seen.sort();
+        (seen.len() >= 3).then(|| seen[(seen.len() * 9).div_ceil(10) - 1])
+    }
+
     /// Keep `took`, how long a prepared reply took to write, or at least took.
-    fn wrote(&mut self, took: Duration) {
-        if self.writes.len() == WRITES_KEPT {
-            self.writes.pop_front();
+    fn wrote(&mut self, took: Duration, short: bool) {
+        let writes = match short {
+            true => &mut self.short_writes,
+            false => &mut self.writes,
+        };
+        if writes.len() == WRITES_KEPT {
+            writes.pop_front();
         }
-        self.writes.push_back(took);
+        writes.push_back(took);
     }
 
     /// `run`, what a tree's steps are expected to take, scaled by the share of
@@ -215,6 +240,17 @@ pub(crate) fn took(call: &CapabilityCall, time: Duration, output: &str) {
 /// Record that this call ended, and whether it failed, and keep the experience.
 pub(crate) fn finished(call: &CapabilityCall, failed: bool) {
     keep(|experience| experience.finished(&called(call), failed));
+}
+
+/// Record that a round's own request led to its first step `took` after the
+/// round began, what a prepared reply has to beat.
+pub(crate) fn answered(took: Duration) {
+    let mut timings = timings();
+    timings.answered = Some(
+        timings
+            .answered
+            .map_or(took, |old| old.mul_f64(0.7) + took.mul_f64(0.3)),
+    );
 }
 
 /// Record that the read set watched a tree to its end, and whether it stopped
@@ -339,6 +375,15 @@ const NAMED_PLACES: &str = "Take the command to be right about where its people 
 const BRIEF: &str = "Put the likeliest situation first. Write each RTDL node's description in a \
                      few words and each reply's `content` in one sentence, since Pilot uses a \
                      prepared reply only if it is written before the plan ends. ";
+
+/// What the short form asks of a prepared reply: one plan, no longer than it
+/// takes to keep the robot moving, so that it is written before the plan ends.
+const SHORT: &str = "Give exactly one situation. Its `when` names every fact its reply's steps \
+                     rely on, such as which object, who receives it and where that person is, or \
+                     which place, so that each can be checked against the outputs. Its reply is \
+                     the shortest plan that keeps the robot doing the right next thing, at most \
+                     two steps, with each RTDL node's description in a few words and `content` in \
+                     one sentence; the rest is planned while those steps run. ";
 
 const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene's object list \
      may show although these steps' outputs do not name it, for example because a search by a \
@@ -595,6 +640,9 @@ pub(crate) struct Speculation {
     expected: Option<Duration>,
     /// When the tree was dispatched.
     dispatched: Instant,
+    /// Whether the success reply was asked in the short form, which a reply
+    /// the round's own request beat counts toward the write time of.
+    short: bool,
 }
 
 /// The `do` steps of a tree whose failure fixes what else ran, as node index and
@@ -646,6 +694,94 @@ fn failures_to_prepare(
     failures
 }
 
+/// How margin scheduling shares the planner among the replies a tree's
+/// outcomes may need, the task's `margin_policy`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Policy {
+    /// Skip a tree expected to end before a reply could be written; prepare
+    /// failures and stops past a fixed rate.
+    Current,
+    /// Always prepare success in the short form at once; failures and stops as
+    /// `Current` does, on trees it would not skip.
+    Short,
+    /// Prepare each outcome by the planner wait its reply is expected to save,
+    /// asked short when a full reply could not be written before it is needed.
+    Adaptive,
+}
+
+impl Policy {
+    fn of(context: &Value) -> Self {
+        match context["margin_policy"].as_str() {
+            Some("short") => Self::Short,
+            Some("adaptive") => Self::Adaptive,
+            _ => Self::Current,
+        }
+    }
+}
+
+/// How much of a reply a prepared request asks for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Length {
+    /// Up to three situations, each with a complete reply.
+    Full,
+    /// Fewer situations, likeliest first, with short descriptions.
+    Brief,
+    /// One situation whose `when` names every fact its reply relies on, with
+    /// the shortest plan that keeps the robot doing the right next thing.
+    Short,
+}
+
+impl Length {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Brief => "brief",
+            Self::Short => "short",
+        }
+    }
+}
+
+/// Take up to `wanted` of `task`'s prepared requests, `PREPARED_PER_TASK` a
+/// task, and return how many it got.
+fn spend(task: &str, wanted: usize) -> usize {
+    static SPENT: Mutex<(String, usize)> = Mutex::new((String::new(), 0));
+    let mut spent = SPENT.lock().unwrap_or_else(PoisonError::into_inner);
+    if spent.0 != task {
+        *spent = (task.to_string(), 0);
+    }
+    let got = wanted.min(PREPARED_PER_TASK.saturating_sub(spent.1));
+    spent.1 += got;
+    got
+}
+
+/// The outcomes worth a request, best first, with the length to ask each in and
+/// the planner wait, in seconds, its reply is expected to save: its probability
+/// times how much sooner than the round's own request (`own` after the tree
+/// ends, `left` from now) it would be ready. A reply is asked in full if it can
+/// be written before it is needed, else short.
+fn allocate(
+    candidates: Vec<(Outcome, f64)>,
+    left: Duration,
+    own: Duration,
+    (full, short): (Duration, Duration),
+) -> Vec<(Outcome, Length, f64)> {
+    let length = if full <= left {
+        Length::Brief
+    } else {
+        Length::Short
+    };
+    let write = if length == Length::Brief { full } else { short };
+    let sooner = (left + own).saturating_sub(write).min(own).as_secs_f64();
+    let mut chosen: Vec<(Outcome, Length, f64)> = candidates
+        .into_iter()
+        .map(|(outcome, p)| (outcome, length, p * sooner))
+        .filter(|(_, _, saving)| *saving >= MIN_SAVING_S)
+        .collect();
+    chosen.sort_by(|a, b| b.2.total_cmp(&a.2));
+    chosen.truncate(MAX_BRANCHES);
+    chosen
+}
+
 /// A tree's capability calls, in node order.
 fn calls(plan: &Plan) -> impl Iterator<Item = (&RtdlNode, &CapabilityCall)> {
     plan.nodes
@@ -680,6 +816,11 @@ impl Speculation {
         let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
         let experienced = context["experience"].as_bool().unwrap_or(true);
         let margin = context["margin"].as_bool().unwrap_or(true);
+        let policy = if margin {
+            Policy::of(&context)
+        } else {
+            Policy::Current
+        };
         // Long unless it is known to end before one reply could be written.
         let long;
         // Where the robot will be once the tree ends, as far as is known.
@@ -688,6 +829,12 @@ impl Speculation {
         let due;
         // What the tree's steps are expected to take, for how long trees run.
         let expected;
+        // Whether the tree is expected to end before the round's own request,
+        // sent then, would answer sooner than a reply asked now.
+        let short_tree;
+        // The time left until the tree ends, what the round's own request takes
+        // to its first step, and what full and short replies take to write.
+        let estimates;
         {
             let timings = timings();
             // A loop runs its body any number of times, so its calls' times bound nothing.
@@ -703,9 +850,20 @@ impl Speculation {
             long = run.zip(write).is_none_or(|(run, reply)| run >= reply);
             expected = run.filter(|_| margin);
             due = timings.calibrated(expected).map(|run| dispatched + run);
+            short_tree = run
+                .zip(timings.first_text)
+                .zip(write)
+                .is_some_and(|((run, first_text), reply)| run + first_text < reply);
+            let left = due.map(|due| due.saturating_duration_since(Instant::now()));
+            let short = write.map(|full| timings.short_write_time().unwrap_or(full / 2));
+            estimates = left
+                .zip(timings.answered)
+                .zip(write.zip(short))
+                .map(|((left, own), writes)| (left, own, writes));
             if let Some(run) = run
                 && let (Some(first_text), Some(reply)) = (timings.first_text, write)
-                && run + first_text < reply
+                && short_tree
+                && policy == Policy::Current
             {
                 info!(
                     "[pilot/segue] {}",
@@ -741,9 +899,8 @@ impl Speculation {
         let acts = calls(plan)
             .any(|(_, call)| !reads.contains(&crate::discovery::llm_name(&call.contract_id)));
         let stop_rate = timings().experience.stop_rate();
-        let stops = read_set
-            && context["stop_replies"].as_bool().unwrap_or(true)
-            && (!budget || stop_rate >= MIN_FAILURE_RATE);
+        let stop_replies = read_set && context["stop_replies"].as_bool().unwrap_or(true);
+        let stops = stop_replies && (!budget || stop_rate >= MIN_FAILURE_RATE);
         if stops && acts {
             endings.push((Outcome::Stopped, stop_rate));
             if budget {
@@ -762,10 +919,58 @@ impl Speculation {
                 _ => None,
             })
             .collect();
-        let outcomes: Vec<Outcome> = std::iter::once(Outcome::Succeeded)
-            .chain(endings.into_iter().map(|(outcome, _)| outcome))
-            .filter(|outcome| !prepared(outcome))
-            .collect();
+        let length = if margin { Length::Brief } else { Length::Full };
+        // What each outcome's reply is expected to save, under the adaptive policy.
+        let mut savings = serde_json::Map::new();
+        let mut outcomes: Vec<(Outcome, Length)> = match (policy, estimates) {
+            (Policy::Adaptive, Some((left, own, writes))) => {
+                // A step fails only if every step before it succeeded; a stop
+                // comes at its own rate, and success has what is left.
+                let timings = timings();
+                let mut reached = 1.0;
+                let mut candidates: Vec<(Outcome, f64)> = steps
+                    .iter()
+                    .filter_map(|(index, op_id)| {
+                        let call = plan.nodes[*index as usize].call.as_ref()?;
+                        let rate = timings.experience.failure_rate(&called(call));
+                        let failed = reached * rate;
+                        reached *= 1.0 - rate;
+                        Some((Outcome::Failed(op_id.clone()), failed))
+                    })
+                    .collect();
+                let stop = if stop_replies && acts { stop_rate } else { 0.0 };
+                if stop > 0.0 {
+                    candidates.push((Outcome::Stopped, stop));
+                }
+                candidates.insert(0, (Outcome::Succeeded, reached * (1.0 - stop)));
+                let chosen = allocate(candidates, left, own, writes);
+                for (outcome, _, saving) in &chosen {
+                    savings.insert(outcome.label(), json!((saving * 10.0).round() / 10.0));
+                }
+                chosen
+                    .into_iter()
+                    .map(|(outcome, length, _)| (outcome, length))
+                    .collect()
+            }
+            (Policy::Current, _) => std::iter::once(Outcome::Succeeded)
+                .chain(endings.into_iter().map(|(outcome, _)| outcome))
+                .map(|outcome| (outcome, length))
+                .collect(),
+            // Failures and stops only on a tree long enough to write them.
+            _ => std::iter::once((Outcome::Succeeded, Length::Short))
+                .chain(
+                    endings
+                        .into_iter()
+                        .filter(|_| !short_tree)
+                        .map(|(outcome, _)| (outcome, length)),
+                )
+                .collect(),
+        };
+        outcomes.retain(|(outcome, _)| !prepared(outcome));
+        if policy != Policy::Current {
+            outcomes.truncate(spend(&task.task_id, outcomes.len()));
+        }
+        let short = outcomes.contains(&(Outcome::Succeeded, Length::Short));
         // Only a decision model reading the real results can choose between situations.
         let situations = DECISION_MODEL.is_some();
         let effort = context["prepared_effort"]
@@ -786,12 +991,19 @@ impl Speculation {
             margin,
             stops,
             objects: Arc::new(objects),
+            budget: (policy != Policy::Current).then(|| task.task_id.clone()),
         });
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
         let tau_success = tau("tau_success", tau_choice);
-        let lookahead = context["lookahead"].as_u64().unwrap_or(LOOKAHEAD);
+        // Further along the success path only once its own reply can be ready in time.
+        let lookahead = match policy {
+            Policy::Current => context["lookahead"].as_u64().unwrap_or(LOOKAHEAD),
+            Policy::Short => 1,
+            Policy::Adaptive if short => 1,
+            Policy::Adaptive => LOOKAHEAD,
+        };
         let tree = format!(
             "RTDL plan {} ({:?})",
             plan.plan_id, plan.nodes[0].description
@@ -816,15 +1028,16 @@ impl Speculation {
         );
         let started = Instant::now();
         let mut branches = outcomes
-            .into_iter()
-            .map(|outcome| {
+            .iter()
+            .map(|(outcome, length)| {
+                let outcome = outcome.clone();
                 let mut messages = prefix.clone();
                 let steps = match outcome {
                     Outcome::Stopped => &relied,
                     _ => &listed,
                 };
                 messages.push(Message::user(&hypothesis(
-                    &tree, steps, &outcome, situations, false, long, margin,
+                    &tree, steps, &outcome, situations, false, long, *length,
                 )));
                 // Failures are rare, so only the success path is prepared further along.
                 let ahead = if outcome == Outcome::Succeeded {
@@ -836,6 +1049,7 @@ impl Speculation {
                     request.clone(),
                     messages,
                     outcome.label(),
+                    *length,
                     ahead,
                     end,
                     None,
@@ -868,6 +1082,16 @@ impl Speculation {
                 "tau_success": tau_success,
                 "tau_done": tau_done,
                 "lookahead": lookahead,
+                "policy": format!("{policy:?}").to_lowercase(),
+                "lengths": outcomes
+                    .iter()
+                    .map(|(outcome, length)| (outcome.label(), json!(length.label())))
+                    .collect::<serde_json::Map<_, _>>(),
+                "savings_s": savings,
+                "estimates_ms": estimates.map(|(left, own, (full, short))| json!({
+                    "left": left.as_millis() as u64, "own": own.as_millis() as u64,
+                    "full": full.as_millis() as u64, "short": short.as_millis() as u64,
+                })),
             })
         );
         branches.extend(held);
@@ -893,6 +1117,7 @@ impl Speculation {
             go: None,
             expected,
             dispatched,
+            short,
         })
     }
 
@@ -1318,7 +1543,7 @@ impl Speculation {
         // A reply the round's own request beat took at least this long, which
         // the write-time estimate would miss if it counted finished replies only.
         if reason == "request answered first" {
-            timings().wrote(self.started.elapsed());
+            timings().wrote(self.started.elapsed(), self.short);
         }
         info!(
             "[pilot/segue] {}",
@@ -1327,6 +1552,7 @@ impl Speculation {
                 "plan_id": self.plan_id,
                 "reason": reason,
                 "outcome": self.ended.clone().flatten().map(|o| o.label()),
+                "since_start_ms": self.started.elapsed().as_millis() as u64,
                 "unfinished": self.branches.iter().filter(|b| !b.reply.is_finished()).count(),
             })
         );
@@ -1810,7 +2036,8 @@ pub(crate) fn replay(reply: String) -> BoxStream<'static, Result<VlmStreamItem>>
 /// situation the outcome could show. With `returned`, `listed` gives what each
 /// step returned when it was run ahead, so nothing about them is left to guess.
 /// With `long`, the tree leaves time to prepare a bold course and a careful
-/// one, so its success is not to be answered with a refusal to plan.
+/// one, so its success is not to be answered with a refusal to plan, unless
+/// `length` asks for the short form.
 fn hypothesis(
     tree: &str,
     listed: &str,
@@ -1818,7 +2045,7 @@ fn hypothesis(
     situations: bool,
     returned: bool,
     long: bool,
-    brief: bool,
+    length: Length,
 ) -> String {
     let ended = match outcome {
         Outcome::Succeeded => "finished successfully".to_string(),
@@ -1871,7 +2098,7 @@ fn hypothesis(
              picks the situation from Pilot's note, so do not answer NEEDS_RESULTS.",
             assume_nothing,
         ),
-        Outcome::Succeeded if long => (
+        Outcome::Succeeded if long && length != Length::Short => (
             "This plan runs long enough to prepare more than one course, so prepare two or \
              three situations rather than decline. First the bold one: what the outputs most \
              likely show, with a reply that carries the task as far from there as one tree can. \
@@ -1922,13 +2149,19 @@ fn hypothesis(
     };
     // Fewer situations make a shorter reply, but never none. A stop keeps up to
     // three, one per kind of change it may be.
-    let ask = match brief && *outcome != Outcome::Stopped {
-        true => ask
-            .replace("one to three situations", "one or two situations")
-            .replace("two or three situations", "two situations"),
-        false => ask.to_string(),
+    let (ask, brief) = match (length, outcome) {
+        (Length::Full, _) => (ask.to_string(), ""),
+        (_, Outcome::Stopped) => (ask.to_string(), BRIEF),
+        (Length::Brief, _) => (
+            ask.replace("one to three situations", "one or two situations")
+                .replace("two or three situations", "two situations"),
+            BRIEF,
+        ),
+        (Length::Short, _) => (
+            ask.replace("one to three situations", "only the likeliest situation"),
+            SHORT,
+        ),
     };
-    let brief = if brief { BRIEF } else { "" };
     format!(
         "Pilot speculation request (an assumption, not a new user message): assume {tree} has \
          just {ended}. Its steps:{listed}\n\
@@ -1963,6 +2196,27 @@ struct Request {
     stops: bool,
     /// The objects Scene knew, by region, in the state the requests are sent with.
     objects: Arc<Value>,
+    /// The task whose prepared requests are counted against `PREPARED_PER_TASK`,
+    /// under margin policies `short` and `adaptive`.
+    budget: Option<String>,
+}
+
+impl Request {
+    /// How much of a reply a request prepared ahead asks for.
+    fn length(&self) -> Length {
+        if self.margin {
+            Length::Brief
+        } else {
+            Length::Full
+        }
+    }
+
+    /// Whether one more prepared request fits the task's budget, taking it if so.
+    fn afford(&self) -> bool {
+        self.budget
+            .as_deref()
+            .is_none_or(|task| spend(task, 1) == 1)
+    }
 }
 
 /// When a request prepared ahead is due to start, and what wakes it sooner:
@@ -2084,14 +2338,16 @@ async fn read_ahead(reader: &Reader, reply: &Value) -> Option<Vec<Value>> {
     steps.iter().map(|index| returned.remove(index)).collect()
 }
 
-/// Write the reply for the outcome `label` names, once `wait` lets it start,
-/// then, while `ahead` trees further are allowed, the replies after the trees
-/// that reply would dispatch, which start from `from` as far as is known, once
-/// the tree this reply follows ends, expected by `due`.
+/// Write the reply for the outcome `label` names, asked at `length`, once
+/// `wait` lets it start, then, while `ahead` trees further are allowed, the
+/// replies after the trees that reply would dispatch, which start from `from`
+/// as far as is known, once the tree this reply follows ends, expected by `due`.
+#[allow(clippy::too_many_arguments)] // Each says something different about one request.
 fn prepare(
     request: Arc<Request>,
     messages: Vec<Message>,
     label: String,
+    length: Length,
     ahead: u64,
     from: Option<(f64, f64)>,
     wait: Option<Wait>,
@@ -2101,7 +2357,7 @@ fn prepare(
         if let Some(wait) = wait {
             until_due(wait).await;
         }
-        let text = generate(&request, messages.clone(), &label)
+        let text = generate(&request, messages.clone(), &label, length)
             .await
             .map_err(|error| {
                 warn!(
@@ -2282,6 +2538,9 @@ fn look_ahead(
         let label = format!("{label}/{index}");
         let mut branches = Vec::new();
         for (position, before) in early {
+            if !request.afford() {
+                break;
+            }
             let outcome = Outcome::Failed(steps[position].0.clone());
             let ask = hypothesis(
                 &tree,
@@ -2290,7 +2549,7 @@ fn look_ahead(
                 DECISION_MODEL.is_some(),
                 false,
                 false,
-                request.margin,
+                request.length(),
             );
             let mut messages = messages.clone();
             messages.push(Message::user(&ask));
@@ -2301,6 +2560,7 @@ fn look_ahead(
                     request.clone(),
                     messages,
                     label,
+                    request.length(),
                     0,
                     end,
                     wait,
@@ -2311,7 +2571,7 @@ fn look_ahead(
                 objects: request.objects.clone(),
             });
         }
-        if stop {
+        if stop && request.afford() {
             let args: String = nodes.iter().map(|node| node["args"].to_string()).collect();
             let navigations = steps
                 .iter()
@@ -2325,7 +2585,7 @@ fn look_ahead(
                 DECISION_MODEL.is_some(),
                 false,
                 false,
-                request.margin,
+                request.length(),
             );
             let mut messages = messages.clone();
             messages.push(Message::user(&ask));
@@ -2336,6 +2596,7 @@ fn look_ahead(
                     request.clone(),
                     messages,
                     label,
+                    request.length(),
                     0,
                     end,
                     wait,
@@ -2346,7 +2607,7 @@ fn look_ahead(
                 objects: request.objects.clone(),
             });
         }
-        if short || readable {
+        if (short || readable) && request.afford() {
             let objects = request.objects.clone();
             let (request, reply) = (request.clone(), reply.clone());
             // A tree read ahead runs now, whenever its reply is due.
@@ -2379,10 +2640,12 @@ fn look_ahead(
                     DECISION_MODEL.is_some(),
                     read.is_some(),
                     false,
-                    request.margin,
+                    request.length(),
                 );
                 messages.push(Message::user(&ask));
-                let prepared = prepare(request, messages, label, ahead, end, wait, due).await?;
+                let length = request.length();
+                let prepared =
+                    prepare(request, messages, label, length, ahead, end, wait, due).await?;
                 Ok(Prepared { read, ..prepared })
             });
             branches.push(Branch {
@@ -2410,7 +2673,12 @@ fn look_ahead(
 }
 
 /// Run one background request to completion and return its text.
-async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> Result<String> {
+async fn generate(
+    request: &Request,
+    messages: Vec<Message>,
+    outcome: &str,
+    length: Length,
+) -> Result<String> {
     let Request {
         vlm,
         shape,
@@ -2450,9 +2718,14 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
         if let Some(first) = first_token {
             smooth(&mut timings.first_text, first);
         }
-        smooth(&mut timings.reply, started.elapsed());
-        timings.wrote(requested.elapsed());
+        if length != Length::Short {
+            smooth(&mut timings.reply, started.elapsed());
+        }
+        timings.wrote(requested.elapsed(), length == Length::Short);
     }
+    // How closely the reply kept to the length it was asked in.
+    let written: Value = serde_json::from_str(&text).unwrap_or_default();
+    let situations = written["situations"].as_array();
     info!(
         "[pilot/segue] {}",
         json!({
@@ -2466,6 +2739,11 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
             "cached_input_tokens": usage.as_ref().and_then(|u| u.cached_tokens),
             "output_tokens": usage.as_ref().map(|u| u.completion_tokens),
             "needs_results": needs_results(&text),
+            "length": length.label(),
+            "situations": situations.map(Vec::len),
+            "steps": situations
+                .and_then(|s| s.first())
+                .map(|first| do_nodes(&first["reply"]["rtdl"]).len()),
         })
     );
     Ok(text)
@@ -2473,12 +2751,12 @@ async fn generate(request: &Request, messages: Vec<Message>, outcome: &str) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{Branch, Outcome, Prepared, Speculation};
+    use super::{Branch, Length, Outcome, Prepared, Speculation};
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
     use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState};
     use crate::planner::{RTDL_DO, RTDL_FALLBACK, RTDL_IF, RTDL_PARALLEL, RTDL_SEQUENCE};
     use std::collections::HashMap;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// A sequence `0` of three `do` steps `1..=3`, with one branch per outcome.
     fn three_steps() -> Speculation {
@@ -2538,6 +2816,7 @@ mod tests {
             go: None,
             expected: None,
             dispatched: Instant::now(),
+            short: false,
         }
     }
 
@@ -2756,6 +3035,67 @@ mod tests {
         assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), 0, false)));
     }
 
+    #[test]
+    fn allocation_asks_short_when_a_full_reply_would_come_too_late() {
+        let s = Duration::from_secs;
+        let candidates = || {
+            vec![
+                (Outcome::Succeeded, 0.8),
+                (Outcome::Failed("p-1".into()), 0.15),
+                (Outcome::Failed("p-2".into()), 0.01),
+            ]
+        };
+        // Ten seconds left and a full reply writes in eight: every reply in full,
+        // each saving its probability times the round's own nine seconds.
+        let roomy = super::allocate(candidates(), s(10), s(9), (s(8), s(4)));
+        let lengths: Vec<_> = roomy.iter().map(|(o, l, _)| (o.label(), *l)).collect();
+        assert_eq!(
+            lengths,
+            [
+                ("succeeded".into(), Length::Brief),
+                ("failed:p-1".into(), Length::Brief)
+            ]
+        );
+        assert!((roomy[0].2 - 7.2).abs() < 1e-9);
+        // Two seconds left: a full reply would be ready 6 s after the tree, a
+        // short one 2 s after, against the own request's nine.
+        let tight = super::allocate(candidates(), s(2), s(9), (s(8), s(4)));
+        assert_eq!(tight[0].1, Length::Short);
+        assert!((tight[0].2 - 0.8 * 7.0).abs() < 1e-9);
+        // A reply that cannot beat the own request saves nothing and is not sent.
+        assert!(super::allocate(candidates(), s(0), s(3), (s(20), s(12))).is_empty());
+    }
+
+    #[test]
+    fn a_task_spends_at_most_its_budget_of_prepared_requests() {
+        let budget = super::PREPARED_PER_TASK;
+        assert_eq!(super::spend("task-a", budget - 1), budget - 1);
+        assert_eq!(super::spend("task-a", 3), 1);
+        assert_eq!(super::spend("task-a", 1), 0);
+        assert_eq!(super::spend("task-b", 2), 2);
+    }
+
+    #[test]
+    fn the_short_form_asks_for_one_situation_naming_what_its_plan_relies_on() {
+        let short = |outcome, long| {
+            super::hypothesis("plan p", "", &outcome, true, false, long, Length::Short)
+        };
+        for long in [false, true] {
+            let ask = short(Outcome::Succeeded, long);
+            assert!(ask.contains("only the likeliest situation") && ask.contains(super::SHORT));
+            assert!(!ask.contains("bold"));
+        }
+        // A stop keeps one situation per kind of change.
+        let stop = short(Outcome::Stopped, false);
+        assert!(stop.contains("one to three situations") && !stop.contains(super::SHORT));
+        let context = serde_json::json!({"margin_policy": "adaptive"});
+        assert_eq!(super::Policy::of(&context), super::Policy::Adaptive);
+        assert_eq!(
+            super::Policy::of(&serde_json::json!({})),
+            super::Policy::Current
+        );
+    }
+
     #[tokio::test]
     async fn a_bare_reply_envelope_counts_as_a_lone_situation() {
         let reply = r#"{"content": "x", "rtdl": {"nodes": []}}"#;
@@ -2789,29 +3129,62 @@ mod tests {
     fn with_a_decision_model_every_outcome_asks_for_situations() {
         for outcome in [Outcome::Succeeded, Outcome::Failed("p-0".into())] {
             let ask = |situations| {
-                super::hypothesis("plan p", "", &outcome, situations, false, false, false)
+                super::hypothesis(
+                    "plan p",
+                    "",
+                    &outcome,
+                    situations,
+                    false,
+                    false,
+                    Length::Full,
+                )
             };
             assert!(ask(true).contains(r#"{"situations""#));
             assert!(!ask(false).contains("situations"));
         }
-        let read = super::hypothesis("plan p", "", &Outcome::Succeeded, true, true, false, false);
+        let read = super::hypothesis(
+            "plan p",
+            "",
+            &Outcome::Succeeded,
+            true,
+            true,
+            false,
+            Length::Full,
+        );
         assert!(read.contains(r#"{"when": "", "reply": ...}"#) && !read.contains("not known yet"));
     }
 
     #[test]
     fn a_long_tree_is_asked_for_a_bold_and_a_careful_course_on_success_only() {
-        let ask =
-            |outcome, long| super::hypothesis("plan p", "", &outcome, true, false, long, false);
+        let ask = |outcome, long| {
+            super::hypothesis("plan p", "", &outcome, true, false, long, Length::Full)
+        };
         assert!(ask(Outcome::Succeeded, true).contains("First the bold one"));
         assert!(!ask(Outcome::Succeeded, false).contains("First the bold one"));
         assert!(!ask(Outcome::Failed("p-0".into()), true).contains("First the bold one"));
         // Margin scheduling asks for replies short enough to be written in time,
         // with one or two situations, never none.
-        let brief = super::hypothesis("plan p", "", &Outcome::Succeeded, true, false, false, true);
+        let brief = super::hypothesis(
+            "plan p",
+            "",
+            &Outcome::Succeeded,
+            true,
+            false,
+            false,
+            Length::Brief,
+        );
         assert!(brief.contains("one or two situations") && brief.contains("in a few words"));
         assert!(ask(Outcome::Succeeded, false).contains("one to three situations"));
         // A stop keeps one situation per kind of change it may be.
-        let stop = super::hypothesis("plan p", "", &Outcome::Stopped, true, false, false, true);
+        let stop = super::hypothesis(
+            "plan p",
+            "",
+            &Outcome::Stopped,
+            true,
+            false,
+            false,
+            Length::Brief,
+        );
         assert!(stop.contains("one to three situations") && stop.contains("in a few words"));
     }
 
