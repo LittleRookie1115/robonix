@@ -84,10 +84,13 @@ const MARGIN_SLACK: Duration = Duration::from_secs(2);
 const WRITES_KEPT: usize = 32;
 
 /// Prepared requests one task may send under margin policies `short` and
-/// `adaptive`, so that the two compare at the same cost: about twice what the
-/// `current` policy sent a GPSR command on average, and above what it sent
-/// nine commands in ten.
+/// `adaptive` unless its `prepared_budget` says otherwise, so that the two
+/// compare at the same cost: about twice what the `current` policy sent a GPSR
+/// command on average, and above what it sent nine commands in ten.
 const PREPARED_PER_TASK: usize = 12;
+
+/// Trees a task is taken to run before any task has finished in this process.
+const TREES_PER_TASK: f64 = 4.0;
 
 /// Least planner wait, in seconds, a request must be expected to save for the
 /// `adaptive` margin policy to send it.
@@ -133,9 +136,6 @@ struct Timings {
     /// How long recent prepared replies took from their request to their last
     /// word, waiting for a request slot included.
     writes: std::collections::VecDeque<Duration>,
-    /// The same for replies asked in the short form, one situation and the
-    /// shortest plan that carries on.
-    short_writes: std::collections::VecDeque<Duration>,
     /// About how long a round takes from its start to its first step when its
     /// own request, not a prepared reply, serves it.
     answered: Option<Duration>,
@@ -153,24 +153,18 @@ impl Timings {
         }
     }
 
-    /// The median write times of full and short replies, which the `adaptive`
-    /// policy weighs expected savings by; a short one is taken as half a full
-    /// one until three are seen.
-    fn typical_writes(&self) -> Option<(Duration, Duration)> {
-        let full = quantile(&self.writes, 0.5).or(self.reply)?;
-        Some((full, quantile(&self.short_writes, 0.5).unwrap_or(full / 2)))
+    /// The median write time of a prepared reply, which the `adaptive` policy
+    /// weighs expected savings by.
+    fn typical_write(&self) -> Option<Duration> {
+        quantile(&self.writes, 0.5).or(self.reply)
     }
 
     /// Keep `took`, how long a prepared reply took to write, or at least took.
-    fn wrote(&mut self, took: Duration, short: bool) {
-        let writes = match short {
-            true => &mut self.short_writes,
-            false => &mut self.writes,
-        };
-        if writes.len() == WRITES_KEPT {
-            writes.pop_front();
+    fn wrote(&mut self, took: Duration) {
+        if self.writes.len() == WRITES_KEPT {
+            self.writes.pop_front();
         }
-        writes.push_back(took);
+        self.writes.push_back(took);
     }
 
     /// `run`, what a tree's steps are expected to take, scaled by the share of
@@ -650,8 +644,8 @@ pub(crate) struct Speculation {
     expected: Option<Duration>,
     /// When the tree was dispatched.
     dispatched: Instant,
-    /// Whether the success reply was asked in the short form, which a reply
-    /// the round's own request beat counts toward the write time of.
+    /// Whether the success reply was asked in the short form, whose write time
+    /// a reply the round's own request beat says nothing about.
     short: bool,
 }
 
@@ -751,43 +745,79 @@ impl Length {
     }
 }
 
-/// Take up to `wanted` of `task`'s prepared requests, `PREPARED_PER_TASK` a
-/// task, and return how many it got.
-fn spend(task: &str, wanted: usize) -> usize {
-    static SPENT: Mutex<(String, usize)> = Mutex::new((String::new(), 0));
-    let mut spent = SPENT.lock().unwrap_or_else(PoisonError::into_inner);
-    if spent.0 != task {
-        *spent = (task.to_string(), 0);
+/// What the running task has spent of its prepared-request budget.
+#[derive(Default)]
+struct Spending {
+    /// The task, by id.
+    task: String,
+    /// Prepared requests it has sent.
+    spent: usize,
+    /// Trees it has started speculating on.
+    trees: usize,
+    /// Trees per task over the tasks this process finished, as a running mean
+    /// with the count it is over.
+    per_task: Option<(f64, u32)>,
+}
+
+static SPENDING: LazyLock<Mutex<Spending>> = LazyLock::new(Default::default);
+
+fn spending() -> std::sync::MutexGuard<'static, Spending> {
+    SPENDING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Spending {
+    /// Move on to `task` if it is a new one, folding the last one's trees into
+    /// the mean.
+    fn of(&mut self, task: &str) -> &mut Self {
+        if self.task != task {
+            if !self.task.is_empty() {
+                let trees = self.trees as f64;
+                self.per_task = Some(match self.per_task {
+                    Some((mean, n)) => ((mean * f64::from(n) + trees) / f64::from(n + 1), n + 1),
+                    None => (trees, 1),
+                });
+            }
+            self.task = task.to_string();
+            (self.spent, self.trees) = (0, 0);
+        }
+        self
     }
-    let got = wanted.min(PREPARED_PER_TASK.saturating_sub(spent.1));
-    spent.1 += got;
+
+    /// How many requests to hold back for the success replies of the trees
+    /// the task is expected to run after the one starting now.
+    fn reserve(&self) -> usize {
+        let expected = self.per_task.map_or(TREES_PER_TASK, |(mean, _)| mean);
+        (expected - self.trees as f64).ceil().max(0.0) as usize
+    }
+}
+
+/// Take up to `wanted` of `task`'s `cap` prepared requests, beyond the `keep`
+/// held back, and return how many it got.
+fn spend(task: &str, wanted: usize, cap: usize, keep: usize) -> usize {
+    let mut spending = spending();
+    let spending = spending.of(task);
+    let got = wanted.min(cap.saturating_sub(spending.spent + keep));
+    spending.spent += got;
     got
 }
 
-/// The outcomes worth a request, best first, with the length to ask each in and
-/// the planner wait, in seconds, its reply is expected to save: its probability
-/// times how much sooner than the round's own request (`own` after the tree
-/// ends, `left` from now) it would be ready. A reply is asked in full if it can
-/// be written before it is needed, else short.
+/// The outcomes worth a request, best first, with the planner wait, in seconds,
+/// its reply is expected to save: its probability times how much sooner than
+/// the round's own request (`own` after the tree ends, `left` from now) a reply
+/// taking `write` would be ready.
 fn allocate(
     candidates: Vec<(Outcome, f64)>,
     left: Duration,
     own: Duration,
-    (full, short): (Duration, Duration),
-) -> Vec<(Outcome, Length, f64)> {
-    let length = if full <= left {
-        Length::Brief
-    } else {
-        Length::Short
-    };
-    let write = if length == Length::Brief { full } else { short };
+    write: Duration,
+) -> Vec<(Outcome, f64)> {
     let sooner = (left + own).saturating_sub(write).min(own).as_secs_f64();
-    let mut chosen: Vec<(Outcome, Length, f64)> = candidates
+    let mut chosen: Vec<(Outcome, f64)> = candidates
         .into_iter()
-        .map(|(outcome, p)| (outcome, length, p * sooner))
-        .filter(|(_, _, saving)| *saving >= MIN_SAVING_S)
+        .map(|(outcome, p)| (outcome, p * sooner))
+        .filter(|(_, saving)| *saving >= MIN_SAVING_S)
         .collect();
-    chosen.sort_by(|a, b| b.2.total_cmp(&a.2));
+    chosen.sort_by(|a, b| b.1.total_cmp(&a.1));
     chosen.truncate(MAX_BRANCHES);
     chosen
 }
@@ -867,8 +897,8 @@ impl Speculation {
             let left = due.map(|due| due.saturating_duration_since(Instant::now()));
             estimates = left
                 .zip(timings.answered)
-                .zip(timings.typical_writes())
-                .map(|((left, own), writes)| (left, own, writes));
+                .zip(timings.typical_write())
+                .map(|((left, own), write)| (left, own, write));
             if let Some(run) = run
                 && let (Some(first_text), Some(reply)) = (timings.first_text, write)
                 && short_tree
@@ -932,7 +962,7 @@ impl Speculation {
         // What each outcome's reply is expected to save, under the adaptive policy.
         let mut savings = serde_json::Map::new();
         let mut outcomes: Vec<(Outcome, Length)> = match (policy, estimates) {
-            (Policy::Adaptive, Some((left, own, writes))) => {
+            (Policy::Adaptive, Some((left, own, write))) => {
                 // A step fails only if every step before it succeeded; a stop
                 // comes at its own rate, and success has what is left.
                 let timings = timings();
@@ -952,13 +982,13 @@ impl Speculation {
                     candidates.push((Outcome::Stopped, stop));
                 }
                 candidates.insert(0, (Outcome::Succeeded, reached * (1.0 - stop)));
-                let chosen = allocate(candidates, left, own, writes);
-                for (outcome, _, saving) in &chosen {
+                let chosen = allocate(candidates, left, own, write);
+                for (outcome, saving) in &chosen {
                     savings.insert(outcome.label(), json!((saving * 10.0).round() / 10.0));
                 }
                 chosen
                     .into_iter()
-                    .map(|(outcome, length, _)| (outcome, length))
+                    .map(|(outcome, _)| (outcome, length))
                     .collect()
             }
             (Policy::Current, _) => std::iter::once(Outcome::Succeeded)
@@ -976,8 +1006,29 @@ impl Speculation {
                 .collect(),
         };
         outcomes.retain(|(outcome, _)| !prepared(outcome));
-        if policy != Policy::Current {
-            outcomes.truncate(spend(&task.task_id, outcomes.len()));
+        // A budget caps a task's prepared requests; the adaptive policy spends
+        // past its best request only what the trees still expected leave over.
+        let cap = context["prepared_budget"]
+            .as_u64()
+            .map(|cap| cap as usize)
+            .or((policy != Policy::Current).then_some(PREPARED_PER_TASK));
+        let (keep, budget_left) = match cap {
+            Some(cap) => {
+                let mut spending = spending();
+                let spending = spending.of(&task.task_id);
+                spending.trees += 1;
+                let keep = match policy {
+                    Policy::Adaptive => spending.reserve(),
+                    _ => 0,
+                };
+                (keep, Some(cap.saturating_sub(spending.spent)))
+            }
+            None => (0, None),
+        };
+        if let Some(cap) = cap {
+            let best = spend(&task.task_id, outcomes.len().min(1), cap, 0);
+            let rest = spend(&task.task_id, outcomes.len().saturating_sub(1), cap, keep);
+            outcomes.truncate(best + rest);
         }
         let short = outcomes.contains(&(Outcome::Succeeded, Length::Short));
         // Only a decision model reading the real results can choose between situations.
@@ -1000,7 +1051,7 @@ impl Speculation {
             margin,
             stops,
             objects: Arc::new(objects),
-            budget: (policy != Policy::Current).then(|| task.task_id.clone()),
+            budget: cap.map(|cap| (task.task_id.clone(), cap, keep)),
         });
         let tau =
             |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
@@ -1097,9 +1148,11 @@ impl Speculation {
                     .map(|(outcome, length)| (outcome.label(), json!(length.label())))
                     .collect::<serde_json::Map<_, _>>(),
                 "savings_s": savings,
-                "estimates_ms": estimates.map(|(left, own, (full, short))| json!({
+                "budget_left": budget_left,
+                "held_back": keep,
+                "estimates_ms": estimates.map(|(left, own, write)| json!({
                     "left": left.as_millis() as u64, "own": own.as_millis() as u64,
-                    "full": full.as_millis() as u64, "short": short.as_millis() as u64,
+                    "write": write.as_millis() as u64,
                 })),
             })
         );
@@ -1551,8 +1604,8 @@ impl Speculation {
     pub(crate) fn discard(self, reason: &str) {
         // A reply the round's own request beat took at least this long, which
         // the write-time estimate would miss if it counted finished replies only.
-        if reason == "request answered first" {
-            timings().wrote(self.started.elapsed(), self.short);
+        if reason == "request answered first" && !self.short {
+            timings().wrote(self.started.elapsed());
         }
         info!(
             "[pilot/segue] {}",
@@ -2205,9 +2258,9 @@ struct Request {
     stops: bool,
     /// The objects Scene knew, by region, in the state the requests are sent with.
     objects: Arc<Value>,
-    /// The task whose prepared requests are counted against `PREPARED_PER_TASK`,
-    /// under margin policies `short` and `adaptive`.
-    budget: Option<String>,
+    /// The task whose prepared requests are counted against a budget, the
+    /// budget, and how many of it to hold back for the task's later trees.
+    budget: Option<(String, usize, usize)>,
 }
 
 impl Request {
@@ -2223,8 +2276,8 @@ impl Request {
     /// Whether one more prepared request fits the task's budget, taking it if so.
     fn afford(&self) -> bool {
         self.budget
-            .as_deref()
-            .is_none_or(|task| spend(task, 1) == 1)
+            .as_ref()
+            .is_none_or(|(task, cap, keep)| spend(task, 1, *cap, *keep) == 1)
     }
 }
 
@@ -2727,10 +2780,11 @@ async fn generate(
         if let Some(first) = first_token {
             smooth(&mut timings.first_text, first);
         }
+        // A short reply says nothing about how long a full one takes.
         if length != Length::Short {
             smooth(&mut timings.reply, started.elapsed());
+            timings.wrote(requested.elapsed());
         }
-        timings.wrote(requested.elapsed(), length == Length::Short);
     }
     // How closely the reply kept to the length it was asked in.
     let written: Value = serde_json::from_str(&text).unwrap_or_default();
@@ -3045,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_asks_short_when_a_full_reply_would_come_too_late() {
+    fn allocation_ranks_outcomes_by_the_wait_their_replies_save() {
         let s = Duration::from_secs;
         let candidates = || {
             vec![
@@ -3054,34 +3108,34 @@ mod tests {
                 (Outcome::Failed("p-2".into()), 0.01),
             ]
         };
-        // Ten seconds left and a full reply writes in eight: every reply in full,
-        // each saving its probability times the round's own nine seconds.
-        let roomy = super::allocate(candidates(), s(10), s(9), (s(8), s(4)));
-        let lengths: Vec<_> = roomy.iter().map(|(o, l, _)| (o.label(), *l)).collect();
-        assert_eq!(
-            lengths,
-            [
-                ("succeeded".into(), Length::Brief),
-                ("failed:p-1".into(), Length::Brief)
-            ]
-        );
-        assert!((roomy[0].2 - 7.2).abs() < 1e-9);
-        // Two seconds left: a full reply would be ready 6 s after the tree, a
-        // short one 2 s after, against the own request's nine.
-        let tight = super::allocate(candidates(), s(2), s(9), (s(8), s(4)));
-        assert_eq!(tight[0].1, Length::Short);
-        assert!((tight[0].2 - 0.8 * 7.0).abs() < 1e-9);
+        // Ten seconds left and a reply writes in eight: each saves its
+        // probability times the round's own nine seconds, the rarest too little.
+        let roomy = super::allocate(candidates(), s(10), s(9), s(8));
+        let labels: Vec<_> = roomy.iter().map(|(o, _)| o.label()).collect();
+        assert_eq!(labels, ["succeeded", "failed:p-1"]);
+        assert!((roomy[0].1 - 7.2).abs() < 1e-9);
+        // Two seconds left: the reply would be ready 6 s after the tree, three
+        // before the own request.
+        let tight = super::allocate(candidates(), s(2), s(9), s(8));
+        assert!((tight[0].1 - 0.8 * 3.0).abs() < 1e-9);
         // A reply that cannot beat the own request saves nothing and is not sent.
-        assert!(super::allocate(candidates(), s(0), s(3), (s(20), s(12))).is_empty());
+        assert!(super::allocate(candidates(), s(0), s(3), s(20)).is_empty());
     }
 
     #[test]
-    fn a_task_spends_at_most_its_budget_of_prepared_requests() {
-        let budget = super::PREPARED_PER_TASK;
-        assert_eq!(super::spend("task-a", budget - 1), budget - 1);
-        assert_eq!(super::spend("task-a", 3), 1);
-        assert_eq!(super::spend("task-a", 1), 0);
-        assert_eq!(super::spend("task-b", 2), 2);
+    fn a_task_spends_at_most_its_budget_and_holds_back_for_later_trees() {
+        assert_eq!(super::spend("task-a", 2, 4, 0), 2);
+        // With one request held back, one of the three asked for fits.
+        assert_eq!(super::spend("task-a", 3, 4, 1), 1);
+        assert_eq!(super::spend("task-a", 1, 4, 0), 1);
+        assert_eq!(super::spend("task-a", 1, 4, 0), 0);
+        assert_eq!(super::spend("task-b", 2, 4, 0), 2);
+        // After a task of three trees, a task one tree in holds back two.
+        let mut spending = super::Spending::default();
+        spending.of("a").trees = 3;
+        spending.of("b").trees = 1;
+        assert_eq!(spending.per_task, Some((3.0, 1)));
+        assert_eq!(spending.reserve(), 2);
     }
 
     #[test]
