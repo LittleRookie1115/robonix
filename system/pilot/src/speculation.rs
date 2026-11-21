@@ -1375,7 +1375,9 @@ fn renamed(mut reply: String, renames: &[(String, String)]) -> String {
 
 /// The reply prepared for the situation the decision model finds in `state`,
 /// that situation's index, and whether the model picked it: a lone situation
-/// with an empty `when` was written for the whole outcome and needs no pick.
+/// with an empty `when` was written for the whole outcome and needs no pick,
+/// and so does a bare reply envelope, which some planners send instead of
+/// listing situations.
 async fn situation(
     plan_id: &str,
     reply: &str,
@@ -1390,6 +1392,9 @@ async fn situation(
         .flatten()
         .map(|(k, _)| k.clone())
         .collect();
+    if reply.get("situations").is_none() && reply.get("rtdl").is_some() {
+        return Ok((reply.to_string(), 0, false));
+    }
     let situations = reply
         .get_mut("situations")
         .and_then(Value::as_array_mut)
@@ -2740,6 +2745,25 @@ mod tests {
         let settled =
             super::situation("p", reply, serde_json::json!({}), 1.0, &Default::default()).await;
         assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), 0, false)));
+    }
+
+    #[tokio::test]
+    async fn a_bare_reply_envelope_counts_as_a_lone_situation() {
+        let reply = r#"{"content": "x", "rtdl": {"nodes": []}}"#;
+        let settled =
+            super::situation("p", reply, serde_json::json!({}), 1.0, &Default::default()).await;
+        assert_eq!(
+            settled,
+            Ok((
+                r#"{"content":"x","rtdl":{"nodes":[]}}"#.to_string(),
+                0,
+                false
+            ))
+        );
+        let empty = r#"{"content": "x"}"#;
+        let settled =
+            super::situation("p", empty, serde_json::json!({}), 1.0, &Default::default()).await;
+        assert!(settled.is_err());
     }
 
     #[test]
