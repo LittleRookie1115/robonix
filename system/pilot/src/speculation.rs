@@ -84,8 +84,10 @@ const MARGIN_SLACK: Duration = Duration::from_secs(2);
 const WRITES_KEPT: usize = 32;
 
 /// Prepared requests one task may send under margin policies `short` and
-/// `adaptive`, so that the two compare at the same cost.
-const PREPARED_PER_TASK: usize = 8;
+/// `adaptive`, so that the two compare at the same cost: about twice what the
+/// `current` policy sent a GPSR command on average, and above what it sent
+/// nine commands in ten.
+const PREPARED_PER_TASK: usize = 12;
 
 /// Least planner wait, in seconds, a request must be expected to save for the
 /// `adaptive` margin policy to send it.
@@ -145,19 +147,18 @@ impl Timings {
     /// reply that comes too late is no use; otherwise the smoothed time once a
     /// slot is held.
     fn write_time(&self, margin: bool) -> Option<Duration> {
-        if margin && self.writes.len() >= 3 {
-            let mut seen: Vec<Duration> = self.writes.iter().copied().collect();
-            seen.sort();
-            return seen.get((seen.len() * 9).div_ceil(10) - 1).copied();
+        match margin {
+            true => quantile(&self.writes, 0.9).or(self.reply),
+            false => self.reply,
         }
-        self.reply
     }
 
-    /// The 90th percentile of recent short-form write times, once there are three.
-    fn short_write_time(&self) -> Option<Duration> {
-        let mut seen: Vec<Duration> = self.short_writes.iter().copied().collect();
-        seen.sort();
-        (seen.len() >= 3).then(|| seen[(seen.len() * 9).div_ceil(10) - 1])
+    /// The median write times of full and short replies, which the `adaptive`
+    /// policy weighs expected savings by; a short one is taken as half a full
+    /// one until three are seen.
+    fn typical_writes(&self) -> Option<(Duration, Duration)> {
+        let full = quantile(&self.writes, 0.5).or(self.reply)?;
+        Some((full, quantile(&self.short_writes, 0.5).unwrap_or(full / 2)))
     }
 
     /// Keep `took`, how long a prepared reply took to write, or at least took.
@@ -200,6 +201,14 @@ impl Timings {
             .map(|(capability, _)| self.calls.get(capability));
         (longest.sum(), None)
     }
+}
+
+/// The `q` quantile of `times`, once there are three.
+fn quantile(times: &std::collections::VecDeque<Duration>, q: f64) -> Option<Duration> {
+    let mut seen: Vec<Duration> = times.iter().copied().collect();
+    seen.sort();
+    let rank = (seen.len() as f64 * q).ceil() as usize;
+    (seen.len() >= 3).then(|| seen[rank.max(1) - 1])
 }
 
 static TIMINGS: LazyLock<Mutex<Timings>> = LazyLock::new(|| {
@@ -855,10 +864,9 @@ impl Speculation {
                 .zip(write)
                 .is_some_and(|((run, first_text), reply)| run + first_text < reply);
             let left = due.map(|due| due.saturating_duration_since(Instant::now()));
-            let short = write.map(|full| timings.short_write_time().unwrap_or(full / 2));
             estimates = left
                 .zip(timings.answered)
-                .zip(write.zip(short))
+                .zip(timings.typical_writes())
                 .map(|((left, own), writes)| (left, own, writes));
             if let Some(run) = run
                 && let (Some(first_text), Some(reply)) = (timings.first_text, write)
