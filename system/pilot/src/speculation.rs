@@ -1392,7 +1392,16 @@ async fn situation(
         .flatten()
         .map(|(k, _)| k.clone())
         .collect();
-    if reply.get("situations").is_none() && reply.get("rtdl").is_some() {
+    // Some planners nest the situations in the envelope's text instead.
+    if reply.get("situations").is_none()
+        && let Some(inner) = reply["content"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(|inner| inner.get("situations").is_some())
+    {
+        reply = inner;
+    }
+    if reply.get("situations").is_none() && reply["rtdl"].is_object() {
         return Ok((reply.to_string(), 0, false));
     }
     let situations = reply
@@ -2760,10 +2769,20 @@ mod tests {
                 false
             ))
         );
-        let empty = r#"{"content": "x"}"#;
+        for empty in [r#"{"content": "x"}"#, r#"{"content": "x", "rtdl": null}"#] {
+            let settled =
+                super::situation("p", empty, serde_json::json!({}), 1.0, &Default::default()).await;
+            assert!(settled.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn situations_nested_in_an_envelopes_text_are_unwrapped() {
+        let inner = r#"{"situations": [{"when": "", "reply": {"content": "y"}}]}"#;
+        let reply = serde_json::json!({"content": inner, "rtdl": null}).to_string();
         let settled =
-            super::situation("p", empty, serde_json::json!({}), 1.0, &Default::default()).await;
-        assert!(settled.is_err());
+            super::situation("p", &reply, serde_json::json!({}), 1.0, &Default::default()).await;
+        assert_eq!(settled, Ok((r#"{"content":"y"}"#.to_string(), 0, false)));
     }
 
     #[test]
