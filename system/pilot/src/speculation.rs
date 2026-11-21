@@ -385,14 +385,15 @@ const BRIEF: &str = "Put the likeliest situation first. Write each RTDL node's d
                      few words and each reply's `content` in one sentence, since Pilot uses a \
                      prepared reply only if it is written before the plan ends. ";
 
-/// What the short form asks of a prepared reply: one plan, no longer than it
-/// takes to keep the robot moving, so that it is written before the plan ends.
-const SHORT: &str = "Give exactly one situation. Its `when` names every fact its reply's steps \
-                     rely on, such as which object, who receives it and where that person is, or \
-                     which place, so that each can be checked against the outputs. Its reply is \
-                     the shortest plan that keeps the robot doing the right next thing, at most \
-                     two steps, with each RTDL node's description in a few words and `content` in \
-                     one sentence; the rest is planned while those steps run. ";
+/// What the short form asks of a prepared reply: the likeliest situation only,
+/// with its complete reply, so that it is written before the plan ends. Fewer
+/// steps would not shorten it as much, and would leave the rest of the task to
+/// another round.
+const SHORT: &str = "Give exactly one situation, the likeliest. Its `when` names every fact its \
+                     reply's steps rely on, such as which object, who receives it and where that \
+                     person is, or which place, so that each can be checked against the outputs. \
+                     Its reply is the complete reply for that situation, with each RTDL node's \
+                     description in a few words and `content` in one sentence. ";
 
 const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene's object list \
      may show although these steps' outputs do not name it, for example because a search by a \
@@ -735,8 +736,8 @@ enum Length {
     Full,
     /// Fewer situations, likeliest first, with short descriptions.
     Brief,
-    /// One situation whose `when` names every fact its reply relies on, with
-    /// the shortest plan that keeps the robot doing the right next thing.
+    /// One situation, the likeliest, whose `when` names every fact its
+    /// complete reply relies on.
     Short,
 }
 
