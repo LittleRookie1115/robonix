@@ -2520,9 +2520,12 @@ fn look_ahead(
         }
         // A tree that only reads is short whatever was timed, and can run now.
         let readable = reads_only(&reply["rtdl"], &request.reads);
+        // Beyond a failure's or stop's reply only the success of the tree it
+        // dispatches is prepared: a further failure or stop is rarer still.
+        let branch = !label.starts_with(Outcome::Succeeded.label().as_str());
         // A stop comes once the robot sees the change, often while the tree's
         // first navigation runs, before a reply asked for at its dispatch is written.
-        let stop = request.stops && request.margin && !readable;
+        let stop = !branch && request.stops && request.margin && !readable;
         let ((run, end), first, write, early) = {
             let timings = timings();
             let write = timings.write_time(request.margin);
@@ -2541,6 +2544,7 @@ fn look_ahead(
                 early.then_some((position, before))
             };
             let early: Vec<(usize, Option<Duration>)> = (0..nodes.len())
+                .filter(|_| !branch)
                 .filter_map(fails_early)
                 .take(MAX_BRANCHES - 1 - usize::from(stop))
                 .collect();
