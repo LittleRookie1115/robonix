@@ -1060,6 +1060,9 @@ impl Speculation {
         let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
         let tau_success = tau("tau_success", tau_choice);
         // Further along the success path only once its own reply can be ready in time.
+        // Whether a failure's or a stop's reply may prepare one tree further, the
+        // task's `lookahead_branches`.
+        let branches_ahead = context["lookahead_branches"].as_bool().unwrap_or(false);
         let lookahead = match policy {
             Policy::Current => context["lookahead"].as_u64().unwrap_or(LOOKAHEAD),
             Policy::Short => 1,
@@ -1101,11 +1104,14 @@ impl Speculation {
                 messages.push(Message::user(&hypothesis(
                     &tree, steps, &outcome, situations, false, long, *length,
                 )));
-                // Failures are rare, so only the success path is prepared further along.
-                let ahead = if outcome == Outcome::Succeeded {
-                    lookahead.saturating_sub(1)
-                } else {
-                    0
+                // Failures are rare, so only the success path is prepared further
+                // along, unless a failure's or stop's reply may be too: one tree,
+                // asked as soon as that reply is written, since a failure or stop
+                // comes before the tree's expected end.
+                let (ahead, due) = match outcome {
+                    Outcome::Succeeded => (lookahead.saturating_sub(1), due),
+                    _ if branches_ahead => (1, None),
+                    _ => (0, due),
                 };
                 let reply = tokio::spawn(prepare(
                     request.clone(),
