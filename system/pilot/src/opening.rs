@@ -370,24 +370,30 @@ fn there(at: Option<(f64, f64)>, position: &Value) -> bool {
 /// Objects and people a later round's next step may go to: people, then the
 /// objects whose label the task names, each as the question names it (with its
 /// region from the state view's `objects`) and its Scene id; none the robot at
-/// `at` is already beside, by Scene's `poses`.
+/// `at` is already beside, by Scene's `poses`, and one per name, the nearest:
+/// options the question names alike split the decision model's confidence.
 pub(crate) fn named_objects(
     task: &str,
     objects: &Value,
     poses: &Value,
     at: Option<(f64, f64)>,
 ) -> Vec<(String, String)> {
-    let beside = |id: &str| {
-        let pose = poses
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|pose| pose["id"] == id);
-        pose.is_some_and(|pose| there(at, pose))
+    let pose = |id: &str| {
+        let poses = poses.as_array().into_iter().flatten();
+        poses.into_iter().find(|pose| pose["id"] == id)
+    };
+    let beside = |id: &str| pose(id).is_some_and(|pose| there(at, pose));
+    // How far the robot has to go, unknown last.
+    let away = |id: &str| -> f64 {
+        let xy = pose(id).and_then(|pose| Some((pose["x"].as_f64()?, pose["y"].as_f64()?)));
+        match (at, xy) {
+            (Some((x, y)), Some((px, py))) => (px - x).hypot(py - y),
+            _ => f64::MAX,
+        }
     };
     let words = |text: &str| -> String { text.to_lowercase().replace(['_', '-'], " ") };
     let task = words(task);
-    let mut found: Vec<(bool, String, String)> = Vec::new();
+    let mut found: Vec<(bool, f64, String, String)> = Vec::new();
     for (region, listed) in objects.as_object().into_iter().flatten() {
         for object in listed.as_array().into_iter().flatten() {
             let (Some(label), Some(id)) = (object["label"].as_str(), object["id"].as_str()) else {
@@ -396,14 +402,16 @@ pub(crate) fn named_objects(
             let person = label == "person";
             if (person || task.contains(&words(label))) && !beside(id) {
                 let named = format!("the {} in {region}", words(label));
-                found.push((!person, named, id.to_string()));
+                found.push((!person, away(id), named, id.to_string()));
             }
         }
     }
-    found.sort_by_key(|(object, _, _)| *object);
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut named: HashSet<String> = HashSet::new();
     found
         .into_iter()
-        .map(|(_, named, id)| (named, id))
+        .filter(|(_, _, name, _)| named.insert(name.clone()))
+        .map(|(_, _, name, id)| (name, id))
         .collect()
 }
 
@@ -503,6 +511,13 @@ mod tests {
                 ("the person in kitchen".to_string(), "p1".to_string()),
                 ("the red bull in kitchen".to_string(), "o1".to_string())
             ]
+        );
+        // Two people in one room are offered once, the nearer.
+        let two = json!({"kitchen": [{"id": "far", "label": "person"}, {"id": "near", "label": "person"}]});
+        let at = json!([{"id": "far", "x": 9.0, "y": 0.0}, {"id": "near", "x": 4.0, "y": 0.0}]);
+        assert_eq!(
+            super::named_objects("t", &two, &at, Some((0.0, 0.0))),
+            [("the person in kitchen".to_string(), "near".to_string())]
         );
         // A person the robot stands beside is not offered.
         let beside = json!({"bedroom": [{"id": "p2", "label": "person"}]});
