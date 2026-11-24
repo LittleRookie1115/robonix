@@ -31,6 +31,12 @@ use tonic::transport::Channel;
 /// picks were right 7 times in 7 at 0.56 to 0.78; not calibrated.
 pub(crate) const TAU_OPEN: f64 = 0.65;
 
+/// The same for a move at a later round, unless the task's `tau_handoff` says
+/// otherwise. The decision model is less sure mid-task: in a smoke its picks of
+/// the instruction point were right four times in five at 0.43 to 0.81, and a
+/// round waited 7 to 13 s for the plan's navigate.
+pub(crate) const TAU_HANDOFF: f64 = 0.5;
+
 /// Longest the decision model may take for the move to be worth starting: the
 /// plan's first step usually comes about six seconds after the task.
 const ANSWER_WITHIN: Duration = Duration::from_secs(3);

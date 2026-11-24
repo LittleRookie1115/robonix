@@ -2032,9 +2032,14 @@ pub async fn run_turn(
                 .filter_map(|c| c.as_str())
                 .map(String::from)
                 .collect();
-            let tau = context["tau_open"]
-                .as_f64()
-                .unwrap_or(crate::opening::TAU_OPEN);
+            let tau = match done {
+                None => context["tau_open"]
+                    .as_f64()
+                    .unwrap_or(crate::opening::TAU_OPEN),
+                Some(_) => context["tau_handoff"]
+                    .as_f64()
+                    .unwrap_or(crate::opening::TAU_HANDOFF),
+            };
             crate::opening::Opening::start(
                 &task.text,
                 done,
