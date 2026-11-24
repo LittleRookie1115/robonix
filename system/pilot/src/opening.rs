@@ -346,7 +346,7 @@ pub(crate) fn named_objects(task: &str, objects: &Value) -> Vec<(String, String)
             }
         }
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by_key(|(object, _, _)| *object);
     found
         .into_iter()
         .map(|(_, named, id)| (named, id))
@@ -530,9 +530,11 @@ mod tests {
             ("nav2".into(), "robonix/service/navigation/navigate".into()),
         );
         let goal = json!({"header": {"frame_id": "map"}, "pose": {"position": {"x": 1.0}}});
-        let reply = super::toward("navigation_navigate", "kitchen", &goal);
-        let plan = crate::speculation::own_plan(&targets, &reply, "opening-1".into())
-            .expect("the move parses");
+        let place = super::Goal::Place(goal.clone());
+        let reply = super::toward("navigation_navigate", None, "Go to kitchen.", &place);
+        let plan =
+            crate::speculation::own_plan(&targets, &reply.expect("a place"), "opening-1".into())
+                .expect("the move parses");
         let calls: Vec<_> = plan
             .nodes
             .iter()
@@ -544,5 +546,41 @@ mod tests {
         assert_eq!(call.call_id, "opening-1:0");
         let args: serde_json::Value = serde_json::from_str(&call.args_json).unwrap();
         assert_eq!(args["goal"], goal);
+    }
+
+    #[test]
+    fn a_move_to_an_object_finds_where_to_stand_first() {
+        let mut targets = CapabilityTargetMap::new();
+        targets.insert(
+            "navigation_navigate".into(),
+            ("nav2".into(), "robonix/service/navigation/navigate".into()),
+        );
+        targets.insert(
+            "scene_goal_near".into(),
+            ("scene".into(), "robonix/system/scene/goal_near".into()),
+        );
+        let cup = super::Goal::Object("scene.object.7".into());
+        let reply = super::toward(
+            "navigation_navigate",
+            Some("scene_goal_near"),
+            "Go to the cup.",
+            &cup,
+        );
+        let plan =
+            crate::speculation::own_plan(&targets, &reply.expect("goal_near"), "opening-2".into())
+                .expect("the move parses");
+        let contracts: Vec<&str> = plan
+            .nodes
+            .iter()
+            .filter_map(|n| Some(n.call.as_ref()?.contract_id.as_str()))
+            .collect();
+        assert_eq!(
+            contracts,
+            [
+                "robonix/system/scene/goal_near",
+                "robonix/service/navigation/navigate"
+            ]
+        );
+        assert!(plan.nodes.iter().any(|n| n.node_kind == RTDL_IF));
     }
 }
