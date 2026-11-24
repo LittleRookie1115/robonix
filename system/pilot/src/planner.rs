@@ -2196,11 +2196,22 @@ pub async fn run_turn(
             && task_switch(task, "handoff_moves", false)
             && speculation::decision_model()
         {
+            let robot = &state["scene"]["state"];
+            let at = robot["x"]
+                .as_f64()
+                .zip(robot["y"].as_f64())
+                .filter(|_| robot["pose_known"] == true);
             opening = move_ahead(Some(crate::opening::Handoff {
                 done: turn_steps.clone(),
                 said: last_content.clone(),
-                robot_in: state["scene"]["state"]["region_name"].clone(),
-                objects: crate::opening::named_objects(&task.text, &state["objects"]),
+                robot_in: robot["region_name"].clone(),
+                at,
+                objects: crate::opening::named_objects(
+                    &task.text,
+                    &state["objects"],
+                    &state["poses"],
+                    at,
+                ),
             }));
         }
         let mut live = crate::stream_execution::StreamExecution::default();

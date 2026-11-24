@@ -68,6 +68,12 @@ const OBJECTS_SHOWN: usize = 8;
 
 const GOAL_NEAR: &str = "/scene/goal_near";
 
+/// How close a place's goal or an object must be to the robot for a later
+/// round not to offer it: the robot is there already, and its next step there
+/// asks or acts rather than drives (in a smoke, moves toward a person the robot
+/// stood beside were stopped by the plan's ask_name).
+const THERE_M: f64 = 2.0;
+
 /// Where a later round stands, for the decision model to tell where its next
 /// step goes.
 pub(crate) struct Handoff {
@@ -77,6 +83,8 @@ pub(crate) struct Handoff {
     pub(crate) said: String,
     /// The region the robot is in, as Scene's robot context names it.
     pub(crate) robot_in: Value,
+    /// Where the robot is on the map, if Scene knows.
+    pub(crate) at: Option<(f64, f64)>,
     /// Objects and people the robot may go to next, each as how the question
     /// names it and its Scene id.
     pub(crate) objects: Vec<(String, String)>,
@@ -151,10 +159,12 @@ impl Opening {
             .iter()
             .find(|(_, (_, contract))| contract.ends_with(GOAL_NEAR))
             .map(|(name, _)| name.clone());
+        let at = handoff.as_ref().and_then(|handoff| handoff.at);
         let mut places: Vec<(String, Goal)> = places
             .as_array()?
             .iter()
             .filter(|place| place["goal"].is_object())
+            .filter(|place| !there(at, &place["goal"]["pose"]["position"]))
             .filter_map(|place| {
                 let name = place["name"].as_str()?;
                 Some((format!("Go to {name}."), Goal::Place(place["goal"].clone())))
@@ -327,10 +337,33 @@ fn toward(navigate: &str, goal_near: Option<&str>, name: &str, goal: &Goal) -> O
     )
 }
 
+/// Whether `position` (x, y on the map) lies within THERE_M of the robot at `at`.
+fn there(at: Option<(f64, f64)>, position: &Value) -> bool {
+    let (Some((x, y)), Some(px), Some(py)) = (at, position["x"].as_f64(), position["y"].as_f64())
+    else {
+        return false;
+    };
+    (px - x).hypot(py - y) < THERE_M
+}
+
 /// Objects and people a later round's next step may go to: people, then the
 /// objects whose label the task names, each as the question names it (with its
-/// region from the state view's `objects`) and its Scene id.
-pub(crate) fn named_objects(task: &str, objects: &Value) -> Vec<(String, String)> {
+/// region from the state view's `objects`) and its Scene id; none the robot at
+/// `at` is already beside, by Scene's `poses`.
+pub(crate) fn named_objects(
+    task: &str,
+    objects: &Value,
+    poses: &Value,
+    at: Option<(f64, f64)>,
+) -> Vec<(String, String)> {
+    let beside = |id: &str| {
+        let pose = poses
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|pose| pose["id"] == id);
+        pose.is_some_and(|pose| there(at, pose))
+    };
     let words = |text: &str| -> String { text.to_lowercase().replace(['_', '-'], " ") };
     let task = words(task);
     let mut found: Vec<(bool, String, String)> = Vec::new();
@@ -340,7 +373,7 @@ pub(crate) fn named_objects(task: &str, objects: &Value) -> Vec<(String, String)
                 continue;
             };
             let person = label == "person";
-            if person || task.contains(&words(label)) {
+            if (person || task.contains(&words(label))) && !beside(id) {
                 let named = format!("the {} in {region}", words(label));
                 found.push((!person, named, id.to_string()));
             }
@@ -403,6 +436,7 @@ mod tests {
             done: (0..15).map(|i| json!({"step": i})).collect(),
             said: "I'll take it to the kitchen.".into(),
             robot_in: "bedroom".into(),
+            at: None,
             objects: Vec::new(),
         };
         let (state, question) = super::ask("t", Some(&handoff), &["Go to kitchen."]);
@@ -426,7 +460,13 @@ mod tests {
                         {"id": "p1", "label": "person"}],
             "elsewhere": []
         });
-        let named = super::named_objects("Bring me a red bull from the kitchen", &objects);
+        let poses = json!([{"id": "o2", "x": 0.5, "y": 0.0}, {"id": "p2", "x": 1.0, "y": 1.0}]);
+        let named = super::named_objects(
+            "Bring me a red bull from the kitchen",
+            &objects,
+            &poses,
+            None,
+        );
         assert_eq!(
             named,
             [
@@ -434,6 +474,9 @@ mod tests {
                 ("the red bull in kitchen".to_string(), "o1".to_string())
             ]
         );
+        // A person the robot stands beside is not offered.
+        let beside = json!({"bedroom": [{"id": "p2", "label": "person"}]});
+        assert!(super::named_objects("t", &beside, &poses, Some((0.0, 0.0))).is_empty());
         let cup = super::Goal::Object("o2".into());
         let tree =
             &super::toward("nav", Some("near"), "Go to the cup.", &cup).expect("goal_near")["rtdl"];
