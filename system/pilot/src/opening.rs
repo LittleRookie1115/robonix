@@ -400,17 +400,20 @@ pub(crate) fn named_objects(
                 continue;
             };
             let person = label == "person";
-            if (person || task.contains(&words(label))) && !beside(id) {
+            if person || task.contains(&words(label)) {
                 let named = format!("the {} in {region}", words(label));
                 found.push((!person, away(id), named, id.to_string()));
             }
         }
     }
     found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    // One per name, the nearest; none if the robot stands beside it, since Scene may keep the one it just reached
+    // twice and a further record named alike is likelier that one than another.
     let mut named: HashSet<String> = HashSet::new();
     found
         .into_iter()
         .filter(|(_, _, name, _)| named.insert(name.clone()))
+        .filter(|(_, _, _, id)| !beside(id))
         .map(|(_, _, name, id)| (name, id))
         .collect()
 }
@@ -522,6 +525,10 @@ mod tests {
         // A person the robot stands beside is not offered.
         let beside = json!({"bedroom": [{"id": "p2", "label": "person"}]});
         assert!(super::named_objects("t", &beside, &poses, Some((0.0, 0.0))).is_empty());
+        // Nor anyone else in that room: a further person there is likelier the same one recorded twice.
+        let twice = json!({"kitchen": [{"id": "here", "label": "person"}, {"id": "there", "label": "person"}]});
+        let at = json!([{"id": "here", "x": 0.5, "y": 0.0}, {"id": "there", "x": 4.0, "y": 0.0}]);
+        assert!(super::named_objects("t", &twice, &at, Some((0.0, 0.0))).is_empty());
         let cup = super::Goal::Object("o2".into());
         let tree =
             &super::toward("nav", Some("near"), "Go to the cup.", &cup).expect("goal_near")["rtdl"];
