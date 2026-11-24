@@ -1,7 +1,9 @@
 //! The opening move. A task's first plan takes several seconds to write, and
 //! most tasks begin by going somewhere. With a decision model, Pilot asks it
 //! which of the map's places the task begins by going to and, if it is sure,
-//! sends the robot there while the plan is written. Navigation follows the
+//! sends the robot there while the plan is written. With `handoff_moves` it does
+//! the same at every later round its own planning request serves, asking where
+//! the task's next step goes given the steps done so far. Navigation follows the
 //! newest goal, so the plan's first navigate takes the moving robot over when
 //! it runs. The move is stopped if the plan's first step that moves or uses
 //! the robot is anything else, if that navigate's tree ends without it having
@@ -39,6 +41,18 @@ const WHERE: &str = "The robot has just been given this task and is planning it.
 
 const NOWHERE: &str = "The task does not begin by going to one of these places, or which one is \
                        unclear.";
+
+const WHERE_NEXT: &str = "The robot is carrying out this task; `done` lists the steps it has run \
+                          so far, with their results, and it is planning what to do next. Which \
+                          of these places does its next step go to? If its next move is not to go \
+                          to one of them, or which one is unclear, pick the last option.";
+
+const NOWHERE_NEXT: &str = "The next step does not go to one of these places, or which one is \
+                            unclear.";
+
+/// Steps of `done` the decision model is shown: the latest, which say where the
+/// task stands.
+const DONE_SHOWN: usize = 12;
 
 const NAVIGATE: &str = "/navigation/navigate";
 
@@ -78,11 +92,14 @@ pub(crate) struct Opening {
 
 impl Opening {
     /// Ask where `task` begins among `places` (the state view's map places, each
-    /// with the goal goal_region gave it) and move there if the decision model
-    /// picks one with at least `tau`. `None` without a navigate capability or a
-    /// place to go.
+    /// with the goal goal_region gave it), or with `done`, the steps the turn has
+    /// run, where its next step goes, and move there if the decision model picks
+    /// one with at least `tau`. `None` without a navigate capability or a place
+    /// to go.
+    #[allow(clippy::too_many_arguments)] // Each is a different part of the round it starts in.
     pub(crate) fn start(
         task: &str,
+        done: Option<&[Value]>,
         places: &Value,
         targets: &CapabilityTargetMap,
         graph: RobonixSystemExecutorExecuteClient<Channel>,
@@ -103,14 +120,9 @@ impl Opening {
         if places.is_empty() {
             return None;
         }
-        let mut criteria: serde_json::Map<String, Value> = places
-            .iter()
-            .enumerate()
-            .map(|(index, (name, _))| (index.to_string(), format!("Go to {name}.").into()))
-            .collect();
-        criteria.insert("none".into(), NOWHERE.into());
-        let question = json!({"type": "choice", "instructions": WHERE, "criteria": criteria});
-        let state = json!({"task": task});
+        let names: Vec<&str> = places.iter().map(|(name, _)| name.as_str()).collect();
+        let (state, question) = ask(task, done, &names);
+        let round = done.map_or(0, |done| done.len());
         let plan_id = format!("{PLAN_ID}{}", uuid::Uuid::new_v4());
         let phase = Arc::new(Mutex::new(Phase::Asking));
         let (targets, shared, id) = (targets.clone(), phase.clone(), plan_id.clone());
@@ -137,7 +149,7 @@ impl Opening {
             }
             info!(
                 "[pilot/segue] {}",
-                json!({"event": "opening", "plan_id": id, "place": name,
+                json!({"event": "opening", "plan_id": id, "place": name, "steps_done": round,
                        "answered_ms": asked.elapsed().as_millis() as u64})
             );
             if let Ok(events) = graph.clone().execute(tonic::Request::new(plan)).await {
@@ -207,6 +219,30 @@ impl Opening {
     }
 }
 
+/// What the decision model is shown and asked: where `task` begins among the
+/// places `names`, or with `done` where its next step goes.
+fn ask(task: &str, done: Option<&[Value]>, names: &[&str]) -> (Value, Value) {
+    let mut criteria: serde_json::Map<String, Value> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index.to_string(), format!("Go to {name}.").into()))
+        .collect();
+    let (instructions, nowhere, state) = match done {
+        None => (WHERE, NOWHERE, json!({"task": task})),
+        Some(done) => {
+            let latest = &done[done.len().saturating_sub(DONE_SHOWN)..];
+            (
+                WHERE_NEXT,
+                NOWHERE_NEXT,
+                json!({"task": task, "done": latest}),
+            )
+        }
+    };
+    criteria.insert("none".into(), nowhere.into());
+    let question = json!({"type": "choice", "instructions": instructions, "criteria": criteria});
+    (state, question)
+}
+
 /// Whether a step of `contract` moves the robot or uses its body or voice, which
 /// a step such as a shell command or a memory lookup does not.
 fn engages(contract: &str) -> bool {
@@ -267,6 +303,22 @@ mod tests {
     use crate::planner::{CapabilityTargetMap, RTDL_DO, RTDL_IF, RTDL_SEQUENCE};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_later_round_asks_where_the_next_step_goes_given_the_latest_steps() {
+        let done: Vec<serde_json::Value> = (0..15).map(|i| json!({"step": i})).collect();
+        let (state, question) = super::ask("t", Some(&done), &["kitchen"]);
+        assert_eq!(
+            state["done"].as_array().map(Vec::len),
+            Some(super::DONE_SHOWN)
+        );
+        assert_eq!(state["done"][0]["step"], 3);
+        assert_eq!(question["instructions"], super::WHERE_NEXT);
+        assert_eq!(question["criteria"]["0"], "Go to kitchen.");
+        let (first, opening) = super::ask("t", None, &["kitchen"]);
+        assert!(first.get("done").is_none());
+        assert_eq!(opening["instructions"], super::WHERE);
+    }
 
     /// A move under way, whose stop goes nowhere.
     fn moving() -> Opening {

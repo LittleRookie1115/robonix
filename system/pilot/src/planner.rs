@@ -2022,11 +2022,9 @@ pub async fn run_turn(
                 .await;
             break;
         }
-        if requests == 0
-            && speculate
-            && task_switch(task, "opening", true)
-            && speculation::decision_model()
-        {
+        // The robot heads for where the task, or with `handoff_moves` its next
+        // step, goes while this round's plan is written.
+        let move_ahead = |done: Option<&[serde_json::Value]>| {
             let context: serde_json::Value =
                 serde_json::from_str(&task.context_json).unwrap_or_default();
             let listed = context["read_only"].as_array().into_iter().flatten();
@@ -2037,15 +2035,23 @@ pub async fn run_turn(
             let tau = context["tau_open"]
                 .as_f64()
                 .unwrap_or(crate::opening::TAU_OPEN);
-            opening = crate::opening::Opening::start(
+            crate::opening::Opening::start(
                 &task.text,
+                done,
                 &state["places"],
                 &target_map,
                 executor.graph.clone(),
                 executor.control.clone(),
                 reads,
                 tau,
-            );
+            )
+        };
+        if requests == 0
+            && speculate
+            && task_switch(task, "opening", true)
+            && speculation::decision_model()
+        {
+            opening = move_ahead(None);
         }
         requests += 1;
         let _ = tx
@@ -2175,6 +2181,17 @@ pub async fn run_turn(
                 }
                 Err(reason) => spec.discard(&reason),
             }
+        }
+        // This round waits for its own request: the robot may head for where
+        // the next step goes meanwhile.
+        if prepared.is_none()
+            && requests > 1
+            && opening.is_none()
+            && speculate
+            && task_switch(task, "handoff_moves", false)
+            && speculation::decision_model()
+        {
+            opening = move_ahead(Some(&turn_steps));
         }
         let mut live = crate::stream_execution::StreamExecution::default();
         // A prepared reply was just checked against this round's state view.
