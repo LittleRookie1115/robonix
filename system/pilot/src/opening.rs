@@ -165,6 +165,11 @@ impl Opening {
             .iter()
             .filter(|place| place["goal"].is_object())
             .filter(|place| !there(at, &place["goal"]["pose"]["position"]))
+            // Mid-task, only places the task names: a choice among every place
+            // on the map spread the decision model's confidence thin.
+            .filter(|place| {
+                handoff.is_none() || place["name"].as_str().is_some_and(|name| names(task, name))
+            })
             .filter_map(|place| {
                 let name = place["name"].as_str()?;
                 Some((format!("Go to {name}."), Goal::Place(place["goal"].clone())))
@@ -337,6 +342,22 @@ fn toward(navigate: &str, goal_near: Option<&str>, name: &str, goal: &Goal) -> O
     )
 }
 
+/// Words a place's name shares with every kind of place, which do not tell one
+/// place from another.
+const GENERIC: [&str; 5] = ["table", "room", "point", "area", "the"];
+
+/// Whether `task` names the place `name`: its whole name, or a word of it that
+/// is not GENERIC (so "the trash" names the kitchen trash bin).
+fn names(task: &str, name: &str) -> bool {
+    let words = |text: &str| -> String { text.to_lowercase().replace(['_', '-'], " ") };
+    let (task, name) = (words(task), words(name));
+    let said: HashSet<&str> = task.split(|c: char| !c.is_alphanumeric()).collect();
+    task.contains(&name)
+        || name
+            .split_whitespace()
+            .any(|word| !GENERIC.contains(&word) && said.contains(word))
+}
+
 /// Whether `position` (x, y on the map) lies within THERE_M of the robot at `at`.
 fn there(at: Option<(f64, f64)>, position: &Value) -> bool {
     let (Some((x, y)), Some(px), Some(py)) = (at, position["x"].as_f64(), position["y"].as_f64())
@@ -451,6 +472,15 @@ mod tests {
         let (first, opening) = super::ask("t", None, &["Go to kitchen."]);
         assert!(first.get("done").is_none());
         assert_eq!(opening["instructions"], super::WHERE);
+    }
+
+    #[test]
+    fn a_later_round_offers_only_places_the_task_names() {
+        let task = "Put the cup in the trash, then come back to the instruction point";
+        assert!(super::names(task, "kitchen trash bin"));
+        assert!(super::names(task, "instruction point"));
+        assert!(!super::names(task, "coffee table"));
+        assert!(!super::names(task, "living room"));
     }
 
     #[test]
