@@ -49,9 +49,11 @@ const NOWHERE: &str = "The task does not begin by going to one of these places, 
                        unclear.";
 
 const WHERE_NEXT: &str = "The robot is carrying out this task; `done` lists the steps it has run \
-                          so far, with their results, and it is planning what to do next. Which \
-                          of these places does its next step go to? If its next move is not to go \
-                          to one of them, or which one is unclear, pick the last option.";
+                          so far, with their results, `said` what the robot last told the user \
+                          (often what it means to do next), and `robot_in` where it is. It is \
+                          planning what to do next. Which of these places, objects or people does \
+                          its next step go to? If its next move is not to go to one of them, or \
+                          which one is unclear, pick the last option.";
 
 const NOWHERE_NEXT: &str = "The next step does not go to one of these places, or which one is \
                             unclear.";
@@ -59,6 +61,34 @@ const NOWHERE_NEXT: &str = "The next step does not go to one of these places, or
 /// Steps of `done` the decision model is shown: the latest, which say where the
 /// task stands.
 const DONE_SHOWN: usize = 12;
+
+/// Objects and people offered as where a later round's next step goes: those
+/// the task names, people first.
+const OBJECTS_SHOWN: usize = 8;
+
+const GOAL_NEAR: &str = "/scene/goal_near";
+
+/// Where a later round stands, for the decision model to tell where its next
+/// step goes.
+pub(crate) struct Handoff {
+    /// The steps the turn has run, with their results.
+    pub(crate) done: Vec<Value>,
+    /// What the robot last told the user, which often says what it means to do next.
+    pub(crate) said: String,
+    /// The region the robot is in, as Scene's robot context names it.
+    pub(crate) robot_in: Value,
+    /// Objects and people the robot may go to next, each as how the question
+    /// names it and its Scene id.
+    pub(crate) objects: Vec<(String, String)>,
+}
+
+/// Where a move heads.
+enum Goal {
+    /// A map place's goal pose, as goal_region gave it.
+    Place(Value),
+    /// A Scene object or person, whose goal goal_near gives when the move starts.
+    Object(String),
+}
 
 const NAVIGATE: &str = "/navigation/navigate";
 
@@ -98,14 +128,14 @@ pub(crate) struct Opening {
 
 impl Opening {
     /// Ask where `task` begins among `places` (the state view's map places, each
-    /// with the goal goal_region gave it), or with `done`, the steps the turn has
-    /// run, where its next step goes, and move there if the decision model picks
-    /// one with at least `tau`. `None` without a navigate capability or a place
-    /// to go.
+    /// with the goal goal_region gave it), or at a later round (`handoff`) where
+    /// its next step goes among those and the objects and people it names, and
+    /// move there if the decision model picks one with at least `tau`. `None`
+    /// without a navigate capability or anywhere to go.
     #[allow(clippy::too_many_arguments)] // Each is a different part of the round it starts in.
     pub(crate) fn start(
         task: &str,
-        done: Option<&[Value]>,
+        handoff: Option<Handoff>,
         places: &Value,
         targets: &CapabilityTargetMap,
         graph: RobonixSystemExecutorExecuteClient<Channel>,
@@ -117,18 +147,33 @@ impl Opening {
             .iter()
             .find(|(_, (_, contract))| contract.ends_with(NAVIGATE))
             .map(|(name, _)| name.clone())?;
-        let places: Vec<(String, Value)> = places
+        let goal_near = targets
+            .iter()
+            .find(|(_, (_, contract))| contract.ends_with(GOAL_NEAR))
+            .map(|(name, _)| name.clone());
+        let mut places: Vec<(String, Goal)> = places
             .as_array()?
             .iter()
             .filter(|place| place["goal"].is_object())
-            .filter_map(|place| Some((place["name"].as_str()?.to_string(), place["goal"].clone())))
+            .filter_map(|place| {
+                let name = place["name"].as_str()?;
+                Some((format!("Go to {name}."), Goal::Place(place["goal"].clone())))
+            })
             .collect();
+        if goal_near.is_some()
+            && let Some(handoff) = &handoff
+        {
+            let objects = handoff.objects.iter().take(OBJECTS_SHOWN);
+            places.extend(
+                objects.map(|(named, id)| (format!("Go to {named}."), Goal::Object(id.clone()))),
+            );
+        }
         if places.is_empty() {
             return None;
         }
         let names: Vec<&str> = places.iter().map(|(name, _)| name.as_str()).collect();
-        let (state, question) = ask(task, done, &names);
-        let round = done.map_or(0, |done| done.len());
+        let (state, question) = ask(task, handoff.as_ref(), &names);
+        let round = handoff.as_ref().map_or(0, |handoff| handoff.done.len());
         let plan_id = format!("{PLAN_ID}{}", uuid::Uuid::new_v4());
         let phase = Arc::new(Mutex::new(Phase::Asking));
         let (targets, shared, id) = (targets.clone(), phase.clone(), plan_id.clone());
@@ -143,7 +188,8 @@ impl Opening {
             if asked.elapsed() > ANSWER_WITHIN {
                 return;
             }
-            let Some(plan) = own_plan(&targets, &toward(&navigate, name, goal), id.clone()) else {
+            let reply = toward(&navigate, goal_near.as_deref(), name, goal);
+            let Some(plan) = reply.and_then(|reply| own_plan(&targets, &reply, id.clone())) else {
                 return;
             };
             {
@@ -226,22 +272,21 @@ impl Opening {
 }
 
 /// What the decision model is shown and asked: where `task` begins among the
-/// places `names`, or with `done` where its next step goes.
-fn ask(task: &str, done: Option<&[Value]>, names: &[&str]) -> (Value, Value) {
+/// options `names`, or at a later round (`handoff`) where its next step goes.
+fn ask(task: &str, handoff: Option<&Handoff>, names: &[&str]) -> (Value, Value) {
     let mut criteria: serde_json::Map<String, Value> = names
         .iter()
         .enumerate()
-        .map(|(index, name)| (index.to_string(), format!("Go to {name}.").into()))
+        .map(|(index, name)| (index.to_string(), (*name).into()))
         .collect();
-    let (instructions, nowhere, state) = match done {
+    let (instructions, nowhere, state) = match handoff {
         None => (WHERE, NOWHERE, json!({"task": task})),
-        Some(done) => {
+        Some(handoff) => {
+            let done = &handoff.done;
             let latest = &done[done.len().saturating_sub(DONE_SHOWN)..];
-            (
-                WHERE_NEXT,
-                NOWHERE_NEXT,
-                json!({"task": task, "done": latest}),
-            )
+            let state = json!({"task": task, "done": latest, "said": handoff.said,
+                               "robot_in": handoff.robot_in});
+            (WHERE_NEXT, NOWHERE_NEXT, state)
         }
     };
     criteria.insert("none".into(), nowhere.into());
@@ -257,13 +302,55 @@ fn engages(contract: &str) -> bool {
         .any(|part| contract.contains(part))
 }
 
-/// The reply whose tree sends the robot to `goal`, the place `name`'s, with `navigate`.
-fn toward(navigate: &str, name: &str, goal: &Value) -> Value {
-    let description = format!("Head for {name} while the plan is written");
-    json!({"content": "", "rtdl_description": description, "rtdl": {
-        "op": "sequence", "op_id": 1, "description": description,
-        "children": [{"op": "do", "op_id": 2, "cap": navigate, "description": description,
-                      "args": {"goal": goal}}]}})
+/// The reply whose tree sends the robot toward `goal`, the option `name`'s, with
+/// `navigate`: a place's goal at once, an object's or person's through
+/// `goal_near` first, if that finds it reachable.
+fn toward(navigate: &str, goal_near: Option<&str>, name: &str, goal: &Goal) -> Option<Value> {
+    let description = format!("{} while the plan is written", name.trim_end_matches('.'));
+    let go = |goal: Value| {
+        json!({"op": "do", "op_id": 0, "cap": navigate, "description": description,
+               "args": {"goal": goal}})
+    };
+    let children = match goal {
+        Goal::Place(goal) => vec![go(goal.clone())],
+        Goal::Object(id) => vec![
+            json!({"op": "do", "op_id": 0, "cap": goal_near?, "description": "Find where to stand",
+                   "args": {"object_id": id}, "bind": "near"}),
+            json!({"op": "if", "op_id": 0, "description": "Go only if reachable",
+                   "condition": {"op": "eq", "args": [{"var": "near", "path": ["reachable"]}, true]},
+                   "then": go(json!({"var": "near", "path": ["goal"]}))}),
+        ],
+    };
+    Some(
+        json!({"content": "", "rtdl_description": description, "rtdl": {
+        "op": "sequence", "op_id": 0, "description": description, "children": children}}),
+    )
+}
+
+/// Objects and people a later round's next step may go to: people, then the
+/// objects whose label the task names, each as the question names it (with its
+/// region from the state view's `objects`) and its Scene id.
+pub(crate) fn named_objects(task: &str, objects: &Value) -> Vec<(String, String)> {
+    let words = |text: &str| -> String { text.to_lowercase().replace(['_', '-'], " ") };
+    let task = words(task);
+    let mut found: Vec<(bool, String, String)> = Vec::new();
+    for (region, listed) in objects.as_object().into_iter().flatten() {
+        for object in listed.as_array().into_iter().flatten() {
+            let (Some(label), Some(id)) = (object["label"].as_str(), object["id"].as_str()) else {
+                continue;
+            };
+            let person = label == "person";
+            if person || task.contains(&words(label)) {
+                let named = format!("the {} in {region}", words(label));
+                found.push((!person, named, id.to_string()));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+        .into_iter()
+        .map(|(_, named, id)| (named, id))
+        .collect()
 }
 
 impl Drop for Opening {
@@ -312,18 +399,47 @@ mod tests {
 
     #[test]
     fn a_later_round_asks_where_the_next_step_goes_given_the_latest_steps() {
-        let done: Vec<serde_json::Value> = (0..15).map(|i| json!({"step": i})).collect();
-        let (state, question) = super::ask("t", Some(&done), &["kitchen"]);
+        let handoff = super::Handoff {
+            done: (0..15).map(|i| json!({"step": i})).collect(),
+            said: "I'll take it to the kitchen.".into(),
+            robot_in: "bedroom".into(),
+            objects: Vec::new(),
+        };
+        let (state, question) = super::ask("t", Some(&handoff), &["Go to kitchen."]);
         assert_eq!(
             state["done"].as_array().map(Vec::len),
             Some(super::DONE_SHOWN)
         );
         assert_eq!(state["done"][0]["step"], 3);
+        assert_eq!(state["said"], "I'll take it to the kitchen.");
         assert_eq!(question["instructions"], super::WHERE_NEXT);
         assert_eq!(question["criteria"]["0"], "Go to kitchen.");
-        let (first, opening) = super::ask("t", None, &["kitchen"]);
+        let (first, opening) = super::ask("t", None, &["Go to kitchen."]);
         assert!(first.get("done").is_none());
         assert_eq!(opening["instructions"], super::WHERE);
+    }
+
+    #[test]
+    fn a_later_round_may_head_for_people_and_objects_the_task_names() {
+        let objects = json!({
+            "kitchen": [{"id": "o1", "label": "red_bull"}, {"id": "o2", "label": "cup"},
+                        {"id": "p1", "label": "person"}],
+            "elsewhere": []
+        });
+        let named = super::named_objects("Bring me a red bull from the kitchen", &objects);
+        assert_eq!(
+            named,
+            [
+                ("the person in kitchen".to_string(), "p1".to_string()),
+                ("the red bull in kitchen".to_string(), "o1".to_string())
+            ]
+        );
+        let cup = super::Goal::Object("o2".into());
+        let tree =
+            &super::toward("nav", Some("near"), "Go to the cup.", &cup).expect("goal_near")["rtdl"];
+        assert_eq!(tree["children"][0]["args"]["object_id"], "o2");
+        assert_eq!(tree["children"][1]["then"]["args"]["goal"]["var"], "near");
+        assert!(super::toward("nav", None, "x", &cup).is_none());
     }
 
     /// A move under way, whose stop goes nowhere.

@@ -2024,7 +2024,7 @@ pub async fn run_turn(
         }
         // The robot heads for where the task, or with `handoff_moves` its next
         // step, goes while this round's plan is written.
-        let move_ahead = |done: Option<&[serde_json::Value]>| {
+        let move_ahead = |handoff: Option<crate::opening::Handoff>| {
             let context: serde_json::Value =
                 serde_json::from_str(&task.context_json).unwrap_or_default();
             let listed = context["read_only"].as_array().into_iter().flatten();
@@ -2032,7 +2032,7 @@ pub async fn run_turn(
                 .filter_map(|c| c.as_str())
                 .map(String::from)
                 .collect();
-            let tau = match done {
+            let tau = match handoff {
                 None => context["tau_open"]
                     .as_f64()
                     .unwrap_or(crate::opening::TAU_OPEN),
@@ -2042,7 +2042,7 @@ pub async fn run_turn(
             };
             crate::opening::Opening::start(
                 &task.text,
-                done,
+                handoff,
                 &state["places"],
                 &target_map,
                 executor.graph.clone(),
@@ -2196,7 +2196,12 @@ pub async fn run_turn(
             && task_switch(task, "handoff_moves", false)
             && speculation::decision_model()
         {
-            opening = move_ahead(Some(&turn_steps));
+            opening = move_ahead(Some(crate::opening::Handoff {
+                done: turn_steps.clone(),
+                said: last_content.clone(),
+                robot_in: state["scene"]["state"]["region_name"].clone(),
+                objects: crate::opening::named_objects(&task.text, &state["objects"]),
+            }));
         }
         let mut live = crate::stream_execution::StreamExecution::default();
         // A prepared reply was just checked against this round's state view.
