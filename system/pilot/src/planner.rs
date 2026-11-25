@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 /// gRPC client for executor's plan-dispatch contract. Pilot only ever calls
 /// `Execute(Plan)` — discovery happens directly against atlas now.
+#[derive(Clone)]
 pub struct ExecutorConn {
     /// Submits RTDL nodes while model output is still arriving.
     pub streaming: RobonixSystemExecutorExecuteStreamClient<Channel>,
@@ -1748,6 +1749,12 @@ pub async fn run_turn(
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
+    // With a success reply decided on early, the state view its check reads,
+    // taken while the tree's last steps run so that the check need not wait
+    // for one when the tree ends: when the reading started, and the reading.
+    let mut view_ahead: Option<(std::time::Instant, ViewReading)> = None;
+    // The capabilities the last round found, which a reading ahead queries.
+    let mut last_caps: Vec<(String, atlas_pb::Capability)> = Vec::new();
     // The robot heading where the task begins while its first plan is written.
     let mut opening: Option<crate::opening::Opening> = None;
     // Each running tree's read set, read against Scene each second; see watch.rs.
@@ -1770,6 +1777,8 @@ pub async fn run_turn(
     // reports nothing until it ends: look again for one to settle early.
     let mut early_tick = tokio::time::interval(Duration::from_millis(250));
     early_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut view_tick = tokio::time::interval(Duration::from_secs(1));
+    view_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
@@ -1856,6 +1865,16 @@ pub async fn run_turn(
                 _ = early_tick.tick(), if speculation.as_ref().is_some_and(Speculation::may_decide_early) => {
                     speculation.iter_mut().for_each(|spec| spec.decide_early(&turn_steps));
                 }
+                _ = view_tick.tick(), if state_view && !last_caps.is_empty()
+                    && speculation.as_ref().is_some_and(Speculation::decided_early) => {
+                    // One reading at a time, each started as the last one ends.
+                    if view_ahead.as_ref().is_none_or(|(_, reading)| reading.is_finished()) {
+                        let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), last_caps.clone());
+                        view_ahead = Some((std::time::Instant::now(), tokio::spawn(async move {
+                            state_context::collect(&executor, &mut atlas, &caps, true).await
+                        })));
+                    }
+                }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
                     if let Some(scene) = &scene_providers {
                         let stopped = check_watches(&mut watches, scene, read_set, executor, forest, history).await;
@@ -1924,8 +1943,27 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        let (environment_block, map_regions, state) =
-            state_context::collect(executor, atlas, &cap_list, state_view).await;
+        // A reply decided on early is checked against the state view read as
+        // its tree's last steps ran, if that reading started within the last
+        // VIEW_AHEAD_AGE; otherwise, and for the round's own request, one is read now.
+        let ahead = view_ahead
+            .take()
+            .filter(|(began, _)| pending.is_some() && began.elapsed() < VIEW_AHEAD_AGE);
+        let ahead = match ahead {
+            Some((began, reading)) => reading.await.ok().map(|view| (began.elapsed(), view)),
+            None => None,
+        };
+        let (environment_block, map_regions, state) = match ahead {
+            Some((age, view)) => {
+                info!(
+                    "[pilot/segue] {}",
+                    serde_json::json!({"event": "decide_early", "state_view_age_ms": age.as_millis() as u64})
+                );
+                view
+            }
+            None => state_context::collect(executor, atlas, &cap_list, state_view).await,
+        };
+        last_caps = cap_list.clone();
         scene_providers = state_context::SceneProviders::among(&cap_list);
         speculation::located(&state["scene"]);
         let soma_body = crate::soma_context::fetch_system_prompt_block(atlas, consumer_id)
@@ -2824,6 +2862,13 @@ Resolve a named room through current Scene regions before navigation; never use 
 
 Copy each cap exactly from the current catalog. Scope feedback by plan_id/call_id. A dispatch record describes submitted RTDL nodes, not actual capability invocations. Use Executor leaf feedback to confirm calls that ran. A successful repeat result reports how many times its body ran, including zero. Do not repeat successful work.
 "#;
+
+/// A state view being read: its environment block, map regions and state.
+type ViewReading = tokio::task::JoinHandle<(String, String, serde_json::Value)>;
+
+/// How recently a state view read while a tree's last steps ran must have
+/// started for the check of the reply decided on early to use it.
+const VIEW_AHEAD_AGE: Duration = Duration::from_secs(2);
 
 /// The RTDL protocol text sent on every planning round, with or without
 /// Segue's guidance on folding reads into the trees that act on them.

@@ -1340,6 +1340,11 @@ impl Speculation {
         }
     }
 
+    /// Whether the success reply has been decided on early.
+    pub(crate) fn decided_early(&self) -> bool {
+        self.held.is_some() && self.early.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     /// Whether the success reply may yet be settled early.
     pub(crate) fn may_decide_early(&self) -> bool {
         self.decide_early
