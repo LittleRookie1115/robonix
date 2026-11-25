@@ -85,6 +85,11 @@ fn eval(expr: &Value, vars: &HashMap<String, Value>) -> Result<Value, String> {
                 .get(name)
                 .ok_or_else(|| format!("undefined variable '{name}'"))?;
             if let Some(parts) = obj.get("path").and_then(Value::as_array) {
+                // A binding holds only a step's successful output, so whether that step succeeded is
+                // true even when its output has no `success` field, as most capabilities' outputs do not.
+                if parts.len() == 1 && parts[0] == "success" && value.get("success").is_none() {
+                    return Ok(Value::Bool(true));
+                }
                 for part in parts {
                     value = if let Some(field) = part.as_str() {
                         value.as_object().and_then(|fields| fields.get(field))
@@ -185,6 +190,20 @@ mod tests {
         );
         assert!(eval_value(&json!({"var":"missing"}), &vars).is_err());
         assert!(eval_value(&json!({"var":"camera","path":["unknown"]}), &vars).is_err());
+    }
+
+    #[test]
+    fn a_binding_answers_that_its_step_succeeded() {
+        let vars = HashMap::from([
+            ("pickup".into(), json!({"object":"cup"})),
+            ("removed".into(), json!({"success":false})),
+        ]);
+        let succeeded =
+            |name: &str| json!({"op":"eq","args":[{"var":name,"path":["success"]},true]});
+        assert!(eval_condi(&succeeded("pickup"), &vars).unwrap());
+        assert!(!eval_condi(&succeeded("removed"), &vars).unwrap());
+        assert!(eval_condi(&succeeded("missing"), &vars).is_err());
+        assert!(eval_value(&json!({"var":"pickup","path":["success","x"]}), &vars).is_err());
     }
 
     #[test]
