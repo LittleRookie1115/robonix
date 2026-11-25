@@ -1766,6 +1766,10 @@ pub async fn run_turn(
     let taken: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
     let mut watch_tick = tokio::time::interval(Duration::from_secs(1));
     watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A success reply may be written while a tree's last step runs, which
+    // reports nothing until it ends: look again for one to settle early.
+    let mut early_tick = tokio::time::interval(Duration::from_millis(250));
+    early_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every step reported this turn, since a reply may close the task on
     // results of earlier trees.
     let mut turn_steps: Vec<serde_json::Value> = Vec::new();
@@ -1845,8 +1849,12 @@ pub async fn run_turn(
                     // The session holds a sender, so the channel never closes.
                     if let Some(event) = ev {
                         observe(&mut speculation, &mut opening, &mut watches, &event, read_set);
+                        speculation.iter_mut().for_each(|spec| spec.decide_early(&turn_steps));
                         should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
+                }
+                _ = early_tick.tick(), if speculation.as_ref().is_some_and(Speculation::may_decide_early) => {
+                    speculation.iter_mut().for_each(|spec| spec.decide_early(&turn_steps));
                 }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
                     if let Some(scene) = &scene_providers {

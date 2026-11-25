@@ -44,7 +44,7 @@
 use crate::experience::Experience;
 use crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient;
 use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
-use crate::pb::pilot::{CapabilityCall, Plan, RtdlNode, RtdlNodeState, Task};
+use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState, Task};
 use crate::planner::{
     CapabilityTargetMap, RTDL_DO, RTDL_IF, RTDL_REPEAT, RTDL_SEQUENCE, RTDL_WHILE,
 };
@@ -340,6 +340,9 @@ fn reply_steps(tree: &Value) -> Vec<(String, Value)> {
 
 /// What stands for an image among the step results the decision model reads.
 const IMAGE_NOT_SHOWN: &str = "[image, not shown]";
+/// What the decision model is told a step still running returned: settling
+/// early assumes it succeeds, and its output would only say so.
+const STILL_RUNNING: &str = "[still running; assumed to succeed]";
 
 /// What a prepared reply asks for instead of a plan when it cannot be written
 /// without the real outputs. It must fit the reply schema, which providers enforce.
@@ -647,6 +650,61 @@ pub(crate) struct Speculation {
     /// Whether the success reply was asked in the short form, whose write time
     /// a reply the round's own request beat says nothing about.
     short: bool,
+    /// Whether to settle the success reply while the tree's last steps still
+    /// run, once those only act: the task's `decide_early`, on by default.
+    decide_early: bool,
+    /// The success reply settled early, the steps left assumed to succeed.
+    early: Option<JoinHandle<Result<Prepared, String>>>,
+    /// Outputs of this tree's steps that have succeeded so far, by node index.
+    succeeded: HashMap<u32, String>,
+}
+
+/// Capabilities whose output says no more than that they succeeded: with the
+/// steps left in a tree only these, its success is known before it ends but
+/// for whether they succeed.
+const ONLY_ACT: [&str; 4] = [
+    "robonix/service/navigation/navigate",
+    "robonix/skill/manipulation/pick",
+    "robonix/skill/manipulation/place",
+    "robonix/service/speech/speak",
+];
+
+/// A step as the decision model reads it: what it called and, once it has
+/// ended, how; `None` for a step still running, which is reported as succeeded.
+fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) -> Value {
+    let parse = |text: &str| serde_json::from_str(text).unwrap_or_else(|_| Value::from(text));
+    let call = node.call.clone().unwrap_or_default();
+    let mut step = json!({
+        "op": node.op_id,
+        "capability": call.contract_id,
+        "args": parse(&call.args_json),
+    });
+    match ended {
+        None => {
+            step["status"] = "succeeded".into();
+            step["output"] = STILL_RUNNING.into();
+        }
+        Some((true, leaf)) => {
+            step["status"] = "succeeded".into();
+            // The decision model reads text only, and one image's base64
+            // alone exceeds its input limit.
+            step["output"] = if crate::history::is_image_output(&leaf.output) {
+                IMAGE_NOT_SHOWN.into()
+            } else {
+                parse(&leaf.output)
+            };
+        }
+        Some((false, leaf)) => {
+            step["status"] = "failed".into();
+            step["error"] = if leaf.error.is_empty() {
+                leaf.output.clone()
+            } else {
+                leaf.error.clone()
+            }
+            .into();
+        }
+    }
+    step
 }
 
 /// The `do` steps of a tree whose failure fixes what else ran, as node index and
@@ -1188,6 +1246,9 @@ impl Speculation {
             expected,
             dispatched,
             short,
+            decide_early: context["decide_early"].as_bool().unwrap_or(true),
+            early: None,
+            succeeded: HashMap::new(),
         })
     }
 
@@ -1250,7 +1311,65 @@ impl Speculation {
         {
             let failed = Outcome::Failed(step.op_id.clone());
             self.branches.retain(|branch| branch.outcome != failed);
+            let output = node.leaf_result.as_ref().map(|leaf| leaf.output.clone());
+            self.succeeded
+                .insert(node.node_index, output.unwrap_or_default());
         }
+    }
+
+    /// Whether the success reply may yet be settled early.
+    pub(crate) fn may_decide_early(&self) -> bool {
+        self.decide_early
+            && self.early.is_none()
+            && self.ended.is_none()
+            && DECISION_MODEL.is_some()
+    }
+
+    /// Settle the success reply now if every step the tree has left only acts
+    /// and the reply is written: the decision model, asked while those steps
+    /// run on the steps so far and them assumed to succeed, answers before the
+    /// tree ends, and [`Speculation::settle`] uses that answer if it succeeds.
+    /// `turn_steps` are the steps of the turn's earlier trees.
+    pub(crate) fn decide_early(&mut self, turn_steps: &[Value]) {
+        if !self.may_decide_early() {
+            return;
+        }
+        let Some(left) = only_acting_left(&self.steps, &self.nodes, &self.succeeded) else {
+            return;
+        };
+        let Some(branch) = self
+            .branches
+            .iter_mut()
+            .find(|branch| branch.outcome == Outcome::Succeeded && branch.reply.is_finished())
+        else {
+            return;
+        };
+        let Some(Ok(Ok(prepared))) = (&mut branch.reply).now_or_never() else {
+            return;
+        };
+        branch.reply = tokio::spawn(async { Err("settled early".to_string()) });
+        let mut steps = turn_steps.to_vec();
+        steps.extend(self.steps.iter().filter_map(|(index, _)| {
+            let node = self.nodes.get(*index as usize)?;
+            let ended = self
+                .succeeded
+                .get(index)
+                .map(|output| CapabilityCallResult {
+                    output: output.clone(),
+                    ..Default::default()
+                });
+            Some(report_step(node, ended.as_ref().map(|leaf| (true, leaf))))
+        }));
+        let state = json!({"task": self.task, "steps": steps});
+        let (plan_id, tau, tau_done) = (self.plan_id.clone(), self.tau_success, self.tau_done);
+        let (renames, reads) = (self.renames.clone(), self.reads.clone());
+        info!(
+            "[pilot/segue] {}",
+            json!({"event": "decide_early", "plan_id": plan_id, "steps_left": left})
+        );
+        self.early = Some(tokio::spawn(async move {
+            settle_reply(prepared, state, &plan_id, tau, tau_done, &renames, &reads).await
+        }));
     }
 
     /// Record how the tree ended, from its completion.
@@ -1285,37 +1404,12 @@ impl Speculation {
                     Some((node.op_id.clone(), r.leaf_result.as_ref()?.output.clone()))
                 }),
         );
-        let parse = |text: &str| serde_json::from_str(text).unwrap_or_else(|_| Value::from(text));
         self.report = leaves
             .iter()
             .filter(|(r, _)| r.state == succeeded || failed(r.state))
             .map(|(r, node)| {
-                let call = node.call.clone().unwrap_or_default();
                 let leaf = r.leaf_result.clone().unwrap_or_default();
-                let mut step = json!({
-                    "op": node.op_id,
-                    "capability": call.contract_id,
-                    "args": parse(&call.args_json),
-                });
-                if r.state == succeeded {
-                    step["status"] = "succeeded".into();
-                    // The decision model reads text only, and one image's base64
-                    // alone exceeds its input limit.
-                    step["output"] = if crate::history::is_image_output(&leaf.output) {
-                        IMAGE_NOT_SHOWN.into()
-                    } else {
-                        parse(&leaf.output)
-                    };
-                } else {
-                    step["status"] = "failed".into();
-                    step["error"] = if leaf.error.is_empty() {
-                        leaf.output
-                    } else {
-                        leaf.error
-                    }
-                    .into();
-                }
-                step
+                report_step(node, Some((r.state == succeeded, &leaf)))
             })
             .collect();
         let state = |index: u32| {
@@ -1392,7 +1486,7 @@ impl Speculation {
     pub(crate) fn settle(&mut self, steps: Vec<Value>) -> Result<Branch, &'static str> {
         let mut written = self.take_branch()?;
         let (outcome, objects) = (written.outcome.clone(), written.objects.clone());
-        let (plan_id, task) = (self.plan_id.clone(), self.task.clone());
+        let plan_id = self.plan_id.clone();
         // A stop's situations, like a success's, are matched to text that names
         // what happened: Pilot's note of what changed.
         let tau = match outcome {
@@ -1402,50 +1496,26 @@ impl Speculation {
         let tau_done = self.tau_done;
         let renames = self.renames.clone();
         let (reads, own) = (self.reads.clone(), self.report.clone());
+        let state = json!({"task": self.task, "steps": steps});
+        let early = self.early.take().filter(|_| outcome == Outcome::Succeeded);
         let reply = tokio::spawn(async move {
-            let Prepared {
-                text: mut reply,
-                mut next,
-                read,
-            } = written.reply().await?;
-            if let Some(read) = read {
+            if let Some(early) = early {
+                let settled = early.await.unwrap_or_else(|_| Err("request failed".into()));
+                info!(
+                    "[pilot/segue] {}",
+                    json!({"event": "decide_early", "plan_id": plan_id, "used": settled.is_ok(),
+                           "why_not": settled.as_ref().err()})
+                );
+                return settled;
+            }
+            let prepared = written.reply().await?;
+            if let Some(read) = &prepared.read {
                 let now = own.iter().map(|step| &step["output"]);
                 if read.len() != own.len() || !read.iter().zip(now).all(|(a, b)| same(a, b)) {
                     return Err("results differ from those read ahead".into());
                 }
             }
-            let mut state = json!({"task": task, "steps": steps});
-            let mut picked = false;
-            if DECISION_MODEL.is_some() {
-                let index;
-                (reply, index, picked) =
-                    situation(&plan_id, &reply, state.clone(), tau, &reads).await?;
-                next = next.into_iter().skip(index).take(1).collect();
-            }
-            let reply = renamed(reply, &renames);
-            if needs_results(&reply) {
-                return Err("reply needs results".into());
-            }
-            let mut envelope: Value =
-                serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
-            if searched_in_vain(&envelope["rtdl"], &state["steps"]) {
-                return Err("searches again for what came back empty twice".into());
-            }
-            if repeated_in_vain(&envelope["rtdl"], &state["steps"], &reads) {
-                return Err("repeats a call that came back the same twice".into());
-            }
-            // A situation's reply was written for the results the decision model just matched;
-            // asking again whether the results support it only adds a second, noisier answer.
-            if DECISION_MODEL.is_some() && !picked && !dispatches(&envelope["rtdl"]) {
-                state["final_reply"] = envelope["content"].take();
-                let question = json!({"type": "noul", "instructions": DONE});
-                decide(&plan_id, state, question, |_| tau_done).await?;
-            }
-            Ok(Prepared {
-                text: reply,
-                next,
-                read: None,
-            })
+            settle_reply(prepared, state, &plan_id, tau, tau_done, &renames, &reads).await
         });
         Ok(Branch {
             outcome,
@@ -1655,9 +1725,85 @@ impl Speculation {
             go: Some(ahead.go),
             expected: None,
             stop: None,
+            early: None,
+            succeeded: HashMap::new(),
             ..self
         })
     }
+}
+
+/// The one reply to use of those `prepared` for an outcome, given the turn's
+/// steps in `state`: the situation the decision model finds, checked against
+/// what came back empty or the same before, and for a reply that dispatches
+/// nothing, whether the steps support it; or why there is none.
+async fn settle_reply(
+    prepared: Prepared,
+    mut state: Value,
+    plan_id: &str,
+    tau: f64,
+    tau_done: f64,
+    renames: &[(String, String)],
+    reads: &HashSet<String>,
+) -> Result<Prepared, String> {
+    let Prepared {
+        text: mut reply,
+        mut next,
+        ..
+    } = prepared;
+    let mut picked = false;
+    if DECISION_MODEL.is_some() {
+        let index;
+        (reply, index, picked) = situation(plan_id, &reply, state.clone(), tau, reads).await?;
+        next = next.into_iter().skip(index).take(1).collect();
+    }
+    let reply = renamed(reply, renames);
+    if needs_results(&reply) {
+        return Err("reply needs results".into());
+    }
+    let mut envelope: Value =
+        serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+    if searched_in_vain(&envelope["rtdl"], &state["steps"]) {
+        return Err("searches again for what came back empty twice".into());
+    }
+    if repeated_in_vain(&envelope["rtdl"], &state["steps"], reads) {
+        return Err("repeats a call that came back the same twice".into());
+    }
+    // A situation's reply was written for the results the decision model just matched;
+    // asking again whether the results support it only adds a second, noisier answer.
+    if DECISION_MODEL.is_some() && !picked && !dispatches(&envelope["rtdl"]) {
+        state["final_reply"] = envelope["content"].take();
+        let question = json!({"type": "noul", "instructions": DONE});
+        decide(plan_id, state, question, |_| tau_done).await?;
+    }
+    Ok(Prepared {
+        text: reply,
+        next,
+        read: None,
+    })
+}
+
+/// How many steps `steps` (a tree's, in order) has left, given those that have
+/// `succeeded`, if every do step of `nodes` is among them and those left only
+/// act; `None` otherwise, or with none left.
+fn only_acting_left(
+    steps: &[(u32, String)],
+    nodes: &[RtdlNode],
+    succeeded: &HashMap<u32, String>,
+) -> Option<usize> {
+    let calls = nodes
+        .iter()
+        .filter(|node| node.node_kind == RTDL_DO)
+        .count();
+    let left: Vec<&RtdlNode> = steps
+        .iter()
+        .filter(|(index, _)| !succeeded.contains_key(index))
+        .filter_map(|(index, _)| nodes.get(*index as usize))
+        .collect();
+    let acts = |node: &&RtdlNode| {
+        let contract = node.call.as_ref().map(|call| call.contract_id.as_str());
+        contract.is_some_and(|contract| ONLY_ACT.contains(&contract))
+    };
+    (steps.len() == calls && !left.is_empty() && left.iter().all(acts)).then_some(left.len())
 }
 
 /// `reply` with each op_id a request prepared ahead made up for a step
@@ -2892,7 +3038,76 @@ mod tests {
             expected: None,
             dispatched: Instant::now(),
             short: false,
+            decide_early: true,
+            early: None,
+            succeeded: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_reply_settled_early_is_used_only_if_the_tree_succeeds() {
+        use RtdlNodeStateEnum::{Failed, Succeeded};
+        let settled = |last: RtdlNodeStateEnum| {
+            let mut spec = three_steps();
+            spec.early = Some(tokio::spawn(std::future::ready(Ok(Prepared {
+                text: "early".into(),
+                next: Vec::new(),
+                read: None,
+            }))));
+            let results: Vec<_> = (0..=3)
+                .map(|index| state(index, if index == 3 { last } else { Succeeded }))
+                .collect();
+            spec.ended("p", &results, last == Failed, false);
+            spec.settle(Vec::new()).unwrap()
+        };
+        let mut succeeded = settled(Succeeded);
+        assert_eq!(succeeded.reply().await.unwrap().text, "early");
+        // A failure settles its own reply: here an outcome label, which no reply parses as.
+        let mut failed = settled(Failed);
+        assert!(
+            failed
+                .reply()
+                .await
+                .is_err_and(|why| why.starts_with("reply rejected"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_settled_early_only_while_the_steps_left_only_act() {
+        let (spec, navigate) = (three_steps(), "robonix/service/navigation/navigate");
+        let mut nodes = spec.nodes.clone();
+        let acting = |nodes: &mut Vec<RtdlNode>, index: usize| {
+            nodes[index].call.as_mut().unwrap().contract_id = navigate.into();
+        };
+        let done = |indices: &[u32]| -> HashMap<u32, String> {
+            indices
+                .iter()
+                .map(|&index| (index, String::new()))
+                .collect()
+        };
+        acting(&mut nodes, 3);
+        assert_eq!(
+            super::only_acting_left(&spec.steps, &nodes, &done(&[1])),
+            None
+        );
+        assert_eq!(
+            super::only_acting_left(&spec.steps, &nodes, &done(&[1, 2])),
+            Some(1)
+        );
+        assert_eq!(
+            super::only_acting_left(&spec.steps, &nodes, &done(&[1, 2, 3])),
+            None
+        );
+        acting(&mut nodes, 2);
+        assert_eq!(
+            super::only_acting_left(&spec.steps, &nodes, &done(&[1])),
+            Some(2)
+        );
+        // A step outside the order steps_in_order follows may report anything.
+        assert_eq!(
+            super::only_acting_left(&spec.steps[..2], &nodes, &done(&[1])),
+            None
+        );
     }
 
     fn state(node_index: u32, state: RtdlNodeStateEnum) -> RtdlNodeState {
