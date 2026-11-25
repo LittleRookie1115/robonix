@@ -118,6 +118,9 @@ enum Phase {
 pub(crate) struct Opening {
     /// The plan Pilot runs the move as, which a stop cancels.
     plan_id: String,
+    /// "opening" for the task's first round, "handoff" for a later one: what its
+    /// records name it, as the decision model's question is logged under it.
+    stage: &'static str,
     /// Shared with the task that asks and moves, so a move is never sent after
     /// the turn has decided about it.
     phase: Arc<Mutex<Phase>>,
@@ -132,6 +135,11 @@ pub(crate) struct Opening {
     by: Option<(String, u32)>,
     /// Whether that step ran, so the move is not stopped.
     taken_over: bool,
+}
+
+/// What a move's records call the round it is made at.
+fn stage(handoff: bool) -> &'static str {
+    if handoff { "handoff" } else { "opening" }
 }
 
 impl Opening {
@@ -189,12 +197,13 @@ impl Opening {
         let names: Vec<&str> = places.iter().map(|(name, _)| name.as_str()).collect();
         let (state, question) = ask(task, handoff.as_ref(), &names);
         let round = handoff.as_ref().map_or(0, |handoff| handoff.done.len());
+        let stage = stage(handoff.is_some());
         let plan_id = format!("{PLAN_ID}{}", uuid::Uuid::new_v4());
         let phase = Arc::new(Mutex::new(Phase::Asking));
         let (targets, shared, id) = (targets.clone(), phase.clone(), plan_id.clone());
         let task = tokio::spawn(async move {
             let asked = Instant::now();
-            let Ok(pick) = decide("opening", state, question, |_| tau).await else {
+            let Ok(pick) = decide(stage, state, question, |_| tau).await else {
                 return;
             };
             let Some((name, goal)) = pick.parse::<usize>().ok().and_then(|i| places.get(i)) else {
@@ -216,8 +225,8 @@ impl Opening {
             }
             info!(
                 "[pilot/segue] {}",
-                json!({"event": "opening", "plan_id": id, "place": name, "steps_done": round,
-                       "answered_ms": asked.elapsed().as_millis() as u64})
+                json!({"event": "opening", "plan_id": id, "stage": stage, "place": name,
+                       "steps_done": round, "answered_ms": asked.elapsed().as_millis() as u64})
             );
             if let Ok(events) = graph.clone().execute(tonic::Request::new(plan)).await {
                 let mut events = events.into_inner();
@@ -226,6 +235,7 @@ impl Opening {
         });
         Some(Self {
             plan_id,
+            stage,
             phase,
             task,
             control,
@@ -447,7 +457,7 @@ impl Drop for Opening {
         };
         info!(
             "[pilot/segue] {}",
-            json!({"event": "opening_end", "plan_id": self.plan_id, "ended": ended})
+            json!({"event": "opening_end", "plan_id": self.plan_id, "stage": self.stage, "ended": ended})
         );
     }
 }
@@ -542,6 +552,7 @@ mod tests {
         let nowhere = tonic::transport::Channel::from_static("http://[::1]:1").connect_lazy();
         Opening {
             plan_id: "opening-1".into(),
+            stage: "opening",
             phase: Arc::new(Mutex::new(Phase::Moving)),
             task: tokio::spawn(async {}),
             control: RobonixSystemExecutorControlPlanClient::new(nowhere),

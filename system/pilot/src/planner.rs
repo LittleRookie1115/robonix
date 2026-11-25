@@ -1871,7 +1871,7 @@ pub async fn run_turn(
                     if view_ahead.as_ref().is_none_or(|(_, reading)| reading.is_finished()) {
                         let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), last_caps.clone());
                         let check = speculation.as_ref().and_then(Speculation::check_ahead);
-                        view_ahead = Some((std::time::Instant::now(), tokio::spawn(async move {
+                        view_ahead = Some((std::time::Instant::now(), AbortOnDropHandle::new(tokio::spawn(async move {
                             let view = state_context::collect(&executor, &mut atlas, &caps, true).await;
                             // The questions checking the reply, asked of this view, stand when
                             // the tree ends if they come out the same then.
@@ -1879,7 +1879,7 @@ pub async fn run_turn(
                                 check.ask(&view.2["objects"]).await;
                             }
                             view
-                        })));
+                        }))));
                     }
                 }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
@@ -1931,13 +1931,8 @@ pub async fn run_turn(
         // Settling the prepared reply starts here, so the decision model
         // answers while the context below is gathered.
         let pending = speculation.take().map(|mut spec| {
-            let settled = if tasks.messages.len() != spec.messages_seen {
-                Err("user message arrived")
-            } else if !forest.trees.is_empty() || !forest.kill_pending.is_empty() {
-                Err("trees in flight")
-            } else {
-                spec.settle(turn_steps.iter().chain(spec.report()).cloned().collect())
-            };
+            let in_flight = !forest.trees.is_empty() || !forest.kill_pending.is_empty();
+            let settled = spec.settle_now(tasks.messages.len(), in_flight, &turn_steps);
             (spec, settled)
         });
         transcript.record(history, tasks);
@@ -1953,22 +1948,28 @@ pub async fn run_turn(
         // A reply decided on early is checked against the state view read as
         // its tree's last steps ran, if that reading started within the last
         // VIEW_AHEAD_AGE; otherwise, and for the round's own request, one is read now.
+        let settled = pending.as_ref().is_some_and(|(_, settled)| settled.is_ok());
         let ahead = view_ahead
             .take()
-            .filter(|(began, _)| pending.is_some() && began.elapsed() < VIEW_AHEAD_AGE);
+            .filter(|(began, _)| settled && began.elapsed() < VIEW_AHEAD_AGE);
         let ahead = match ahead {
-            Some((began, reading)) => reading.await.ok().map(|view| (began.elapsed(), view)),
+            Some((began, reading)) => reading.await.ok().map(|view| (began, view)),
             None => None,
         };
+        // When the state view in use was read, if it was read ahead: the reply's
+        // check takes it only while it is younger than VIEW_AHEAD_AGE.
+        let mut read_ahead_at = None;
         let (environment_block, map_regions, state) = match ahead {
-            Some((age, view)) => {
+            Some((began, view)) if began.elapsed() < VIEW_AHEAD_AGE => {
                 info!(
                     "[pilot/segue] {}",
-                    serde_json::json!({"event": "decide_early", "state_view_age_ms": age.as_millis() as u64})
+                    serde_json::json!({"event": "decide_early",
+                                       "state_view_age_ms": began.elapsed().as_millis() as u64})
                 );
+                read_ahead_at = Some(began);
                 view
             }
-            None => state_context::collect(executor, atlas, &cap_list, state_view).await,
+            _ => state_context::collect(executor, atlas, &cap_list, state_view).await,
         };
         last_caps = cap_list.clone();
         scene_providers = state_context::SceneProviders::among(&cap_list);
@@ -2221,9 +2222,29 @@ pub async fn run_turn(
                             Err("request answered first".to_string())
                         }
                     };
+                    // A state view read ahead that has aged past VIEW_AHEAD_AGE by the
+                    // time the reply is checked is read again for the check.
+                    let read_again;
+                    let objects = match read_ahead_at
+                        .filter(|began| began.elapsed() >= VIEW_AHEAD_AGE)
+                    {
+                        Some(began) => {
+                            info!(
+                                "[pilot/segue] {}",
+                                serde_json::json!({"event": "decide_early", "read_again": true,
+                                                   "state_view_age_ms": began.elapsed().as_millis() as u64})
+                            );
+                            read_again =
+                                state_context::collect(executor, atlas, &cap_list, state_view)
+                                    .await
+                                    .2;
+                            &read_again["objects"]
+                        }
+                        None => &state["objects"],
+                    };
                     match reply {
                         Ok(reply) => spec
-                            .validate(reply, branch.objects(), &state["objects"])
+                            .validate(reply, branch.objects(), objects)
                             .await
                             .map(|checked| (checked, branch)),
                         Err(reason) => Err(reason),
@@ -2871,7 +2892,7 @@ Copy each cap exactly from the current catalog. Scope feedback by plan_id/call_i
 "#;
 
 /// A state view being read: its environment block, map regions and state.
-type ViewReading = tokio::task::JoinHandle<(String, String, serde_json::Value)>;
+type ViewReading = AbortOnDropHandle<(String, String, serde_json::Value)>;
 
 /// How recently a state view read while a tree's last steps ran must have
 /// started for the check of the reply decided on early to use it.
