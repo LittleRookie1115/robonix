@@ -655,6 +655,11 @@ pub(crate) struct Speculation {
     /// The decision model's answers for it, asked with the steps left assumed
     /// to succeed: the index of the situation it found.
     early: Option<JoinHandle<Result<usize, String>>>,
+    /// That reply once the decision model has picked its situation, which the
+    /// questions checking it may then be asked of (see [`Speculation::check_ahead`]).
+    early_reply: Arc<Mutex<Option<String>>>,
+    /// The objects Scene listed when that reply was written.
+    early_then: Option<Arc<Value>>,
     /// Outputs of this tree's steps that have succeeded so far, by node index.
     succeeded: HashMap<u32, String>,
 }
@@ -1271,6 +1276,8 @@ impl Speculation {
             decide_early: context["decide_early"].as_bool().unwrap_or(true),
             held: None,
             early: None,
+            early_reply: Default::default(),
+            early_then: None,
             succeeded: HashMap::new(),
         })
     }
@@ -1376,6 +1383,7 @@ impl Speculation {
             return;
         };
         branch.reply = tokio::spawn(async { Err("settled early".to_string()) });
+        self.early_then = Some(branch.objects.clone());
         let mut steps = turn_steps.to_vec();
         steps.extend(self.steps.iter().filter_map(|(index, _)| {
             let node = self.nodes.get(*index as usize)?;
@@ -1398,7 +1406,12 @@ impl Speculation {
         let text = prepared.text.clone();
         self.held = Some(prepared);
         self.early = Some(tokio::spawn(decide_ahead(
-            text, state, plan_id, taus, renames, reads,
+            text,
+            state,
+            plan_id,
+            taus,
+            (renames, reads),
+            self.early_reply.clone(),
         )));
     }
 
@@ -1656,70 +1669,33 @@ impl Speculation {
         wanted: &[String],
         objects: &Value,
     ) -> Result<HashMap<String, String>, String> {
-        if DECISION_MODEL.is_none() {
-            return Err("no decision model to choose an object".into());
-        }
-        let rooms = named_rooms(&self.task, objects);
-        let regions = objects.as_object().into_iter().flatten();
-        let regions = regions.filter(|(region, _)| rooms.is_empty() || rooms.contains(region));
-        let listed: Vec<(String, String)> = regions
-            .flat_map(|(region, listed)| {
-                let listed = listed.as_array().into_iter().flatten();
-                listed.filter_map(move |object| {
-                    let label = object["label"].as_str()?;
-                    let unseen = match object["restored"] == true {
-                        true => " (on the saved map, not seen since)",
-                        false => "",
-                    };
-                    Some((
-                        object["id"].as_str()?.to_string(),
-                        format!("{label} in {region}{unseen}"),
-                    ))
-                })
-            })
-            .collect();
-        let mut criteria: serde_json::Map<String, Value> = listed
-            .iter()
-            .enumerate()
-            .map(|(index, (_, listing))| (index.to_string(), listing.clone().into()))
-            .collect();
-        criteria.insert("none".into(), NONE_FITS.into());
-        let mut picks = HashMap::new();
-        for want in wanted {
-            let state = json!({"task": self.task, "looking_for": want});
-            let question = json!({"type": "choice", "instructions": CHOOSE, "criteria": criteria});
-            let pick = decide(&self.plan_id, state, question, |_| self.tau_choice).await?;
-            let (id, _) = pick
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| listed.get(index))
-                .ok_or_else(|| format!("decision model picked unknown object {pick}"))?;
-            picks.insert(want.clone(), id.clone());
-        }
-        Ok(picks)
+        choose_objects(
+            &self.plan_id,
+            &self.task,
+            self.tau_choice,
+            wanted,
+            objects,
+            false,
+        )
+        .await
     }
 
-    /// Whether one of the `new` objects Scene lists ("<label> in <region>") fits
-    /// what `tree`'s search or the task looks for. A label that answers to
-    /// every word searched for, or whose words the search names in full, fits
-    /// at once; otherwise the decision model judges, and without one any new
-    /// object counts.
+    /// Whether one of the `new` objects Scene lists fits what `tree`'s search
+    /// or the task looks for (see [`fits_new`]).
     async fn fits(&self, tree: &Value, new: &[String]) -> bool {
-        let searched = searched_for(tree);
-        let mut labels = new.iter().filter_map(|listed| listed.split(" in ").next());
-        if labels.any(|label| searched.iter().any(|query| answers(label, query))) {
-            return true;
-        }
-        if DECISION_MODEL.is_none() {
-            return true;
-        }
-        let state = json!({"task": self.task, "searched_for": searched, "newly_listed": new});
-        let question = json!({"type": "noul", "instructions": FITS});
-        match decide(&self.plan_id, state, question, |_| NEW_FITS).await {
-            Ok(_) => true,
-            // Below the threshold is a "no"; a model that does not answer counts as a "yes".
-            Err(reason) => !reason.starts_with("decision model: "),
-        }
+        fits_new(&self.plan_id, &self.task, tree, new, false).await
+    }
+
+    /// What lets the questions checking the success reply decided on early be
+    /// asked before its tree ends, once a state view is read: `None` until then.
+    pub(crate) fn check_ahead(&self) -> Option<CheckAhead> {
+        Some(CheckAhead {
+            plan_id: self.plan_id.clone(),
+            task: self.task.clone(),
+            tau_choice: self.tau_choice,
+            reply: self.early_reply.clone(),
+            then: self.early_then.clone()?,
+        })
     }
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
@@ -1771,6 +1747,8 @@ impl Speculation {
             stop: None,
             held: None,
             early: None,
+            early_reply: Default::default(),
+            early_then: None,
             succeeded: HashMap::new(),
             ..self
         })
@@ -1837,12 +1815,13 @@ async fn decide_ahead(
     mut state: Value,
     plan_id: String,
     (tau, tau_done): (f64, f64),
-    renames: Vec<(String, String)>,
-    reads: Arc<HashSet<String>>,
+    (renames, reads): (Vec<(String, String)>, Arc<HashSet<String>>),
+    picked_reply: Arc<Mutex<Option<String>>>,
 ) -> Result<usize, String> {
     let (chosen, index, picked) =
         situation(&plan_id, &reply, state.clone(), tau, &reads, None).await?;
     let chosen = renamed(chosen, &renames);
+    *picked_reply.lock().unwrap_or_else(PoisonError::into_inner) = Some(chosen.clone());
     if needs_results(&chosen) {
         return Err("reply needs results".into());
     }
@@ -1854,6 +1833,186 @@ async fn decide_ahead(
         decide(&plan_id, state, question, |_| tau_done).await?;
     }
     Ok(index)
+}
+
+/// For each of `wanted`, what a `{"choose": ...}` in a reply asks for, the id
+/// of the object in `objects`, Scene's current list by region, that the
+/// decision model picks; otherwise why the reply cannot be used.
+async fn choose_objects(
+    plan_id: &str,
+    task: &str,
+    tau: f64,
+    wanted: &[String],
+    objects: &Value,
+    ahead: bool,
+) -> Result<HashMap<String, String>, String> {
+    if DECISION_MODEL.is_none() {
+        return Err("no decision model to choose an object".into());
+    }
+    let rooms = named_rooms(task, objects);
+    let regions = objects.as_object().into_iter().flatten();
+    let regions = regions.filter(|(region, _)| rooms.is_empty() || rooms.contains(region));
+    let listed: Vec<(String, String)> = regions
+        .flat_map(|(region, listed)| {
+            let listed = listed.as_array().into_iter().flatten();
+            listed.filter_map(move |object| {
+                let label = object["label"].as_str()?;
+                let unseen = match object["restored"] == true {
+                    true => " (on the saved map, not seen since)",
+                    false => "",
+                };
+                Some((
+                    object["id"].as_str()?.to_string(),
+                    format!("{label} in {region}{unseen}"),
+                ))
+            })
+        })
+        .collect();
+    let mut criteria: serde_json::Map<String, Value> = listed
+        .iter()
+        .enumerate()
+        .map(|(index, (_, listing))| (index.to_string(), listing.clone().into()))
+        .collect();
+    criteria.insert("none".into(), NONE_FITS.into());
+    let mut picks = HashMap::new();
+    for want in wanted {
+        let state = json!({"task": task, "looking_for": want});
+        let question = json!({"type": "choice", "instructions": CHOOSE, "criteria": criteria});
+        let pick = decide_once(plan_id, state, question, tau, ahead).await?;
+        let (id, _) = pick
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| listed.get(index))
+            .ok_or_else(|| format!("decision model picked unknown object {pick}"))?;
+        picks.insert(want.clone(), id.clone());
+    }
+    Ok(picks)
+}
+
+/// Whether one of the `new` objects Scene lists ("<label> in <region>") fits
+/// what `tree`'s search or the task looks for. A label that answers to every
+/// word searched for, or whose words the search names in full, fits at once;
+/// otherwise the decision model judges, and without one any new object counts.
+async fn fits_new(plan_id: &str, task: &str, tree: &Value, new: &[String], ahead: bool) -> bool {
+    let searched = searched_for(tree);
+    let mut labels = new.iter().filter_map(|listed| listed.split(" in ").next());
+    if labels.any(|label| searched.iter().any(|query| answers(label, query))) {
+        return true;
+    }
+    if DECISION_MODEL.is_none() {
+        return true;
+    }
+    let state = json!({"task": task, "searched_for": searched, "newly_listed": new});
+    let question = json!({"type": "noul", "instructions": FITS});
+    match decide_once(plan_id, state, question, NEW_FITS, ahead).await {
+        Ok(_) => true,
+        // Below the threshold is a "no"; a model that does not answer counts as a "yes".
+        Err(reason) => !reason.starts_with("decision model: "),
+    }
+}
+
+/// How long an answer the decision model gave to a question checking a reply
+/// stands for the same question asked again.
+const ASKED_FOR: Duration = Duration::from_secs(120);
+
+/// The decision model's answers to the questions checking replies, by question:
+/// one asked while a tree's last steps ran is not asked again when it ends.
+static ASKED: LazyLock<Mutex<HashMap<String, Asked>>> = LazyLock::new(Default::default);
+
+/// When the decision model answered a question checking a reply, and how.
+type Asked = (Instant, Result<String, String>);
+
+/// [`decide`] with threshold `tau`, unless the same question with the same state
+/// was answered within [`ASKED_FOR`], whose answer it returns instead; asked
+/// `ahead` of a tree's end, that reuse goes unlogged.
+async fn decide_once(
+    plan_id: &str,
+    state: Value,
+    question: Value,
+    tau: f64,
+    ahead: bool,
+) -> Result<String, String> {
+    let key = json!({"state": state, "question": question, "tau": tau}).to_string();
+    let known = {
+        let mut known = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+        known.retain(|_, (at, _)| at.elapsed() < ASKED_FOR);
+        known.get(&key).map(|(_, answer)| answer.clone())
+    };
+    if let Some(answer) = known {
+        if ahead {
+            return answer;
+        }
+        info!(
+            "[pilot/segue] {}",
+            json!({"event": "decide_early", "plan_id": plan_id, "reused": question["type"],
+                   "accept": answer.is_ok()})
+        );
+        return answer;
+    }
+    let answer = decide(plan_id, state, question, |_| tau).await;
+    // An answer, kept; a decision model that did not answer is asked again.
+    if answer.as_ref().is_ok()
+        || answer
+            .as_ref()
+            .is_err_and(|why| why.starts_with("decision model: "))
+    {
+        let mut known = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+        known.insert(key, (Instant::now(), answer.clone()));
+    }
+    answer
+}
+
+/// The questions checking a success reply decided on early, asked against a
+/// state view read while its tree's last steps run: which object each
+/// `{"choose": ...}` means, and whether an object Scene newly lists ends the
+/// search it plans. Their answers stand when the tree ends (see [`decide_once`]).
+pub(crate) struct CheckAhead {
+    /// The tree the reply follows.
+    plan_id: String,
+    /// The user's words for the task.
+    task: String,
+    /// Least confidence an object choice needs.
+    tau_choice: f64,
+    /// The reply decided on early, once the decision model has picked it.
+    reply: Arc<Mutex<Option<String>>>,
+    /// The objects Scene listed when the reply was written.
+    then: Arc<Value>,
+}
+
+impl CheckAhead {
+    /// Ask the questions checking the reply against `objects`, Scene's list then.
+    pub(crate) async fn ask(&self, objects: &Value) {
+        let reply = self
+            .reply
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(mut envelope) = reply.and_then(|reply| serde_json::from_str::<Value>(&reply).ok())
+        else {
+            return;
+        };
+        let mut wanted = Vec::new();
+        to_choose(&envelope["rtdl"], &mut wanted);
+        if !wanted.is_empty() {
+            let chosen = choose_objects(
+                &self.plan_id,
+                &self.task,
+                self.tau_choice,
+                &wanted,
+                objects,
+                true,
+            )
+            .await;
+            let Ok(picks) = chosen else { return };
+            fill(&mut envelope["rtdl"], &picks);
+        }
+        if searches(&envelope["rtdl"]) {
+            let new = listed_since(&self.then, objects);
+            if !new.is_empty() {
+                fits_new(&self.plan_id, &self.task, &envelope["rtdl"], &new, true).await;
+            }
+        }
+    }
 }
 
 /// How many steps `steps` (a tree's, in order) has left, given those that have
@@ -3164,6 +3323,8 @@ mod tests {
             decide_early: true,
             held: None,
             early: None,
+            early_reply: Default::default(),
+            early_then: None,
             succeeded: HashMap::new(),
         }
     }
@@ -3241,6 +3402,23 @@ mod tests {
         assert_eq!(pick["output"], serde_json::json!({"object": "cup"}));
         let navigate = reported(&step("robonix/service/navigation/navigate", "{}"));
         assert_eq!(navigate["output"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test]
+    async fn a_question_checking_a_reply_is_asked_once() {
+        use serde_json::json;
+        let (state, question) = (json!({"task": "cached"}), json!({"type": "noul"}));
+        let key = json!({"state": state, "question": question, "tau": 0.5}).to_string();
+        super::ASKED
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), Ok("yes".into())));
+        let ask = |ahead| super::decide_once("p", state.clone(), question.clone(), 0.5, ahead);
+        assert_eq!(ask(true).await, Ok("yes".to_string()));
+        assert_eq!(ask(false).await, Ok("yes".to_string()));
+        // Another threshold is another question, which no decision model answers here.
+        let other = super::decide_once("p", state.clone(), question.clone(), 0.6, false).await;
+        assert!(other.is_err());
     }
 
     #[tokio::test]

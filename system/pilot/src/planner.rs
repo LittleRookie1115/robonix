@@ -1870,8 +1870,15 @@ pub async fn run_turn(
                     // One reading at a time, each started as the last one ends.
                     if view_ahead.as_ref().is_none_or(|(_, reading)| reading.is_finished()) {
                         let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), last_caps.clone());
+                        let check = speculation.as_ref().and_then(Speculation::check_ahead);
                         view_ahead = Some((std::time::Instant::now(), tokio::spawn(async move {
-                            state_context::collect(&executor, &mut atlas, &caps, true).await
+                            let view = state_context::collect(&executor, &mut atlas, &caps, true).await;
+                            // The questions checking the reply, asked of this view, stand when
+                            // the tree ends if they come out the same then.
+                            if let Some(check) = check {
+                                check.ask(&view.2["objects"]).await;
+                            }
+                            view
                         })));
                     }
                 }
