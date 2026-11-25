@@ -2632,9 +2632,36 @@ fn straight(tree: &Value) -> Vec<&Value> {
     steps
 }
 
+/// The `do` steps `tree` runs on its shortest way to end without failing: an
+/// `if` may take neither branch (the shorter one if it has an `else`), a
+/// `while` may run its body no time, a `fallback` may end with its first child,
+/// and a `repeat` runs its body once unless its count is zero.
+fn least_steps(tree: &Value) -> Vec<&Value> {
+    let children = tree["children"].as_array().into_iter().flatten();
+    match tree["op"].as_str() {
+        Some("do") => vec![tree],
+        Some("sequence" | "parallel") => children.flat_map(least_steps).collect(),
+        Some("fallback") => children.take(1).flat_map(least_steps).collect(),
+        Some("if") => match (tree.get("then"), tree.get("else")) {
+            (Some(then), Some(other)) => {
+                let (then, other) = (least_steps(then), least_steps(other));
+                if then.len() <= other.len() {
+                    then
+                } else {
+                    other
+                }
+            }
+            _ => Vec::new(),
+        },
+        Some("repeat") if tree["count"].as_u64().unwrap_or(0) > 0 => least_steps(&tree["body"]),
+        _ => Vec::new(),
+    }
+}
+
 /// For each reply in `text`, start preparing what could not be written in
 /// time once the tree it dispatches runs: the reply after that tree, if the
-/// tree is expected to end before a reply could be written, and the reply
+/// tree may end before a reply could be written (by the soonest it can end:
+/// an `if` whose condition does not hold skips its steps), and the reply
 /// after the failure of each step that fails often enough and would fail
 /// that early. `messages` is the request `text` answered; the trees start
 /// from `from` as far as is known.
@@ -2672,7 +2699,7 @@ fn look_ahead(
         // A stop comes once the robot sees the change, often while the tree's
         // first navigation runs, before a reply asked for at its dispatch is written.
         let stop = !branch && request.stops && request.margin && !readable;
-        let ((run, end), first, write, early) = {
+        let ((run, end), first, write, early, soonest) = {
             let timings = timings();
             let write = timings.write_time(request.margin);
             let steps = reply_steps(&reply["rtdl"]);
@@ -2701,9 +2728,25 @@ fn look_ahead(
                 true => timings.calibrated(run.0),
                 false => run.0,
             };
-            (run, first, write, early)
+            // A tree may end long before all its steps would have run: an `if`
+            // whose condition does not hold skips its steps. Its next reply is
+            // needed by the soonest it can end.
+            let least: Vec<(String, Value)> = least_steps(&reply["rtdl"])
+                .into_iter()
+                .map(|node| {
+                    (
+                        node["cap"].as_str().unwrap_or("").to_string(),
+                        node["args"].clone(),
+                    )
+                })
+                .collect();
+            let soonest = match (request.margin, expected(&least).0) {
+                (true, Some(least)) => Some(first.map_or(least, |first| first.min(least))),
+                _ => first,
+            };
+            (run, first, write, early, soonest)
         };
-        let short = first.zip(write).is_some_and(|(run, write)| run < write);
+        let short = soonest.zip(write).is_some_and(|(run, write)| run < write);
         // A request is due to start its write time before its reply is needed,
         // `needed` after the tree this reply follows ends; it starts sooner if
         // that tree is dispatched sooner.
@@ -2728,7 +2771,8 @@ fn look_ahead(
                 "stop": stop,
                 "margin": request.margin,
                 "calibrated_ms": first.map(|first| first.as_millis() as u64),
-                "start_in_ms": start(first).map(|(at, _)| (at - Instant::now()).as_millis() as u64),
+                "soonest_ms": soonest.map(|soonest| soonest.as_millis() as u64),
+                "start_in_ms": start(soonest).map(|(at, _)| (at - Instant::now()).as_millis() as u64),
             })
         );
         if !(short || readable) && early.is_empty() && !stop {
@@ -2831,7 +2875,7 @@ fn look_ahead(
             let objects = request.objects.clone();
             let (request, reply) = (request.clone(), reply.clone());
             // A tree read ahead runs now, whenever its reply is due.
-            let wait = start(first).filter(|_| !readable);
+            let wait = start(soonest).filter(|_| !readable);
             let due = due.zip(first).map(|(due, first)| due + first);
             let reply = tokio::spawn(async move {
                 let read = match readable {
@@ -3070,6 +3114,27 @@ mod tests {
                 .await
                 .is_err_and(|why| why.starts_with("reply rejected"))
         );
+    }
+
+    #[test]
+    fn a_tree_may_end_after_only_the_steps_no_condition_can_skip() {
+        use serde_json::json;
+        let call = |cap: &str| json!({"op": "do", "cap": cap});
+        let tree = json!({"op": "sequence", "children": [
+            call("goal_near"),
+            {"op": "if", "condition": true, "then": {"op": "sequence", "children": [
+                call("navigate"), call("pick")]}},
+            {"op": "fallback", "children": [call("find"), call("snapshot")]},
+            {"op": "if", "condition": true, "then": call("speak"),
+             "else": {"op": "sequence", "children": [call("navigate"), call("speak")]}},
+            {"op": "while", "condition": true, "max_iterations": 3, "body": call("find")},
+            {"op": "repeat", "count": 2, "body": call("place")},
+        ]});
+        let caps: Vec<&str> = super::least_steps(&tree)
+            .into_iter()
+            .map(|node| node["cap"].as_str().unwrap())
+            .collect();
+        assert_eq!(caps, ["goal_near", "find", "speak", "place"]);
     }
 
     #[tokio::test]
