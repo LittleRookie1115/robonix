@@ -137,11 +137,6 @@ pub(crate) struct Opening {
     taken_over: bool,
 }
 
-/// What a move's records call the round it is made at.
-fn stage(handoff: bool) -> &'static str {
-    if handoff { "handoff" } else { "opening" }
-}
-
 impl Opening {
     /// Ask where `task` begins among `places` (the state view's map places, each
     /// with the goal goal_region gave it), or at a later round (`handoff`) where
@@ -197,7 +192,10 @@ impl Opening {
         let names: Vec<&str> = places.iter().map(|(name, _)| name.as_str()).collect();
         let (state, question) = ask(task, handoff.as_ref(), &names);
         let round = handoff.as_ref().map_or(0, |handoff| handoff.done.len());
-        let stage = stage(handoff.is_some());
+        let stage = match handoff {
+            Some(_) => "handoff",
+            None => "opening",
+        };
         let plan_id = format!("{PLAN_ID}{}", uuid::Uuid::new_v4());
         let phase = Arc::new(Mutex::new(Phase::Asking));
         let (targets, shared, id) = (targets.clone(), phase.clone(), plan_id.clone());

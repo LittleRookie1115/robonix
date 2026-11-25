@@ -1749,11 +1749,8 @@ pub async fn run_turn(
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
-    // With a success reply decided on early, the state view its check reads,
-    // taken while the tree's last steps run so that the check need not wait
-    // for one when the tree ends: when the reading started, and the reading.
-    let mut view_ahead: Option<(std::time::Instant, ViewReading)> = None;
-    // The capabilities the last round found, which a reading ahead queries.
+    let mut early_views = EarlyViews::default();
+    // The capabilities the last round found, which a state view read early queries.
     let mut last_caps: Vec<(String, atlas_pb::Capability)> = Vec::new();
     // The robot heading where the task begins while its first plan is written.
     let mut opening: Option<crate::opening::Opening> = None;
@@ -1865,21 +1862,10 @@ pub async fn run_turn(
                 _ = early_tick.tick(), if speculation.as_ref().is_some_and(Speculation::may_decide_early) => {
                     speculation.iter_mut().for_each(|spec| spec.decide_early(&turn_steps));
                 }
-                _ = view_tick.tick(), if state_view && !last_caps.is_empty()
-                    && speculation.as_ref().is_some_and(Speculation::decided_early) => {
-                    // One reading at a time, each started as the last one ends.
-                    if view_ahead.as_ref().is_none_or(|(_, reading)| reading.is_finished()) {
-                        let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), last_caps.clone());
-                        let check = speculation.as_ref().and_then(Speculation::check_ahead);
-                        view_ahead = Some((std::time::Instant::now(), AbortOnDropHandle::new(tokio::spawn(async move {
-                            let view = state_context::collect(&executor, &mut atlas, &caps, true).await;
-                            // The questions checking the reply, asked of this view, stand when
-                            // the tree ends if they come out the same then.
-                            if let Some(check) = check {
-                                check.ask(&view.2["objects"]).await;
-                            }
-                            view
-                        }))));
+                _ = view_tick.tick(), if state_view && !last_caps.is_empty() && speculation.is_some()
+                    && !early_views.reading() => {
+                    if let Some(check) = speculation.as_mut().and_then(Speculation::early_check) {
+                        early_views.read(executor, atlas, &last_caps, check);
                     }
                 }
                 _ = watch_tick.tick(), if watches.iter().any(Watch::armed) => {
@@ -1945,31 +1931,23 @@ pub async fn run_turn(
 
         let embodiment_block =
             crate::soma_context::fetch_runtime_prompt_block(atlas, consumer_id).await;
-        // A reply decided on early is checked against the state view read as
-        // its tree's last steps ran, if that reading started within the last
-        // VIEW_AHEAD_AGE; otherwise, and for the round's own request, one is read now.
-        let settled = pending.as_ref().is_some_and(|(_, settled)| settled.is_ok());
-        let ahead = view_ahead
-            .take()
-            .filter(|(began, _)| settled && began.elapsed() < VIEW_AHEAD_AGE);
-        let ahead = match ahead {
-            Some((began, reading)) => reading.await.ok().map(|view| (began, view)),
-            None => None,
-        };
-        // When the state view in use was read, if it was read ahead: the reply's
-        // check takes it only while it is younger than VIEW_AHEAD_AGE.
-        let mut read_ahead_at = None;
-        let (environment_block, map_regions, state) = match ahead {
-            Some((began, view)) if began.elapsed() < VIEW_AHEAD_AGE => {
+        // The success reply decided on early takes, for the round, the state view
+        // read last while its tree's last steps ran; any other round reads one now.
+        let early_view = early_views.take();
+        let early_view = early_view.filter(|_| {
+            pending
+                .as_ref()
+                .is_some_and(|(spec, settled)| settled.is_ok() && spec.early_taken())
+        });
+        let (environment_block, map_regions, state) = match &early_view {
+            Some(early) => {
                 info!(
                     "[pilot/segue] {}",
-                    serde_json::json!({"event": "decide_early",
-                                       "state_view_age_ms": began.elapsed().as_millis() as u64})
+                    serde_json::json!({"event": "decide_early", "state_view_age_ms": early.age_ms()})
                 );
-                read_ahead_at = Some(began);
-                view
+                early.view.clone()
             }
-            _ => state_context::collect(executor, atlas, &cap_list, state_view).await,
+            None => state_context::collect(executor, atlas, &cap_list, state_view).await,
         };
         last_caps = cap_list.clone();
         scene_providers = state_context::SceneProviders::among(&cap_list);
@@ -2222,29 +2200,29 @@ pub async fn run_turn(
                             Err("request answered first".to_string())
                         }
                     };
-                    // A state view read ahead that has aged past VIEW_AHEAD_AGE by the
-                    // time the reply is checked is read again for the check.
+                    // The reply is checked against the view read early only while that
+                    // view is younger than EARLY_VIEW_AGE, with the answers asked of it.
                     let read_again;
-                    let objects = match read_ahead_at
-                        .filter(|began| began.elapsed() >= VIEW_AHEAD_AGE)
-                    {
-                        Some(began) => {
+                    let (objects, asked) = match early_view {
+                        // The round's state is that view.
+                        Some(early) if early.fresh() => (&state["objects"], early.checked),
+                        Some(early) => {
                             info!(
                                 "[pilot/segue] {}",
                                 serde_json::json!({"event": "decide_early", "read_again": true,
-                                                   "state_view_age_ms": began.elapsed().as_millis() as u64})
+                                                   "state_view_age_ms": early.age_ms()})
                             );
                             read_again =
                                 state_context::collect(executor, atlas, &cap_list, state_view)
                                     .await
                                     .2;
-                            &read_again["objects"]
+                            (&read_again["objects"], None)
                         }
-                        None => &state["objects"],
+                        None => (&state["objects"], None),
                     };
                     match reply {
                         Ok(reply) => spec
-                            .validate(reply, branch.objects(), objects)
+                            .validate(reply, branch.objects(), objects, asked)
                             .await
                             .map(|checked| (checked, branch)),
                         Err(reason) => Err(reason),
@@ -2328,7 +2306,6 @@ pub async fn run_turn(
         let mut execution_failed = false;
         let mut invalid_output = false;
         let mut reasoning_bytes = 0_usize;
-        // When the reply's text began, after any thinking, for the round's timing line below.
         let mut text_began: Option<std::time::Duration> = None;
         // With the read set off a change is only logged, once per reply rather
         // than at each step sent after it.
@@ -2891,12 +2868,93 @@ Resolve a named room through current Scene regions before navigation; never use 
 Copy each cap exactly from the current catalog. Scope feedback by plan_id/call_id. A dispatch record describes submitted RTDL nodes, not actual capability invocations. Use Executor leaf feedback to confirm calls that ran. A successful repeat result reports how many times its body ran, including zero. Do not repeat successful work.
 "#;
 
-/// A state view being read: its environment block, map regions and state.
-type ViewReading = AbortOnDropHandle<(String, String, serde_json::Value)>;
-
 /// How recently a state view read while a tree's last steps ran must have
 /// started for the check of the reply decided on early to use it.
-const VIEW_AHEAD_AGE: Duration = Duration::from_secs(2);
+const EARLY_VIEW_AGE: Duration = Duration::from_secs(2);
+
+/// State views read each second while a tree's last steps run, once its success
+/// reply is decided on early, so that the reply's check need not wait for one
+/// when the tree ends.
+#[derive(Default)]
+struct EarlyViews {
+    /// The last view read, shared with the reading that fills it.
+    latest: Arc<std::sync::Mutex<Option<EarlyView>>>,
+    /// The reading under way, abandoned when dropped.
+    reading: Option<AbortOnDropHandle<()>>,
+}
+
+/// A state view read early, with the answers checking the reply against it.
+struct EarlyView {
+    /// When its reading started.
+    began: std::time::Instant,
+    /// Its environment block, map regions and state.
+    view: (String, String, serde_json::Value),
+    /// The answers checking the reply decided on early, once asked of it.
+    checked: Option<speculation::Checked>,
+}
+
+impl EarlyView {
+    /// Whether the view is still young enough to check a reply against.
+    fn fresh(&self) -> bool {
+        self.began.elapsed() < EARLY_VIEW_AGE
+    }
+
+    /// The view's age, for its record.
+    fn age_ms(&self) -> u64 {
+        self.began.elapsed().as_millis() as u64
+    }
+}
+
+impl EarlyViews {
+    /// Whether a reading is under way.
+    fn reading(&self) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|reading| !reading.is_finished())
+    }
+
+    /// Read the state view, keep it as the latest, then ask `check`'s questions of it.
+    fn read(
+        &mut self,
+        executor: &ExecutorConn,
+        atlas: &AtlasClient,
+        caps: &[(String, atlas_pb::Capability)],
+        check: speculation::EarlyCheck,
+    ) {
+        let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), caps.to_vec());
+        let latest = self.latest.clone();
+        self.reading = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let began = std::time::Instant::now();
+            let view = state_context::collect(&executor, &mut atlas, &caps, true).await;
+            let objects = view.2["objects"].clone();
+            let lock = || {
+                latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            };
+            *lock() = Some(EarlyView {
+                began,
+                view,
+                checked: None,
+            });
+            let checked = check.ask(&objects).await.ok();
+            if let Some(early) = lock().as_mut().filter(|early| early.began == began) {
+                early.checked = checked;
+            }
+        })));
+    }
+
+    /// The latest view if it is fresh, abandoning any reading under way.
+    fn take(&mut self) -> Option<EarlyView> {
+        self.reading = None;
+        let latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        latest.filter(EarlyView::fresh)
+    }
+}
 
 /// The RTDL protocol text sent on every planning round, with or without
 /// Segue's guidance on folding reads into the trees that act on them.

@@ -326,9 +326,9 @@ fn plan_steps(plan: &Plan) -> Vec<(String, Value)> {
         .collect()
 }
 
-/// A reply tree's steps as capability and arguments, in the order they are numbered.
-fn reply_steps(tree: &Value) -> Vec<(String, Value)> {
-    do_nodes(tree)
+/// A reply tree's `do` nodes as capability and arguments, in the order given.
+fn reply_steps(nodes: Vec<&Value>) -> Vec<(String, Value)> {
+    nodes
         .into_iter()
         .map(|node| {
             (
@@ -648,54 +648,80 @@ pub(crate) struct Speculation {
     /// Whether the success reply was asked in the short form, whose write time
     /// a reply the round's own request beat says nothing about.
     short: bool,
-    /// Whether to settle the success reply while the tree's last steps still
-    /// run, once those only act: the task's `decide_early`, on by default.
+    /// Whether to decide on the success reply while the tree's last steps
+    /// still run, once those only act: the task's `decide_early`, on by default.
     decide_early: bool,
-    /// The success reply, once taken to be decided on early.
-    held: Option<Prepared>,
-    /// The decision model's answers for it, asked with the steps left assumed
-    /// to succeed: the index of the situation it found.
-    early: Option<AbortOnDropHandle<Result<usize, String>>>,
-    /// That reply once the decision model has picked its situation, which the
-    /// questions checking it may then be asked of (see [`Speculation::check_ahead`]).
-    early_reply: Arc<Mutex<Option<String>>>,
-    /// The objects Scene listed when that reply was written.
-    early_then: Option<Arc<Value>>,
-    /// Outputs of this tree's steps that have succeeded so far, by node index.
-    succeeded: HashMap<u32, String>,
+    /// The success reply once decided on early.
+    early: Option<Early>,
+    /// What this tree's steps that have succeeded so far returned, by node index.
+    succeeded: HashMap<u32, CapabilityCallResult>,
+    /// Whether the reply settled when the tree ended is the success reply
+    /// decided on early.
+    early_taken: bool,
 }
 
-/// Capabilities whose output says no more than that they succeeded: with the
-/// steps left in a tree only these, its success is known before it ends but
-/// for whether they succeed.
-const ONLY_ACT: [&str; 4] = [
-    "robonix/service/navigation/navigate",
-    "robonix/skill/manipulation/pick",
-    "robonix/skill/manipulation/place",
-    "robonix/service/speech/speak",
-];
+/// The success reply decided on before its tree ended.
+struct Early {
+    /// The reply as written, with its situations.
+    reply: Prepared,
+    /// The objects Scene listed when it was written.
+    then: Arc<Value>,
+    /// The steps reported to the decision model as succeeded though still
+    /// running, by node index: its answer stands only if each of them succeeds.
+    assumed: Vec<u32>,
+    /// The decision model being asked, until it answers.
+    asking: Option<AbortOnDropHandle<Result<(usize, String), String>>>,
+    /// Its answer: the situation's index and that situation's reply, or why none.
+    answer: Option<Result<(usize, String), String>>,
+}
 
-/// What a step that only acts returns once it succeeds, which says no more than
-/// its arguments: deciding early reports a step still running as this.
-fn acted(node: &RtdlNode) -> CapabilityCallResult {
-    let call = node.call.clone().unwrap_or_default();
-    let args: Value = serde_json::from_str(&call.args_json).unwrap_or_default();
-    let output = match call.contract_id.rsplit('/').next().unwrap_or("") {
-        "navigate" => json!({"known": true, "state": "SUCCEEDED", "detail": "succeeded"}),
-        "pick" => json!({"object": args["object"]}),
-        "place" => json!({"target": args["target"]}),
-        _ => json!({"ok": true}),
-    };
-    CapabilityCallResult {
-        output: output.to_string(),
-        ..Default::default()
+impl Early {
+    /// The decision model's answer, once it has given one.
+    fn answer(&mut self) -> Option<&Result<(usize, String), String>> {
+        if self
+            .asking
+            .as_ref()
+            .is_some_and(AbortOnDropHandle::is_finished)
+        {
+            let asking = self.asking.take().and_then(|asking| asking.now_or_never());
+            self.answer = Some(asking.map_or_else(
+                || Err("request failed".into()),
+                |done| done.unwrap_or_else(|_| Err("request failed".into())),
+            ));
+        }
+        self.answer.as_ref()
     }
 }
 
-/// A step as the decision model reads it: what it called and, once it has
-/// ended, how; `None` for a step still running, reported as succeeded with what
-/// such a step returns.
-fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) -> Value {
+/// What a step that only acts (navigate, pick, place, speak) returns once it
+/// succeeds, which says no more than its arguments; `None` for any other step,
+/// whose output may decide what comes next. Deciding early reports a step still
+/// running as this. An argument bound only as the tree runs is not known yet.
+fn acted(node: &RtdlNode) -> Option<CapabilityCallResult> {
+    let call = node.call.as_ref()?;
+    let args: Value = serde_json::from_str(&call.args_json).unwrap_or_default();
+    let known = |arg: &Value| match arg.as_object() {
+        Some(object) if crate::expression::is_reference(object) => Value::Null,
+        _ => arg.clone(),
+    };
+    let output = match call.contract_id.as_str() {
+        "robonix/service/navigation/navigate" => {
+            json!({"known": true, "state": "SUCCEEDED", "detail": "succeeded"})
+        }
+        "robonix/skill/manipulation/pick" => json!({"object": known(&args["object"])}),
+        "robonix/skill/manipulation/place" => json!({"target": known(&args["target"])}),
+        "robonix/service/speech/speak" => json!({"ok": true}),
+        _ => return None,
+    };
+    Some(CapabilityCallResult {
+        output: output.to_string(),
+        ..Default::default()
+    })
+}
+
+/// A step as the decision model reads it: what it called and how it ended,
+/// `succeeded` with what `leaf` returned, or failed with its error.
+fn report_step(node: &RtdlNode, succeeded: bool, leaf: &CapabilityCallResult) -> Value {
     let parse = |text: &str| serde_json::from_str(text).unwrap_or_else(|_| Value::from(text));
     let call = node.call.clone().unwrap_or_default();
     let mut step = json!({
@@ -703,34 +729,23 @@ fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) ->
         "capability": call.contract_id,
         "args": parse(&call.args_json),
     });
-    let running;
-    let ended = match ended {
-        Some(ended) => ended,
-        None => {
-            running = acted(node);
-            (true, &running)
+    if succeeded {
+        step["status"] = "succeeded".into();
+        // The decision model reads text only, and one image's base64
+        // alone exceeds its input limit.
+        step["output"] = if crate::history::is_image_output(&leaf.output) {
+            IMAGE_NOT_SHOWN.into()
+        } else {
+            parse(&leaf.output)
+        };
+    } else {
+        step["status"] = "failed".into();
+        step["error"] = if leaf.error.is_empty() {
+            leaf.output.clone()
+        } else {
+            leaf.error.clone()
         }
-    };
-    match ended {
-        (true, leaf) => {
-            step["status"] = "succeeded".into();
-            // The decision model reads text only, and one image's base64
-            // alone exceeds its input limit.
-            step["output"] = if crate::history::is_image_output(&leaf.output) {
-                IMAGE_NOT_SHOWN.into()
-            } else {
-                parse(&leaf.output)
-            };
-        }
-        (false, leaf) => {
-            step["status"] = "failed".into();
-            step["error"] = if leaf.error.is_empty() {
-                leaf.output.clone()
-            } else {
-                leaf.error.clone()
-            }
-            .into();
-        }
+        .into();
     }
     step
 }
@@ -1275,11 +1290,9 @@ impl Speculation {
             dispatched,
             short,
             decide_early: context["decide_early"].as_bool().unwrap_or(true),
-            held: None,
             early: None,
-            early_reply: Default::default(),
-            early_then: None,
             succeeded: HashMap::new(),
+            early_taken: false,
         })
     }
 
@@ -1342,22 +1355,32 @@ impl Speculation {
         {
             let failed = Outcome::Failed(step.op_id.clone());
             self.branches.retain(|branch| branch.outcome != failed);
-            let output = node.leaf_result.as_ref().map(|leaf| leaf.output.clone());
-            self.succeeded
-                .insert(node.node_index, output.unwrap_or_default());
+            let leaf = node.leaf_result.clone().unwrap_or_default();
+            self.succeeded.insert(node.node_index, leaf);
         }
     }
 
-    /// Whether the success reply has been decided on early.
-    pub(crate) fn decided_early(&self) -> bool {
-        self.held.is_some()
-            && self
-                .early
-                .as_ref()
-                .is_some_and(AbortOnDropHandle::is_finished)
+    /// What lets the questions checking the success reply decided on early be
+    /// asked before the tree ends: once the decision model has picked that
+    /// reply's situation.
+    pub(crate) fn early_check(&mut self) -> Option<EarlyCheck> {
+        let (plan_id, task, tau_choice) =
+            (self.plan_id.clone(), self.task.clone(), self.tau_choice);
+        let early = self.early.as_mut()?;
+        let then = early.then.clone();
+        let Some(Ok((_, reply))) = early.answer() else {
+            return None;
+        };
+        Some(EarlyCheck {
+            plan_id,
+            task,
+            tau_choice,
+            reply: reply.clone(),
+            then,
+        })
     }
 
-    /// Whether the success reply may yet be settled early.
+    /// Whether the success reply may yet be decided on early.
     pub(crate) fn may_decide_early(&self) -> bool {
         self.decide_early
             && self.early.is_none()
@@ -1365,11 +1388,11 @@ impl Speculation {
             && DECISION_MODEL.is_some()
     }
 
-    /// Settle the success reply now if every step the tree has left only acts
-    /// and the reply is written: the decision model, asked while those steps
-    /// run on the steps so far and them assumed to succeed, answers before the
-    /// tree ends, and [`Speculation::settle`] uses that answer if it succeeds.
-    /// `turn_steps` are the steps of the turn's earlier trees.
+    /// Decide on the success reply now if every step the tree has left only acts
+    /// and the reply is written: the decision model, asked while those steps run
+    /// on the steps so far with them reported as succeeded, answers before the
+    /// tree ends, and [`Speculation::settle`] takes that answer if each of them
+    /// does succeed. `turn_steps` are the steps of the turn's earlier trees.
     pub(crate) fn decide_early(&mut self, turn_steps: &[Value]) {
         if !self.may_decide_early() {
             return;
@@ -1384,23 +1407,39 @@ impl Speculation {
         else {
             return;
         };
-        let Some(Ok(Ok(prepared))) = (&mut branch.reply).now_or_never() else {
-            return;
+        // A finished handle's output is taken once; whatever it was, one stands in its place.
+        let written = std::mem::replace(
+            &mut branch.reply,
+            tokio::spawn(async { Err("decided early".to_string()) }),
+        );
+        let prepared = match written.now_or_never() {
+            Some(Ok(Ok(prepared))) => prepared,
+            other => {
+                let why = match other {
+                    Some(Ok(Err(why))) => why,
+                    _ => "request failed".to_string(),
+                };
+                branch.reply = tokio::spawn(async { Err(why) });
+                self.decide_early = false;
+                return;
+            }
         };
-        branch.reply = tokio::spawn(async { Err("settled early".to_string()) });
-        self.early_then = Some(branch.objects.clone());
+        let then = branch.objects.clone();
+        let mut assumed = Vec::new();
         let mut steps = turn_steps.to_vec();
-        steps.extend(self.steps.iter().filter_map(|(index, _)| {
-            let node = self.nodes.get(*index as usize)?;
-            let ended = self
-                .succeeded
-                .get(index)
-                .map(|output| CapabilityCallResult {
-                    output: output.clone(),
-                    ..Default::default()
-                });
-            Some(report_step(node, ended.as_ref().map(|leaf| (true, leaf))))
-        }));
+        for (index, _) in &self.steps {
+            let Some(node) = self.nodes.get(*index as usize) else {
+                continue;
+            };
+            let leaf = match self.succeeded.get(index) {
+                Some(leaf) => leaf.clone(),
+                None => {
+                    assumed.push(*index);
+                    acted(node).unwrap_or_default()
+                }
+            };
+            steps.push(report_step(node, true, &leaf));
+        }
         let state = json!({"task": self.task, "steps": steps});
         let (plan_id, taus) = (self.plan_id.clone(), (self.tau_success, self.tau_done));
         let (renames, reads) = (self.renames.clone(), self.reads.clone());
@@ -1409,15 +1448,18 @@ impl Speculation {
             json!({"event": "decide_early", "plan_id": plan_id, "steps_left": left})
         );
         let text = prepared.text.clone();
-        self.held = Some(prepared);
-        self.early = Some(AbortOnDropHandle::new(tokio::spawn(decide_ahead(
-            text,
-            state,
-            plan_id,
-            taus,
-            (renames, reads),
-            self.early_reply.clone(),
-        ))));
+        let asking = tokio::spawn(async move {
+            let (reply, index) =
+                pick_reply(&text, &state, &plan_id, taus, &renames, &reads, None).await?;
+            Ok((index, reply))
+        });
+        self.early = Some(Early {
+            reply: prepared,
+            then,
+            assumed,
+            asking: Some(AbortOnDropHandle::new(asking)),
+            answer: None,
+        });
     }
 
     /// Record how the tree ended, from its completion.
@@ -1443,6 +1485,10 @@ impl Speculation {
             })
             .collect();
         leaves.sort_by_key(|(r, _)| r.node_index);
+        for (r, _) in leaves.iter().filter(|(r, _)| r.state == succeeded) {
+            let leaf = r.leaf_result.clone().unwrap_or_default();
+            self.succeeded.insert(r.node_index, leaf);
+        }
         // A speculation prepared ahead already holds the outputs of the trees before this one.
         self.outputs.extend(
             leaves
@@ -1457,7 +1503,7 @@ impl Speculation {
             .filter(|(r, _)| r.state == succeeded || failed(r.state))
             .map(|(r, node)| {
                 let leaf = r.leaf_result.clone().unwrap_or_default();
-                report_step(node, Some((r.state == succeeded, &leaf)))
+                report_step(node, r.state == succeeded, &leaf)
             })
             .collect();
         let state = |index: u32| {
@@ -1528,10 +1574,17 @@ impl Speculation {
         &self.report
     }
 
+    /// Whether the reply settled when the tree ended is the success reply
+    /// decided on early, which a state view read while the tree's last steps
+    /// ran may check.
+    pub(crate) fn early_taken(&self) -> bool {
+        self.early_taken
+    }
+
     /// [`Speculation::settle`] on the turn's `earlier` steps and this tree's,
     /// unless a user message arrived since the replies were asked for (the
-    /// task holds `messages` now) or other trees are `in_flight`: replies
-    /// written for neither stand.
+    /// task holds `messages` now) or other trees are `in_flight`: a reply was
+    /// written for neither.
     pub(crate) fn settle_now(
         &mut self,
         messages: usize,
@@ -1565,22 +1618,40 @@ impl Speculation {
         let renames = self.renames.clone();
         let (reads, own) = (self.reads.clone(), self.report.clone());
         let state = json!({"task": self.task, "steps": steps});
-        // A success decided on early takes those answers; asked on steps assumed
-        // to succeed, a refusal is asked again on what they returned.
-        let held = self.held.take().filter(|_| outcome == Outcome::Succeeded);
-        let early = self.early.take().filter(|_| held.is_some());
+        // A success decided on early takes those answers if every step they
+        // assumed to succeed did; otherwise, or refused, they are asked again on
+        // what the steps returned.
+        let early = self.early.take().filter(|_| outcome == Outcome::Succeeded);
+        let ran = early
+            .as_ref()
+            .is_some_and(|early| stands(&early.assumed, &self.succeeded));
+        self.early_taken = early.is_some();
         let reply = tokio::spawn(async move {
-            let (prepared, decided) = match (held, early) {
-                (Some(prepared), Some(early)) => {
-                    let answer = early.await.unwrap_or_else(|_| Err("request failed".into()));
+            let (prepared, decided) = match early {
+                Some(mut early) => {
+                    let answer = match early.asking.take() {
+                        Some(asking) => asking
+                            .await
+                            .unwrap_or_else(|_| Err("request failed".into())),
+                        None => early
+                            .answer
+                            .take()
+                            .unwrap_or_else(|| Err("not asked".into())),
+                    };
+                    let why_not = match &answer {
+                        Err(why) => Some(why.clone()),
+                        Ok(_) if !ran => Some("a step assumed to succeed did not".to_string()),
+                        Ok(_) => None,
+                    };
                     info!(
                         "[pilot/segue] {}",
-                        json!({"event": "decide_early", "plan_id": plan_id, "used": answer.is_ok(),
-                               "why_not": answer.as_ref().err()})
+                        json!({"event": "decide_early", "plan_id": plan_id, "used": why_not.is_none(),
+                               "why_not": why_not})
                     );
-                    (prepared, answer.ok())
+                    let decided = answer.ok().filter(|_| ran).map(|(index, _)| index);
+                    (early.reply, decided)
                 }
-                _ => (written.reply().await?, None),
+                None => (written.reply().await?, None),
             };
             if let Some(read) = &prepared.read {
                 let now = own.iter().map(|step| &step["output"]);
@@ -1618,34 +1689,42 @@ impl Speculation {
         reply: String,
         then: &Value,
         objects: &Value,
+        asked: Option<Checked>,
     ) -> Result<(String, Option<String>), String> {
         let mut envelope: Value =
             serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
-        let mut wanted = Vec::new();
-        to_choose(&envelope["rtdl"], &mut wanted);
-        let reply = match wanted.is_empty() {
+        // Answers asked early stand for this reply against these objects only.
+        let asked = asked.filter(|asked| asked.reply == reply);
+        let reused = asked.is_some();
+        let checked = match asked {
+            Some(checked) => checked,
+            None => {
+                let asker = (self.plan_id.as_str(), self.task.as_str(), self.tau_choice);
+                let (picks, new) = check(asker, &envelope["rtdl"], then, objects).await?;
+                Checked {
+                    reply: reply.clone(),
+                    picks,
+                    new,
+                }
+            }
+        };
+        if reused {
+            info!(
+                "[pilot/segue] {}",
+                json!({"event": "decide_early", "plan_id": self.plan_id, "checks_reused": true})
+            );
+        }
+        let reply = match checked.picks.is_empty() {
             true => reply,
             false => {
-                let (plan_id, task, tau) = (&self.plan_id, &self.task, self.tau_choice);
-                let picks = choose_objects(plan_id, task, tau, &wanted, objects, false).await?;
-                fill(&mut envelope["rtdl"], &picks);
+                fill(&mut envelope["rtdl"], &checked.picks);
                 envelope.to_string()
             }
         };
         // The objects the tree reaches through an earlier step's output count as named.
         let mut tree = resolved(&envelope["rtdl"], &self.outputs);
         let moved = moved(&tree, then, objects, &returned(&self.outputs));
-        // A search was planned for what Scene did not list then; once Scene lists an
-        // object that fits what the task looks for, the reply is not used.
-        let mut new = match searches(&envelope["rtdl"]) {
-            true => listed_since(then, objects),
-            false => Vec::new(),
-        };
-        if !new.is_empty()
-            && !fits_new(&self.plan_id, &self.task, &envelope["rtdl"], &new, false).await
-        {
-            new.clear();
-        }
+        let new = checked.new;
         if moved.is_empty() && new.is_empty() {
             return Ok((reply, None));
         }
@@ -1687,18 +1766,6 @@ impl Speculation {
                 )),
             )),
         }
-    }
-
-    /// What lets the questions checking the success reply decided on early be
-    /// asked before its tree ends, once a state view is read: `None` until then.
-    pub(crate) fn check_ahead(&self) -> Option<CheckAhead> {
-        Some(CheckAhead {
-            plan_id: self.plan_id.clone(),
-            task: self.task.clone(),
-            tau_choice: self.tau_choice,
-            reply: self.early_reply.clone(),
-            then: self.early_then.clone()?,
-        })
     }
 
     /// Log why the prepared replies go unused; dropping them aborts their requests.
@@ -1748,59 +1815,47 @@ impl Speculation {
             go: Some(ahead.go),
             expected: None,
             stop: None,
-            held: None,
             early: None,
-            early_reply: Default::default(),
-            early_then: None,
             succeeded: HashMap::new(),
+            early_taken: false,
             ..self
         })
     }
 }
 
 /// The one reply to use of those `prepared` for an outcome, given the turn's
-/// steps in `state`: the situation the decision model finds, checked against
-/// what came back empty or the same before, and for a reply that dispatches
-/// nothing, whether the steps support it; or why there is none.
+/// steps in `state` and, with a decision model, the situation it already
+/// `decided` on early or else finds now; checked against what came back empty
+/// or the same before. Or why there is none.
 async fn settle_reply(
     prepared: Prepared,
-    mut state: Value,
+    state: Value,
     plan_id: &str,
-    (tau, tau_done): (f64, f64),
+    taus: (f64, f64),
     renames: &[(String, String)],
     reads: &HashSet<String>,
     decided: Option<usize>,
 ) -> Result<Prepared, String> {
-    let Prepared {
-        text: mut reply,
-        mut next,
-        ..
-    } = prepared;
-    let mut picked = false;
-    if DECISION_MODEL.is_some() {
-        let index;
-        (reply, index, picked) =
-            situation(plan_id, &reply, state.clone(), tau, reads, decided).await?;
-        next = next.into_iter().skip(index).take(1).collect();
-    }
-    let reply = renamed(reply, renames);
+    let Prepared { text, mut next, .. } = prepared;
+    let reply = match DECISION_MODEL.is_some() {
+        true => {
+            let (reply, index) =
+                pick_reply(&text, &state, plan_id, taus, renames, reads, decided).await?;
+            next = next.into_iter().skip(index).take(1).collect();
+            reply
+        }
+        false => renamed(text, renames),
+    };
     if needs_results(&reply) {
         return Err("reply needs results".into());
     }
-    let mut envelope: Value =
+    let envelope: Value =
         serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
     if searched_in_vain(&envelope["rtdl"], &state["steps"]) {
         return Err("searches again for what came back empty twice".into());
     }
     if repeated_in_vain(&envelope["rtdl"], &state["steps"], reads) {
         return Err("repeats a call that came back the same twice".into());
-    }
-    // A situation's reply was written for the results the decision model just matched;
-    // asking again whether the results support it only adds a second, noisier answer.
-    if DECISION_MODEL.is_some() && decided.is_none() && !picked && !dispatches(&envelope["rtdl"]) {
-        state["final_reply"] = envelope["content"].take();
-        let question = json!({"type": "noul", "instructions": DONE});
-        decide(plan_id, state, question, |_| tau_done).await?;
     }
     Ok(Prepared {
         text: reply,
@@ -1809,33 +1864,37 @@ async fn settle_reply(
     })
 }
 
-/// The decision model's answers for `reply`, asked before its tree ends: the
-/// situation it finds in `state`, and for a reply that dispatches nothing, that
-/// the steps support it. Returns that situation's index, which
-/// [`settle_reply`] then takes without asking again.
-async fn decide_ahead(
-    reply: String,
-    mut state: Value,
-    plan_id: String,
+/// The reply, of those in `text`, for the situation the decision model finds in
+/// `state` (or the one it `decided` on already), with its op_ids renamed, and
+/// that situation's index. A reply that dispatches nothing and was not picked
+/// among situations is used only if the decision model also finds that the
+/// steps support it, unless that too was decided already.
+async fn pick_reply(
+    text: &str,
+    state: &Value,
+    plan_id: &str,
     (tau, tau_done): (f64, f64),
-    (renames, reads): (Vec<(String, String)>, Arc<HashSet<String>>),
-    picked_reply: Arc<Mutex<Option<String>>>,
-) -> Result<usize, String> {
-    let (chosen, index, picked) =
-        situation(&plan_id, &reply, state.clone(), tau, &reads, None).await?;
-    let chosen = renamed(chosen, &renames);
-    *picked_reply.lock().unwrap_or_else(PoisonError::into_inner) = Some(chosen.clone());
-    if needs_results(&chosen) {
+    renames: &[(String, String)],
+    reads: &HashSet<String>,
+    decided: Option<usize>,
+) -> Result<(String, usize), String> {
+    let (reply, index, picked) =
+        situation(plan_id, text, state.clone(), tau, reads, decided).await?;
+    let reply = renamed(reply, renames);
+    if needs_results(&reply) {
         return Err("reply needs results".into());
     }
     let mut envelope: Value =
-        serde_json::from_str(&chosen).map_err(|e| format!("reply rejected: {e}"))?;
-    if !picked && !dispatches(&envelope["rtdl"]) {
+        serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
+    // A situation's reply was written for the results the decision model just matched;
+    // asking again whether the results support it only adds a second, noisier answer.
+    if decided.is_none() && !picked && !dispatches(&envelope["rtdl"]) {
+        let mut state = state.clone();
         state["final_reply"] = envelope["content"].take();
         let question = json!({"type": "noul", "instructions": DONE});
-        decide(&plan_id, state, question, |_| tau_done).await?;
+        decide(plan_id, state, question, |_| tau_done).await?;
     }
-    Ok(index)
+    Ok((reply, index))
 }
 
 /// For each of `wanted`, what a `{"choose": ...}` in a reply asks for, the id
@@ -1847,7 +1906,6 @@ async fn choose_objects(
     tau: f64,
     wanted: &[String],
     objects: &Value,
-    ahead: bool,
 ) -> Result<HashMap<String, String>, String> {
     if DECISION_MODEL.is_none() {
         return Err("no decision model to choose an object".into());
@@ -1881,8 +1939,7 @@ async fn choose_objects(
     for want in wanted {
         let state = json!({"task": task, "looking_for": want});
         let question = json!({"type": "choice", "instructions": CHOOSE, "criteria": criteria});
-        let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
-        let pick = decide_once(plan_id, (state, question), tau, json!(ids), ahead).await?;
+        let pick = decide(plan_id, state, question, |_| tau).await?;
         let (id, _) = pick
             .parse::<usize>()
             .ok()
@@ -1897,7 +1954,7 @@ async fn choose_objects(
 /// what `tree`'s search or the task looks for. A label that answers to every
 /// word searched for, or whose words the search names in full, fits at once;
 /// otherwise the decision model judges, and without one any new object counts.
-async fn fits_new(plan_id: &str, task: &str, tree: &Value, new: &[String], ahead: bool) -> bool {
+async fn fits_new(plan_id: &str, task: &str, tree: &Value, new: &[String]) -> bool {
     let searched = searched_for(tree);
     let mut labels = new.iter().filter_map(|listed| listed.split(" in ").next());
     if labels.any(|label| searched.iter().any(|query| answers(label, query))) {
@@ -1908,118 +1965,89 @@ async fn fits_new(plan_id: &str, task: &str, tree: &Value, new: &[String], ahead
     }
     let state = json!({"task": task, "searched_for": searched, "newly_listed": new});
     let question = json!({"type": "noul", "instructions": FITS});
-    match decide_once(plan_id, (state, question), NEW_FITS, Value::Null, ahead).await {
+    match decide(plan_id, state, question, |_| NEW_FITS).await {
         Ok(_) => true,
         // Below the threshold is a "no"; a model that does not answer counts as a "yes".
         Err(reason) => !reason.starts_with("decision model: "),
     }
 }
 
-/// How long an answer the decision model gave to a question checking a reply
-/// stands for the same question asked again.
-const ASKED_FOR: Duration = Duration::from_secs(120);
-
-/// The decision model's answers to the questions checking replies, by question:
-/// one asked while a tree's last steps ran is not asked again when it ends.
-static ASKED: LazyLock<Mutex<HashMap<String, Asked>>> = LazyLock::new(Default::default);
-
-/// When the decision model answered a question checking a reply, and how.
-type Asked = (Instant, Result<String, String>);
-
-/// [`decide`] with threshold `tau`, unless the same question with the same state
-/// was answered within [`ASKED_FOR`] on the same `evidence` (what the answer
-/// stands for beyond the question's words, such as the ids of the objects its
-/// options list), whose answer it returns instead; asked `ahead` of a tree's
-/// end, that reuse goes unlogged.
-async fn decide_once(
-    plan_id: &str,
-    (state, question): (Value, Value),
-    tau: f64,
-    evidence: Value,
-    ahead: bool,
-) -> Result<String, String> {
-    let key =
-        json!({"state": state, "question": question, "tau": tau, "evidence": evidence}).to_string();
-    let known = {
-        let mut known = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
-        known.retain(|_, (at, _)| at.elapsed() < ASKED_FOR);
-        known.get(&key).map(|(_, answer)| answer.clone())
-    };
-    if let Some(answer) = known {
-        if ahead {
-            return answer;
-        }
-        info!(
-            "[pilot/segue] {}",
-            json!({"event": "decide_early", "plan_id": plan_id, "reused": question["type"],
-                   "accept": answer.is_ok()})
-        );
-        return answer;
-    }
-    let answer = decide(plan_id, state, question, |_| tau).await;
-    // An answer, kept; a decision model that did not answer is asked again.
-    if answer.as_ref().is_ok()
-        || answer
-            .as_ref()
-            .is_err_and(|why| why.starts_with("decision model: "))
-    {
-        let mut known = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
-        known.insert(key, (Instant::now(), answer.clone()));
-    }
-    answer
+/// The answers to the questions checking a reply against one list of Scene's
+/// objects: which object each `{"choose": ...}` means, and which objects Scene
+/// lists that the search the reply plans did not know of and that fit it.
+pub(crate) struct Checked {
+    /// The reply the answers are for, as the round takes it.
+    reply: String,
+    /// The id picked for each `{"choose": ...}`, by what it asks for.
+    picks: HashMap<String, String>,
+    /// Objects listed since the reply was written that end its search.
+    new: Vec<String>,
 }
 
-/// The questions checking a success reply decided on early, asked against a
-/// state view read while its tree's last steps run: which object each
-/// `{"choose": ...}` means, and whether an object Scene newly lists ends the
-/// search it plans. Their answers stand when the tree ends (see [`decide_once`]).
-pub(crate) struct CheckAhead {
+/// Ask the questions checking `rtdl`, a reply's tree written when Scene listed
+/// `then`, against `objects`, Scene's list now.
+async fn check(
+    (plan_id, task, tau): (&str, &str, f64),
+    rtdl: &Value,
+    then: &Value,
+    objects: &Value,
+) -> Result<(HashMap<String, String>, Vec<String>), String> {
+    let mut wanted = Vec::new();
+    to_choose(rtdl, &mut wanted);
+    let picks = match wanted.is_empty() {
+        true => HashMap::new(),
+        false => choose_objects(plan_id, task, tau, &wanted, objects).await?,
+    };
+    let mut tree = rtdl.clone();
+    fill(&mut tree, &picks);
+    // A search was planned for what Scene did not list then; once Scene lists an
+    // object that fits what the task looks for, the reply is not used.
+    let mut new = match searches(&tree) {
+        true => listed_since(then, objects),
+        false => Vec::new(),
+    };
+    if !new.is_empty() && !fits_new(plan_id, task, &tree, &new).await {
+        new.clear();
+    }
+    Ok((picks, new))
+}
+
+/// The questions checking the success reply decided on early, to be asked
+/// against a state view read while its tree's last steps run, so that the round
+/// takes their answers with that view (see [`Speculation::validate`]).
+pub(crate) struct EarlyCheck {
     /// The tree the reply follows.
     plan_id: String,
     /// The user's words for the task.
     task: String,
     /// Least confidence an object choice needs.
     tau_choice: f64,
-    /// The reply decided on early, once the decision model has picked it.
-    reply: Arc<Mutex<Option<String>>>,
+    /// The reply the decision model picked.
+    reply: String,
     /// The objects Scene listed when the reply was written.
     then: Arc<Value>,
 }
 
-impl CheckAhead {
-    /// Ask the questions checking the reply against `objects`, Scene's list then.
-    pub(crate) async fn ask(&self, objects: &Value) {
-        let reply = self
-            .reply
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let Some(mut envelope) = reply.and_then(|reply| serde_json::from_str::<Value>(&reply).ok())
-        else {
-            return;
-        };
-        let mut wanted = Vec::new();
-        to_choose(&envelope["rtdl"], &mut wanted);
-        if !wanted.is_empty() {
-            let chosen = choose_objects(
-                &self.plan_id,
-                &self.task,
-                self.tau_choice,
-                &wanted,
-                objects,
-                true,
-            )
-            .await;
-            let Ok(picks) = chosen else { return };
-            fill(&mut envelope["rtdl"], &picks);
-        }
-        if searches(&envelope["rtdl"]) {
-            let new = listed_since(&self.then, objects);
-            if !new.is_empty() {
-                fits_new(&self.plan_id, &self.task, &envelope["rtdl"], &new, true).await;
-            }
-        }
+impl EarlyCheck {
+    /// The answers checking the reply against `objects`, Scene's list then.
+    pub(crate) async fn ask(&self, objects: &Value) -> Result<Checked, String> {
+        let envelope: Value =
+            serde_json::from_str(&self.reply).map_err(|e| format!("reply rejected: {e}"))?;
+        let asker = (self.plan_id.as_str(), self.task.as_str(), self.tau_choice);
+        let (picks, new) = check(asker, &envelope["rtdl"], &self.then, objects).await?;
+        Ok(Checked {
+            reply: self.reply.clone(),
+            picks,
+            new,
+        })
     }
+}
+
+/// Whether an answer asked with the steps in `assumed` reported as succeeded
+/// stands, given the steps that have `succeeded`: an `if` whose condition
+/// failed skips steps, and the tree still succeeds.
+fn stands(assumed: &[u32], succeeded: &HashMap<u32, CapabilityCallResult>) -> bool {
+    assumed.iter().all(|index| succeeded.contains_key(index))
 }
 
 /// How many steps `steps` (a tree's, in order) has left, given those that have
@@ -2028,7 +2056,7 @@ impl CheckAhead {
 fn only_acting_left(
     steps: &[(u32, String)],
     nodes: &[RtdlNode],
-    succeeded: &HashMap<u32, String>,
+    succeeded: &HashMap<u32, CapabilityCallResult>,
 ) -> Option<usize> {
     let calls = nodes
         .iter()
@@ -2039,10 +2067,7 @@ fn only_acting_left(
         .filter(|(index, _)| !succeeded.contains_key(index))
         .filter_map(|(index, _)| nodes.get(*index as usize))
         .collect();
-    let acts = |node: &&RtdlNode| {
-        let contract = node.call.as_ref().map(|call| call.contract_id.as_str());
-        contract.is_some_and(|contract| ONLY_ACT.contains(&contract))
-    };
+    let acts = |node: &&RtdlNode| acted(node).is_some();
     (steps.len() == calls && !left.is_empty() && left.iter().all(acts)).then_some(left.len())
 }
 
@@ -2878,19 +2903,24 @@ fn straight(tree: &Value) -> Vec<&Value> {
 }
 
 /// The `do` steps `tree` runs on its shortest way to end without failing: an
-/// `if` may take neither branch (the shorter one if it has an `else`), a
+/// `if` may take neither branch (the one that `cost`s less if it has an `else`), a
 /// `while` may run its body no time, a `fallback` may end with its first child,
 /// and a `repeat` runs its body once unless its count is zero.
-fn least_steps(tree: &Value) -> Vec<&Value> {
+fn least_steps<'a>(tree: &'a Value, cost: &dyn Fn(&[&Value]) -> f64) -> Vec<&'a Value> {
     let children = tree["children"].as_array().into_iter().flatten();
     match tree["op"].as_str() {
         Some("do") => vec![tree],
-        Some("sequence" | "parallel") => children.flat_map(least_steps).collect(),
-        Some("fallback") => children.take(1).flat_map(least_steps).collect(),
+        Some("sequence" | "parallel") => children
+            .flat_map(|child| least_steps(child, cost))
+            .collect(),
+        Some("fallback") => children
+            .take(1)
+            .flat_map(|child| least_steps(child, cost))
+            .collect(),
         Some("if") => match (tree.get("then"), tree.get("else")) {
             (Some(then), Some(other)) => {
-                let (then, other) = (least_steps(then), least_steps(other));
-                if then.len() <= other.len() {
+                let (then, other) = (least_steps(then, cost), least_steps(other, cost));
+                if cost(&then) <= cost(&other) {
                     then
                 } else {
                     other
@@ -2898,7 +2928,9 @@ fn least_steps(tree: &Value) -> Vec<&Value> {
             }
             _ => Vec::new(),
         },
-        Some("repeat") if tree["count"].as_u64().unwrap_or(0) > 0 => least_steps(&tree["body"]),
+        Some("repeat") if tree["count"].as_u64().unwrap_or(0) > 0 => {
+            least_steps(&tree["body"], cost)
+        }
         _ => Vec::new(),
     }
 }
@@ -2947,7 +2979,7 @@ fn look_ahead(
         let ((run, end), first, write, early, soonest) = {
             let timings = timings();
             let write = timings.write_time(request.margin);
-            let steps = reply_steps(&reply["rtdl"]);
+            let steps = reply_steps(do_nodes(&reply["rtdl"]));
             let expected = |steps| timings.expected(steps, from, request.experienced);
             let straight = straight(&reply["rtdl"]);
             let fails_early = |position: usize| {
@@ -2976,15 +3008,12 @@ fn look_ahead(
             // A tree may end long before all its steps would have run: an `if`
             // whose condition does not hold skips its steps. Its next reply is
             // needed by the soonest it can end.
-            let least: Vec<(String, Value)> = least_steps(&reply["rtdl"])
-                .into_iter()
-                .map(|node| {
-                    (
-                        node["cap"].as_str().unwrap_or("").to_string(),
-                        node["args"].clone(),
-                    )
-                })
-                .collect();
+            let cost = |nodes: &[&Value]| {
+                let steps = reply_steps(nodes.to_vec());
+                let took = timings.expected(&steps, from, request.experienced).0;
+                took.map_or(f64::MAX, |took| took.as_secs_f64())
+            };
+            let least = reply_steps(least_steps(&reply["rtdl"], &cost));
             let soonest = match (request.margin, expected(&least).0) {
                 (true, Some(least)) => Some(first.map_or(least, |first| first.min(least))),
                 _ => first,
@@ -3121,7 +3150,7 @@ fn look_ahead(
             let (request, reply) = (request.clone(), reply.clone());
             // A tree read ahead runs now, whenever its reply is due.
             let wait = start(soonest).filter(|_| !readable);
-            let due = due.zip(first).map(|(due, first)| due + first);
+            let due = due.zip(soonest).map(|(due, soonest)| due + soonest);
             let reply = tokio::spawn(async move {
                 let read = match readable {
                     true => read_ahead(&request.reader, &reply).await,
@@ -3329,11 +3358,25 @@ mod tests {
             dispatched: Instant::now(),
             short: false,
             decide_early: true,
-            held: None,
             early: None,
-            early_reply: Default::default(),
-            early_then: None,
             succeeded: HashMap::new(),
+            early_taken: false,
+        }
+    }
+
+    /// The success reply of `three_steps`, decided on early with `answer`, its
+    /// steps in `assumed` reported as succeeded while they still ran.
+    fn early(answer: Result<(usize, String), String>, assumed: Vec<u32>) -> super::Early {
+        super::Early {
+            reply: Prepared {
+                text: r#"{"content": "early"}"#.into(),
+                next: Vec::new(),
+                read: None,
+            },
+            then: Default::default(),
+            assumed,
+            asking: None,
+            answer: Some(answer),
         }
     }
 
@@ -3342,33 +3385,42 @@ mod tests {
         use RtdlNodeStateEnum::{Failed, Succeeded};
         let settled = |last: RtdlNodeStateEnum| {
             let mut spec = three_steps();
-            spec.held = Some(Prepared {
-                text: r#"{"content": "early"}"#.into(),
-                next: Vec::new(),
-                read: None,
-            });
-            spec.early = Some(AbortOnDropHandle::new(tokio::spawn(std::future::ready(
-                Ok(0),
-            ))));
+            spec.early = Some(early(Ok((0, String::new())), vec![3]));
             let results: Vec<_> = (0..=3)
                 .map(|index| state(index, if index == 3 { last } else { Succeeded }))
                 .collect();
             spec.ended("p", &results, last == Failed, false);
-            spec.settle(Vec::new()).unwrap()
+            let branch = spec.settle(Vec::new()).unwrap();
+            (spec.early_taken(), branch)
         };
-        let mut succeeded = settled(Succeeded);
+        let (taken, mut succeeded) = settled(Succeeded);
+        assert!(taken);
         assert_eq!(
             succeeded.reply().await.unwrap().text,
             r#"{"content": "early"}"#
         );
         // A failure settles its own reply: here an outcome label, which no reply parses as.
-        let mut failed = settled(Failed);
+        let (taken, mut failed) = settled(Failed);
+        assert!(!taken);
         assert!(
             failed
                 .reply()
                 .await
                 .is_err_and(|why| why.starts_with("reply rejected"))
         );
+    }
+
+    #[test]
+    fn an_early_answer_stands_only_if_every_step_it_assumed_succeeded() {
+        let ran = |indices: &[u32]| -> HashMap<u32, CapabilityCallResult> {
+            indices
+                .iter()
+                .map(|&index| (index, Default::default()))
+                .collect()
+        };
+        // An `if` whose condition fails skips the step the answer assumed would succeed.
+        assert!(!super::stands(&[2, 3], &ran(&[1, 2])));
+        assert!(super::stands(&[2, 3], &ran(&[1, 2, 3])));
     }
 
     #[tokio::test]
@@ -3385,19 +3437,13 @@ mod tests {
             next: None,
             objects: Default::default(),
         });
-        spec.held = Some(Prepared {
-            text: r#"{"content": "early"}"#.into(),
-            next: Vec::new(),
-            read: None,
-        });
-        spec.early = Some(AbortOnDropHandle::new(tokio::spawn(std::future::ready(
-            Ok(0),
-        ))));
+        spec.early = Some(early(Ok((0, String::new())), vec![3]));
         // The read set stopped the tree: what it saw gone is the stop's situation.
         spec.stopped("p", vec!["the cup is gone".into()]);
         let results: Vec<_> = (0..=2).map(|index| state(index, Succeeded)).collect();
         spec.ended("p", &results, false, true);
         let mut stop = spec.settle(Vec::new()).unwrap();
+        assert!(!spec.early_taken());
         assert_eq!(
             stop.reply().await.unwrap().text,
             r#"{"content": "stopped"}"#
@@ -3409,16 +3455,14 @@ mod tests {
         use RtdlNodeStateEnum::Succeeded;
         let mut spec = three_steps();
         let (mut asked, answer) = tokio::sync::oneshot::channel::<()>();
-        spec.held = Some(Prepared {
-            text: r#"{"content": "early"}"#.into(),
-            next: Vec::new(),
-            read: None,
-        });
+        let mut pending = early(Err("not yet".into()), vec![3]);
         // The decision model has not answered yet.
-        spec.early = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+        pending.answer = None;
+        pending.asking = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = answer.await;
-            Ok(0)
+            Ok((0, String::new()))
         })));
+        spec.early = Some(pending);
         let results: Vec<_> = (0..=3).map(|index| state(index, Succeeded)).collect();
         spec.ended("p", &results, false, false);
         let seen = spec.messages_seen;
@@ -3446,16 +3490,23 @@ mod tests {
             {"op": "if", "condition": true, "then": {"op": "sequence", "children": [
                 call("navigate"), call("pick")]}},
             {"op": "fallback", "children": [call("find"), call("snapshot")]},
-            {"op": "if", "condition": true, "then": call("speak"),
-             "else": {"op": "sequence", "children": [call("navigate"), call("speak")]}},
+            {"op": "if", "condition": true, "then": call("navigate"),
+             "else": {"op": "sequence", "children": [call("speak"), call("speak")]}},
             {"op": "while", "condition": true, "max_iterations": 3, "body": call("find")},
             {"op": "repeat", "count": 2, "body": call("place")},
         ]});
-        let caps: Vec<&str> = super::least_steps(&tree)
+        // A navigate costs ten of anything else.
+        let cost = |nodes: &[&serde_json::Value]| -> f64 {
+            nodes
+                .iter()
+                .map(|node| if node["cap"] == "navigate" { 10.0 } else { 1.0 })
+                .sum()
+        };
+        let caps: Vec<&str> = super::least_steps(&tree, &cost)
             .into_iter()
             .map(|node| node["cap"].as_str().unwrap())
             .collect();
-        assert_eq!(caps, ["goal_near", "find", "speak", "place"]);
+        assert_eq!(caps, ["goal_near", "find", "speak", "speak", "place"]);
     }
 
     #[test]
@@ -3469,7 +3520,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let reported = |node: &RtdlNode| super::report_step(node, None);
+        let reported =
+            |node: &RtdlNode| super::report_step(node, true, &super::acted(node).unwrap());
         let pick = reported(&step(
             "robonix/skill/manipulation/pick",
             r#"{"object":"cup"}"#,
@@ -3478,48 +3530,53 @@ mod tests {
         assert_eq!(pick["output"], serde_json::json!({"object": "cup"}));
         let navigate = reported(&step("robonix/service/navigation/navigate", "{}"));
         assert_eq!(navigate["output"]["state"], "SUCCEEDED");
+        // An argument bound as the tree runs is not known before it ends.
+        let bound = step(
+            "robonix/skill/manipulation/place",
+            r#"{"target":{"var":"near"}}"#,
+        );
+        assert_eq!(
+            reported(&bound)["output"],
+            serde_json::json!({"target": null})
+        );
+        // A step whose output may decide what comes next is not one that only acts.
+        assert!(super::acted(&step("robonix/system/scene/find", "{}")).is_none());
     }
 
     #[tokio::test]
-    async fn a_question_checking_a_reply_is_asked_once() {
+    async fn answers_asked_early_check_only_the_reply_they_were_asked_for() {
         use serde_json::json;
-        let (state, question) = (json!({"task": "cached"}), json!({"type": "choice"}));
-        let ids = json!(["scene.object.1", "scene.object.2"]);
-        let key = json!({"state": state, "question": question, "tau": 0.5, "evidence": ids});
-        super::ASKED
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (Instant::now(), Ok("1".into())));
-        let ask = |tau, evidence, ahead| {
-            super::decide_once("p", (state.clone(), question.clone()), tau, evidence, ahead)
+        let reply = json!({"content": "", "rtdl": fetch()}).to_string();
+        let then = objects(&[("kitchen", &["o1"])]);
+        let spec = three_steps();
+        let asked = |reply: &str| super::Checked {
+            reply: reply.to_string(),
+            picks: HashMap::new(),
+            new: vec!["cup in kitchen".to_string()],
         };
-        assert_eq!(ask(0.5, ids.clone(), true).await, Ok("1".to_string()));
-        assert_eq!(ask(0.5, ids.clone(), false).await, Ok("1".to_string()));
-        // Another threshold, or the same words over other objects, is another
-        // question, which no decision model answers here.
-        assert!(ask(0.6, ids.clone(), false).await.is_err());
-        let other = json!(["scene.object.1", "scene.object.3"]);
-        assert!(ask(0.5, other, false).await.is_err());
-        // An answer older than ASKED_FOR is not taken.
-        let old = Instant::now() - super::ASKED_FOR - Duration::from_secs(1);
-        super::ASKED
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (old, Ok("1".into())));
-        assert!(ask(0.5, ids, false).await.is_err());
+        // Asked of this reply, a newly listed object that ends its search stands...
+        let found = spec
+            .validate(reply.clone(), &then, &then, Some(asked(&reply)))
+            .await;
+        assert!(found.is_err_and(|why| why.starts_with("read set changed")));
+        // ...but answers asked of another reply are not this one's.
+        let other = spec
+            .validate(reply.clone(), &then, &then, Some(asked("{}")))
+            .await;
+        assert_eq!(other.unwrap(), (reply, None));
     }
 
     #[tokio::test]
-    async fn a_reply_is_settled_early_only_while_the_steps_left_only_act() {
+    async fn a_reply_is_decided_on_early_only_while_the_steps_left_only_act() {
         let (spec, navigate) = (three_steps(), "robonix/service/navigation/navigate");
         let mut nodes = spec.nodes.clone();
         let acting = |nodes: &mut Vec<RtdlNode>, index: usize| {
             nodes[index].call.as_mut().unwrap().contract_id = navigate.into();
         };
-        let done = |indices: &[u32]| -> HashMap<u32, String> {
+        let done = |indices: &[u32]| -> HashMap<u32, CapabilityCallResult> {
             indices
                 .iter()
-                .map(|&index| (index, String::new()))
+                .map(|&index| (index, Default::default()))
                 .collect()
         };
         acting(&mut nodes, 3);
@@ -4449,10 +4506,13 @@ mod tests {
         let then = objects(&[("kitchen", &["o1"])]);
         let still = objects(&[("kitchen", &["o1", "o7"])]);
         let gone = objects(&[("kitchen", &["o1"])]);
-        let (kept, note) = spec.validate(reply.clone(), &then, &still).await.unwrap();
+        let (kept, note) = spec
+            .validate(reply.clone(), &then, &still, None)
+            .await
+            .unwrap();
         assert_eq!((kept, note), (reply.clone(), None));
         let why = spec
-            .validate(reply.clone(), &then, &gone)
+            .validate(reply.clone(), &then, &gone, None)
             .await
             .unwrap_err();
         assert!(why.contains("o7, which an earlier step found"), "{why}");
@@ -4527,14 +4587,22 @@ mod tests {
         let deliver = json!({"op": "sequence", "children": [call("nav2.navigation_navigate")]});
         let reply = |tree: &serde_json::Value| json!({"content": "", "rtdl": tree}).to_string();
         let spec = three_steps();
-        assert!(spec.validate(reply(&search), &then, &now).await.is_err());
-        let delivered = spec.validate(reply(&deliver), &then, &now).await;
+        assert!(
+            spec.validate(reply(&search), &then, &now, None)
+                .await
+                .is_err()
+        );
+        let delivered = spec.validate(reply(&deliver), &then, &now, None).await;
         assert_eq!(delivered.unwrap().1, None);
         let off = Speculation {
             read_set: false,
             ..spec
         };
-        assert!(off.validate(reply(&search), &then, &now).await.is_ok());
+        assert!(
+            off.validate(reply(&search), &then, &now, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -4543,9 +4611,15 @@ mod tests {
         let then = objects(&[("kitchen", &["o1"])]);
         let gone = objects(&[("kitchen", &["o2"])]);
         let spec = three_steps();
-        let (kept, note) = spec.validate(reply.clone(), &then, &then).await.unwrap();
+        let (kept, note) = spec
+            .validate(reply.clone(), &then, &then, None)
+            .await
+            .unwrap();
         assert_eq!((kept.as_str(), note), (reply.as_str(), None));
-        let (cut, note) = spec.validate(reply.clone(), &then, &gone).await.unwrap();
+        let (cut, note) = spec
+            .validate(reply.clone(), &then, &gone, None)
+            .await
+            .unwrap();
         let cut: serde_json::Value = serde_json::from_str(&cut).unwrap();
         assert_eq!(cut["rtdl"]["children"].as_array().unwrap().len(), 1);
         assert!(note.is_some());
@@ -4554,7 +4628,9 @@ mod tests {
             ..spec
         };
         assert_eq!(
-            off.validate(reply.clone(), &then, &gone).await.unwrap(),
+            off.validate(reply.clone(), &then, &gone, None)
+                .await
+                .unwrap(),
             (reply, None)
         );
     }
