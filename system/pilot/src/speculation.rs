@@ -653,8 +653,11 @@ pub(crate) struct Speculation {
     /// Whether to settle the success reply while the tree's last steps still
     /// run, once those only act: the task's `decide_early`, on by default.
     decide_early: bool,
-    /// The success reply settled early, the steps left assumed to succeed.
-    early: Option<JoinHandle<Result<Prepared, String>>>,
+    /// The success reply, once taken to be decided on early.
+    held: Option<Prepared>,
+    /// The decision model's answers for it, asked with the steps left assumed
+    /// to succeed: the index of the situation it found.
+    early: Option<JoinHandle<Result<usize, String>>>,
     /// Outputs of this tree's steps that have succeeded so far, by node index.
     succeeded: HashMap<u32, String>,
 }
@@ -1247,6 +1250,7 @@ impl Speculation {
             dispatched,
             short,
             decide_early: context["decide_early"].as_bool().unwrap_or(true),
+            held: None,
             early: None,
             succeeded: HashMap::new(),
         })
@@ -1361,15 +1365,17 @@ impl Speculation {
             Some(report_step(node, ended.as_ref().map(|leaf| (true, leaf))))
         }));
         let state = json!({"task": self.task, "steps": steps});
-        let (plan_id, tau, tau_done) = (self.plan_id.clone(), self.tau_success, self.tau_done);
+        let (plan_id, taus) = (self.plan_id.clone(), (self.tau_success, self.tau_done));
         let (renames, reads) = (self.renames.clone(), self.reads.clone());
         info!(
             "[pilot/segue] {}",
             json!({"event": "decide_early", "plan_id": plan_id, "steps_left": left})
         );
-        self.early = Some(tokio::spawn(async move {
-            settle_reply(prepared, state, &plan_id, tau, tau_done, &renames, &reads).await
-        }));
+        let text = prepared.text.clone();
+        self.held = Some(prepared);
+        self.early = Some(tokio::spawn(decide_ahead(
+            text, state, plan_id, taus, renames, reads,
+        )));
     }
 
     /// Record how the tree ended, from its completion.
@@ -1497,25 +1503,39 @@ impl Speculation {
         let renames = self.renames.clone();
         let (reads, own) = (self.reads.clone(), self.report.clone());
         let state = json!({"task": self.task, "steps": steps});
-        let early = self.early.take().filter(|_| outcome == Outcome::Succeeded);
+        // A success decided on early takes those answers; asked on steps assumed
+        // to succeed, a refusal is asked again on what they returned.
+        let held = self.held.take().filter(|_| outcome == Outcome::Succeeded);
+        let early = self.early.take().filter(|_| held.is_some());
         let reply = tokio::spawn(async move {
-            if let Some(early) = early {
-                let settled = early.await.unwrap_or_else(|_| Err("request failed".into()));
-                info!(
-                    "[pilot/segue] {}",
-                    json!({"event": "decide_early", "plan_id": plan_id, "used": settled.is_ok(),
-                           "why_not": settled.as_ref().err()})
-                );
-                return settled;
-            }
-            let prepared = written.reply().await?;
+            let (prepared, decided) = match (held, early) {
+                (Some(prepared), Some(early)) => {
+                    let answer = early.await.unwrap_or_else(|_| Err("request failed".into()));
+                    info!(
+                        "[pilot/segue] {}",
+                        json!({"event": "decide_early", "plan_id": plan_id, "used": answer.is_ok(),
+                               "why_not": answer.as_ref().err()})
+                    );
+                    (prepared, answer.ok())
+                }
+                _ => (written.reply().await?, None),
+            };
             if let Some(read) = &prepared.read {
                 let now = own.iter().map(|step| &step["output"]);
                 if read.len() != own.len() || !read.iter().zip(now).all(|(a, b)| same(a, b)) {
                     return Err("results differ from those read ahead".into());
                 }
             }
-            settle_reply(prepared, state, &plan_id, tau, tau_done, &renames, &reads).await
+            settle_reply(
+                prepared,
+                state,
+                &plan_id,
+                (tau, tau_done),
+                &renames,
+                &reads,
+                decided,
+            )
+            .await
         });
         Ok(Branch {
             outcome,
@@ -1725,6 +1745,7 @@ impl Speculation {
             go: Some(ahead.go),
             expected: None,
             stop: None,
+            held: None,
             early: None,
             succeeded: HashMap::new(),
             ..self
@@ -1740,10 +1761,10 @@ async fn settle_reply(
     prepared: Prepared,
     mut state: Value,
     plan_id: &str,
-    tau: f64,
-    tau_done: f64,
+    (tau, tau_done): (f64, f64),
     renames: &[(String, String)],
     reads: &HashSet<String>,
+    decided: Option<usize>,
 ) -> Result<Prepared, String> {
     let Prepared {
         text: mut reply,
@@ -1753,7 +1774,8 @@ async fn settle_reply(
     let mut picked = false;
     if DECISION_MODEL.is_some() {
         let index;
-        (reply, index, picked) = situation(plan_id, &reply, state.clone(), tau, reads).await?;
+        (reply, index, picked) =
+            situation(plan_id, &reply, state.clone(), tau, reads, decided).await?;
         next = next.into_iter().skip(index).take(1).collect();
     }
     let reply = renamed(reply, renames);
@@ -1770,7 +1792,7 @@ async fn settle_reply(
     }
     // A situation's reply was written for the results the decision model just matched;
     // asking again whether the results support it only adds a second, noisier answer.
-    if DECISION_MODEL.is_some() && !picked && !dispatches(&envelope["rtdl"]) {
+    if DECISION_MODEL.is_some() && decided.is_none() && !picked && !dispatches(&envelope["rtdl"]) {
         state["final_reply"] = envelope["content"].take();
         let question = json!({"type": "noul", "instructions": DONE});
         decide(plan_id, state, question, |_| tau_done).await?;
@@ -1780,6 +1802,34 @@ async fn settle_reply(
         next,
         read: None,
     })
+}
+
+/// The decision model's answers for `reply`, asked before its tree ends: the
+/// situation it finds in `state`, and for a reply that dispatches nothing, that
+/// the steps support it. Returns that situation's index, which
+/// [`settle_reply`] then takes without asking again.
+async fn decide_ahead(
+    reply: String,
+    mut state: Value,
+    plan_id: String,
+    (tau, tau_done): (f64, f64),
+    renames: Vec<(String, String)>,
+    reads: Arc<HashSet<String>>,
+) -> Result<usize, String> {
+    let (chosen, index, picked) =
+        situation(&plan_id, &reply, state.clone(), tau, &reads, None).await?;
+    let chosen = renamed(chosen, &renames);
+    if needs_results(&chosen) {
+        return Err("reply needs results".into());
+    }
+    let mut envelope: Value =
+        serde_json::from_str(&chosen).map_err(|e| format!("reply rejected: {e}"))?;
+    if !picked && !dispatches(&envelope["rtdl"]) {
+        state["final_reply"] = envelope["content"].take();
+        let question = json!({"type": "noul", "instructions": DONE});
+        decide(&plan_id, state, question, |_| tau_done).await?;
+    }
+    Ok(index)
 }
 
 /// How many steps `steps` (a tree's, in order) has left, given those that have
@@ -1815,8 +1865,9 @@ fn renamed(mut reply: String, renames: &[(String, String)]) -> String {
     reply
 }
 
-/// The reply prepared for the situation the decision model finds in `state`,
-/// that situation's index, and whether the model picked it: a lone situation
+/// The reply prepared for the situation the decision model finds in `state`
+/// (or the one it `decided` on already), that situation's index, and whether
+/// the model picked it: a lone situation
 /// with an empty `when` was written for the whole outcome and needs no pick,
 /// and so does a bare reply envelope, which some planners send instead of
 /// listing situations.
@@ -1826,6 +1877,7 @@ async fn situation(
     state: Value,
     tau: f64,
     reads: &HashSet<String>,
+    decided: Option<usize>,
 ) -> Result<(String, usize, bool), String> {
     let mut reply: Value = serde_json::from_str(reply).map_err(|e| format!("situations: {e}"))?;
     let keys: Vec<String> = reply
@@ -1874,7 +1926,10 @@ async fn situation(
         Some(true) => 0.0,
         _ => tau,
     };
-    let pick = decide(plan_id, state, question, needed).await?;
+    let pick = match decided {
+        Some(index) => index.to_string(),
+        None => decide(plan_id, state, question, needed).await?,
+    };
     let (index, situation) = pick
         .parse::<usize>()
         .ok()
@@ -3083,21 +3138,23 @@ mod tests {
             dispatched: Instant::now(),
             short: false,
             decide_early: true,
+            held: None,
             early: None,
             succeeded: HashMap::new(),
         }
     }
 
     #[tokio::test]
-    async fn a_reply_settled_early_is_used_only_if_the_tree_succeeds() {
+    async fn a_reply_decided_on_early_is_used_only_if_the_tree_succeeds() {
         use RtdlNodeStateEnum::{Failed, Succeeded};
         let settled = |last: RtdlNodeStateEnum| {
             let mut spec = three_steps();
-            spec.early = Some(tokio::spawn(std::future::ready(Ok(Prepared {
-                text: "early".into(),
+            spec.held = Some(Prepared {
+                text: r#"{"content": "early"}"#.into(),
                 next: Vec::new(),
                 read: None,
-            }))));
+            });
+            spec.early = Some(tokio::spawn(std::future::ready(Ok(0))));
             let results: Vec<_> = (0..=3)
                 .map(|index| state(index, if index == 3 { last } else { Succeeded }))
                 .collect();
@@ -3105,7 +3162,10 @@ mod tests {
             spec.settle(Vec::new()).unwrap()
         };
         let mut succeeded = settled(Succeeded);
-        assert_eq!(succeeded.reply().await.unwrap().text, "early");
+        assert_eq!(
+            succeeded.reply().await.unwrap().text,
+            r#"{"content": "early"}"#
+        );
         // A failure settles its own reply: here an outcome label, which no reply parses as.
         let mut failed = settled(Failed);
         assert!(
@@ -3385,8 +3445,15 @@ mod tests {
     #[tokio::test]
     async fn a_lone_situation_without_when_is_used_without_asking() {
         let reply = r#"{"situations": [{"when": " ", "reply": {"content": "x"}}]}"#;
-        let settled =
-            super::situation("p", reply, serde_json::json!({}), 1.0, &Default::default()).await;
+        let settled = super::situation(
+            "p",
+            reply,
+            serde_json::json!({}),
+            1.0,
+            &Default::default(),
+            None,
+        )
+        .await;
         assert_eq!(settled, Ok((r#"{"content":"x"}"#.to_string(), 0, false)));
     }
 
@@ -3454,8 +3521,15 @@ mod tests {
     #[tokio::test]
     async fn a_bare_reply_envelope_counts_as_a_lone_situation() {
         let reply = r#"{"content": "x", "rtdl": {"nodes": []}}"#;
-        let settled =
-            super::situation("p", reply, serde_json::json!({}), 1.0, &Default::default()).await;
+        let settled = super::situation(
+            "p",
+            reply,
+            serde_json::json!({}),
+            1.0,
+            &Default::default(),
+            None,
+        )
+        .await;
         assert_eq!(
             settled,
             Ok((
@@ -3465,8 +3539,15 @@ mod tests {
             ))
         );
         for empty in [r#"{"content": "x"}"#, r#"{"content": "x", "rtdl": null}"#] {
-            let settled =
-                super::situation("p", empty, serde_json::json!({}), 1.0, &Default::default()).await;
+            let settled = super::situation(
+                "p",
+                empty,
+                serde_json::json!({}),
+                1.0,
+                &Default::default(),
+                None,
+            )
+            .await;
             assert!(settled.is_err());
         }
     }
@@ -3475,8 +3556,15 @@ mod tests {
     async fn situations_nested_in_an_envelopes_text_are_unwrapped() {
         let inner = r#"{"situations": [{"when": "", "reply": {"content": "y"}}]}"#;
         let reply = serde_json::json!({"content": inner, "rtdl": null}).to_string();
-        let settled =
-            super::situation("p", &reply, serde_json::json!({}), 1.0, &Default::default()).await;
+        let settled = super::situation(
+            "p",
+            &reply,
+            serde_json::json!({}),
+            1.0,
+            &Default::default(),
+            None,
+        )
+        .await;
         assert_eq!(settled, Ok((r#"{"content":"y"}"#.to_string(), 0, false)));
     }
 
