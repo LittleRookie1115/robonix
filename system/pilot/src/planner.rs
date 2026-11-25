@@ -2254,6 +2254,8 @@ pub async fn run_turn(
         let mut execution_failed = false;
         let mut invalid_output = false;
         let mut reasoning_bytes = 0_usize;
+        // When the reply's text began, after any thinking, for the round's timing line below.
+        let mut text_began: Option<std::time::Duration> = None;
         // With the read set off a change is only logged, once per reply rather
         // than at each step sent after it.
         let mut stale_at_dispatch = false;
@@ -2299,6 +2301,7 @@ pub async fn run_turn(
                     idle.as_mut().reset(tokio::time::Instant::now() + vlm_idle_timeout());
                     match item {
                         Some(Ok(VlmStreamItem::TextDelta(delta))) => {
+                            text_began.get_or_insert_with(|| round_began.elapsed());
                             if let Err(error) = parser.push(&delta) { invalid_output = true; stream_error = Some(error); break; }
                             let messages = parser.take_messages();
                             // A tree's steps run as they stream in, before its watch
@@ -2399,9 +2402,16 @@ pub async fn run_turn(
             should_plan = true;
             continue 'supervisor;
         }
-        if reasoning_bytes > 0 {
-            debug!(
-                "[pilot/vlm] round={round} model thought for {reasoning_bytes} byte(s) before replying"
+        // Where a round's own request spends the time the robot may wait: thinking, the reply's text up to
+        // its first step, and the rest of the reply.
+        if !replayed {
+            let ms = |at: Option<std::time::Duration>| at.map(|at| at.as_millis() as u64);
+            info!(
+                "[pilot/vlm] round={round} model thought for {reasoning_bytes} byte(s); text began at {:?} ms, \
+                 first step sent at {:?} ms, reply ended at {} ms after the round began",
+                ms(text_began),
+                ms(dispatched.map(|at| at.duration_since(round_began))),
+                round_began.elapsed().as_millis()
             );
         }
         let generated = async {
