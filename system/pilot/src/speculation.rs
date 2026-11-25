@@ -658,6 +658,9 @@ pub(crate) struct Speculation {
     /// Whether the reply settled when the tree ended is the success reply
     /// decided on early.
     early_taken: bool,
+    /// Whether the success reply turned out unusable when taken out to decide
+    /// on early, so it is not tried again for this tree.
+    early_off: bool,
 }
 
 /// The success reply decided on before its tree ended.
@@ -678,16 +681,12 @@ struct Early {
 impl Early {
     /// The decision model's answer, once it has given one.
     fn answer(&mut self) -> Option<&Result<(usize, String), String>> {
-        if self
-            .asking
-            .as_ref()
-            .is_some_and(AbortOnDropHandle::is_finished)
+        if let Some(asking) = self.asking.as_mut().filter(|asking| asking.is_finished())
+            // A finished task's output may still wait on the polling task's budget.
+            && let Some(done) = tokio::task::unconstrained(asking).now_or_never()
         {
-            let asking = self.asking.take().and_then(|asking| asking.now_or_never());
-            self.answer = Some(asking.map_or_else(
-                || Err("request failed".into()),
-                |done| done.unwrap_or_else(|_| Err("request failed".into())),
-            ));
+            self.answer = Some(done.unwrap_or_else(|_| Err("request failed".into())));
+            self.asking = None;
         }
         self.answer.as_ref()
     }
@@ -1293,6 +1292,7 @@ impl Speculation {
             early: None,
             succeeded: HashMap::new(),
             early_taken: false,
+            early_off: false,
         })
     }
 
@@ -1383,6 +1383,7 @@ impl Speculation {
     /// Whether the success reply may yet be decided on early.
     pub(crate) fn may_decide_early(&self) -> bool {
         self.decide_early
+            && !self.early_off
             && self.early.is_none()
             && self.ended.is_none()
             && DECISION_MODEL.is_some()
@@ -1408,19 +1409,24 @@ impl Speculation {
             return;
         };
         // A finished handle's output is taken once; whatever it was, one stands in its place.
-        let written = std::mem::replace(
+        let mut written = std::mem::replace(
             &mut branch.reply,
             tokio::spawn(async { Err("decided early".to_string()) }),
         );
-        let prepared = match written.now_or_never() {
+        let prepared = match tokio::task::unconstrained(&mut written).now_or_never() {
             Some(Ok(Ok(prepared))) => prepared,
-            other => {
+            None => {
+                // Not handed over yet under the polling task's budget: next time.
+                branch.reply = written;
+                return;
+            }
+            Some(other) => {
                 let why = match other {
-                    Some(Ok(Err(why))) => why,
+                    Ok(Err(why)) => why,
                     _ => "request failed".to_string(),
                 };
                 branch.reply = tokio::spawn(async { Err(why) });
-                self.decide_early = false;
+                self.early_off = true;
                 return;
             }
         };
@@ -1694,37 +1700,30 @@ impl Speculation {
         let mut envelope: Value =
             serde_json::from_str(&reply).map_err(|e| format!("reply rejected: {e}"))?;
         // Answers asked early stand for this reply against these objects only.
-        let asked = asked.filter(|asked| asked.reply == reply);
-        let reused = asked.is_some();
-        let checked = match asked {
-            Some(checked) => checked,
-            None => {
-                let asker = (self.plan_id.as_str(), self.task.as_str(), self.tau_choice);
-                let (picks, new) = check(asker, &envelope["rtdl"], then, objects).await?;
-                Checked {
-                    reply: reply.clone(),
-                    picks,
-                    new,
-                }
-            }
-        };
-        if reused {
+        let asked = asked.filter(|asked| asked.reply == reply && asked.answered());
+        if asked.is_some() {
             info!(
                 "[pilot/segue] {}",
                 json!({"event": "decide_early", "plan_id": self.plan_id, "checks_reused": true})
             );
         }
-        let reply = match checked.picks.is_empty() {
+        let (picks, new) = match asked {
+            Some(checked) => checked.answers?,
+            None => {
+                let asker = (self.plan_id.as_str(), self.task.as_str(), self.tau_choice);
+                check(asker, &envelope["rtdl"], then, objects).await?
+            }
+        };
+        let reply = match picks.is_empty() {
             true => reply,
             false => {
-                fill(&mut envelope["rtdl"], &checked.picks);
+                fill(&mut envelope["rtdl"], &picks);
                 envelope.to_string()
             }
         };
         // The objects the tree reaches through an earlier step's output count as named.
         let mut tree = resolved(&envelope["rtdl"], &self.outputs);
         let moved = moved(&tree, then, objects, &returned(&self.outputs));
-        let new = checked.new;
         if moved.is_empty() && new.is_empty() {
             return Ok((reply, None));
         }
@@ -1818,6 +1817,7 @@ impl Speculation {
             early: None,
             succeeded: HashMap::new(),
             early_taken: false,
+            early_off: false,
             ..self
         })
     }
@@ -1975,13 +1975,34 @@ async fn fits_new(plan_id: &str, task: &str, tree: &Value, new: &[String]) -> bo
 /// The answers to the questions checking a reply against one list of Scene's
 /// objects: which object each `{"choose": ...}` means, and which objects Scene
 /// lists that the search the reply plans did not know of and that fit it.
+#[derive(Clone)]
 pub(crate) struct Checked {
     /// The reply the answers are for, as the round takes it.
     reply: String,
-    /// The id picked for each `{"choose": ...}`, by what it asks for.
-    picks: HashMap<String, String>,
-    /// Objects listed since the reply was written that end its search.
-    new: Vec<String>,
+    /// The id picked for each `{"choose": ...}`, by what it asks for, and the
+    /// objects listed since the reply was written that end its search; or the
+    /// decision model's refusal, which stands as an answer too.
+    answers: Result<(HashMap<String, String>, Vec<String>), String>,
+}
+
+impl Checked {
+    /// Answers refusing the reply `{}`, for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn refused_for_test() -> Self {
+        Self {
+            reply: "{}".into(),
+            answers: Err("decision model: none p=0.900, tau=0.7286".into()),
+        }
+    }
+
+    /// Whether the decision model answered, a refusal included; a model that
+    /// did not answer leaves the questions to be asked again.
+    pub(crate) fn answered(&self) -> bool {
+        match &self.answers {
+            Ok(_) => true,
+            Err(why) => why.starts_with("decision model: "),
+        }
+    }
 }
 
 /// Ask the questions checking `rtdl`, a reply's tree written when Scene listed
@@ -2034,11 +2055,9 @@ impl EarlyCheck {
         let envelope: Value =
             serde_json::from_str(&self.reply).map_err(|e| format!("reply rejected: {e}"))?;
         let asker = (self.plan_id.as_str(), self.task.as_str(), self.tau_choice);
-        let (picks, new) = check(asker, &envelope["rtdl"], &self.then, objects).await?;
         Ok(Checked {
             reply: self.reply.clone(),
-            picks,
-            new,
+            answers: check(asker, &envelope["rtdl"], &self.then, objects).await,
         })
     }
 }
@@ -2062,13 +2081,36 @@ fn only_acting_left(
         .iter()
         .filter(|node| node.node_kind == RTDL_DO)
         .count();
-    let left: Vec<&RtdlNode> = steps
+    let left: Vec<u32> = steps
         .iter()
-        .filter(|(index, _)| !succeeded.contains_key(index))
-        .filter_map(|(index, _)| nodes.get(*index as usize))
+        .map(|(index, _)| *index)
+        .filter(|index| !succeeded.contains_key(index))
         .collect();
-    let acts = |node: &&RtdlNode| acted(node).is_some();
-    (steps.len() == calls && !left.is_empty() && left.iter().all(acts)).then_some(left.len())
+    let acts = |index: &u32| nodes.get(*index as usize).and_then(acted).is_some();
+    // With steps left on both sides of an `if`, one side will not run, and an
+    // answer that assumes both succeed could never stand.
+    let left_under = |root: u32| {
+        let mut stack = vec![root];
+        while let Some(index) = stack.pop() {
+            if left.contains(&index) {
+                return true;
+            }
+            stack.extend(
+                nodes
+                    .get(index as usize)
+                    .into_iter()
+                    .flat_map(|n| n.children.clone()),
+            );
+        }
+        false
+    };
+    let split = nodes.iter().any(|node| {
+        node.node_kind == RTDL_IF
+            && node.children.len() == 2
+            && node.children.iter().all(|&child| left_under(child))
+    });
+    let fits = steps.len() == calls && !left.is_empty() && !split && left.iter().all(acts);
+    fits.then_some(left.len())
 }
 
 /// `reply` with each op_id a request prepared ahead made up for a step
@@ -3361,6 +3403,7 @@ mod tests {
             early: None,
             succeeded: HashMap::new(),
             early_taken: false,
+            early_off: false,
         }
     }
 
@@ -3551,8 +3594,7 @@ mod tests {
         let spec = three_steps();
         let asked = |reply: &str| super::Checked {
             reply: reply.to_string(),
-            picks: HashMap::new(),
-            new: vec!["cup in kitchen".to_string()],
+            answers: Ok((HashMap::new(), vec!["cup in kitchen".to_string()])),
         };
         // Asked of this reply, a newly listed object that ends its search stands...
         let found = spec
@@ -3602,6 +3644,48 @@ mod tests {
             super::only_acting_left(&spec.steps[..2], &nodes, &done(&[1])),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn no_reply_is_decided_on_early_with_steps_left_on_both_sides_of_an_if() {
+        let node = |node_kind: u32, children: Vec<u32>, contract: &str| RtdlNode {
+            node_kind,
+            children,
+            call: (!contract.is_empty()).then(|| CapabilityCall {
+                contract_id: contract.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let navigate = "robonix/service/navigation/navigate";
+        // An if whose then navigates and whose else speaks.
+        let nodes = vec![
+            node(RTDL_IF, vec![1, 2], ""),
+            node(RTDL_DO, vec![], navigate),
+            node(RTDL_DO, vec![], "robonix/service/speech/speak"),
+        ];
+        let steps = vec![(1, "p-1".to_string()), (2, "p-2".to_string())];
+        assert_eq!(
+            super::only_acting_left(&steps, &nodes, &HashMap::new()),
+            None
+        );
+        let then_only = vec![node(RTDL_IF, vec![1], ""), node(RTDL_DO, vec![], navigate)];
+        let steps = vec![(1, "p-1".to_string())];
+        assert_eq!(
+            super::only_acting_left(&steps, &then_only, &HashMap::new()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_asked_early_refuses_the_reply() {
+        let spec = three_steps();
+        let then = objects(&[("kitchen", &["o1"])]);
+        let refused = super::Checked::refused_for_test();
+        let checked = spec
+            .validate("{}".into(), &then, &then, Some(refused))
+            .await;
+        assert!(checked.is_err_and(|why| why.starts_with("decision model: ")));
     }
 
     fn state(node_index: u32, state: RtdlNodeStateEnum) -> RtdlNodeState {

@@ -2877,13 +2877,23 @@ const EARLY_VIEW_AGE: Duration = Duration::from_secs(2);
 /// when the tree ends.
 #[derive(Default)]
 struct EarlyViews {
-    /// The last view read, shared with the reading that fills it.
-    latest: Arc<std::sync::Mutex<Option<EarlyView>>>,
+    /// What the readings have found, shared with the reading under way.
+    found: Arc<std::sync::Mutex<Found>>,
     /// The reading under way, abandoned when dropped.
     reading: Option<AbortOnDropHandle<()>>,
 }
 
+/// The views read early so far.
+#[derive(Default)]
+struct Found {
+    /// The last view read, whose questions may still be being asked.
+    read: Option<EarlyView>,
+    /// The last view whose questions were answered.
+    checked: Option<EarlyView>,
+}
+
 /// A state view read early, with the answers checking the reply against it.
+#[derive(Clone)]
 struct EarlyView {
     /// When its reading started.
     began: std::time::Instant,
@@ -2913,7 +2923,9 @@ impl EarlyViews {
             .is_some_and(|reading| !reading.is_finished())
     }
 
-    /// Read the state view, keep it as the latest, then ask `check`'s questions of it.
+    /// Read the state view, keep it as the last read, then answer `check`'s
+    /// questions of it, unless Scene lists the same objects as the last view
+    /// answered, whose answers it takes.
     fn read(
         &mut self,
         executor: &ExecutorConn,
@@ -2922,37 +2934,53 @@ impl EarlyViews {
         check: speculation::EarlyCheck,
     ) {
         let (executor, mut atlas, caps) = (executor.clone(), atlas.clone(), caps.to_vec());
-        let latest = self.latest.clone();
+        let found = self.found.clone();
         self.reading = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             let began = std::time::Instant::now();
             let view = state_context::collect(&executor, &mut atlas, &caps, true).await;
-            let objects = view.2["objects"].clone();
             let lock = || {
-                latest
+                found
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
             };
-            *lock() = Some(EarlyView {
+            let same = lock().checked.as_ref().and_then(|last| {
+                (last.view.2["objects"] == view.2["objects"])
+                    .then(|| last.checked.clone())
+                    .flatten()
+            });
+            let objects = view.2["objects"].clone();
+            let mut early = EarlyView {
                 began,
                 view,
-                checked: None,
-            });
-            let checked = check.ask(&objects).await.ok();
-            if let Some(early) = lock().as_mut().filter(|early| early.began == began) {
+                checked: same,
+            };
+            if early.checked.is_none() {
+                lock().read = Some(early.clone());
+                let checked = check
+                    .ask(&objects)
+                    .await
+                    .ok()
+                    .filter(speculation::Checked::answered);
                 early.checked = checked;
             }
+            let mut found = lock();
+            if early.checked.is_some() {
+                found.checked = Some(early.clone());
+            }
+            found.read = Some(early);
         })));
     }
 
-    /// The latest view if it is fresh, abandoning any reading under way.
+    /// The freshest view whose questions were answered, else the last view read,
+    /// if fresh; any reading under way is abandoned, and writes nothing more here.
     fn take(&mut self) -> Option<EarlyView> {
         self.reading = None;
-        let latest = self
-            .latest
+        let found = std::mem::take(&mut self.found);
+        let mut found = found
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        latest.filter(EarlyView::fresh)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let checked = found.checked.take().filter(EarlyView::fresh);
+        checked.or_else(|| found.read.take().filter(EarlyView::fresh))
     }
 }
 
@@ -3518,6 +3546,43 @@ mod tests {
         rtdl_protocol, rtdl_state_name, should_replan_after_plan_done, skip_memory_prefetch,
         task_is_session_end, upsert_terminal_result,
     };
+
+    #[test]
+    fn the_round_takes_the_freshest_answered_early_view_and_drops_the_reading() {
+        use super::{EarlyView, EarlyViews, Found};
+        use std::time::{Duration, Instant};
+        let view = |age_ms: u64, answered: bool| EarlyView {
+            began: Instant::now() - Duration::from_millis(age_ms),
+            view: (age_ms.to_string(), String::new(), serde_json::Value::Null),
+            checked: answered.then(crate::speculation::Checked::refused_for_test),
+        };
+        let views = |read, checked| EarlyViews {
+            found: std::sync::Arc::new(std::sync::Mutex::new(Found { read, checked })),
+            reading: None,
+        };
+        // A view answered half a second earlier stands over the last one read,
+        // still being asked about.
+        let mut early = views(Some(view(200, false)), Some(view(700, true)));
+        let old = early.found.clone();
+        assert_eq!(early.take().unwrap().view.0, "700");
+        // A reading still under way writes into what the round no longer looks at.
+        old.lock().unwrap().read = Some(view(0, false));
+        assert!(early.take().is_none());
+        // Past EARLY_VIEW_AGE neither stands.
+        assert!(
+            views(Some(view(2500, false)), Some(view(2600, true)))
+                .take()
+                .is_none()
+        );
+        assert_eq!(
+            views(Some(view(300, false)), Some(view(2600, true)))
+                .take()
+                .unwrap()
+                .view
+                .0,
+            "300"
+        );
+    }
     use crate::pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
     use crate::pb::pilot::{
         CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState, Task,
