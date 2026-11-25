@@ -340,9 +340,6 @@ fn reply_steps(tree: &Value) -> Vec<(String, Value)> {
 
 /// What stands for an image among the step results the decision model reads.
 const IMAGE_NOT_SHOWN: &str = "[image, not shown]";
-/// What the decision model is told a step still running returned: settling
-/// early assumes it succeeds, and its output would only say so.
-const STILL_RUNNING: &str = "[still running; assumed to succeed]";
 
 /// What a prepared reply asks for instead of a plan when it cannot be written
 /// without the real outputs. It must fit the reply schema, which providers enforce.
@@ -672,8 +669,26 @@ const ONLY_ACT: [&str; 4] = [
     "robonix/service/speech/speak",
 ];
 
+/// What a step that only acts returns once it succeeds, which says no more than
+/// its arguments: deciding early reports a step still running as this.
+fn acted(node: &RtdlNode) -> CapabilityCallResult {
+    let call = node.call.clone().unwrap_or_default();
+    let args: Value = serde_json::from_str(&call.args_json).unwrap_or_default();
+    let output = match call.contract_id.rsplit('/').next().unwrap_or("") {
+        "navigate" => json!({"known": true, "state": "SUCCEEDED", "detail": "succeeded"}),
+        "pick" => json!({"object": args["object"]}),
+        "place" => json!({"target": args["target"]}),
+        _ => json!({"ok": true}),
+    };
+    CapabilityCallResult {
+        output: output.to_string(),
+        ..Default::default()
+    }
+}
+
 /// A step as the decision model reads it: what it called and, once it has
-/// ended, how; `None` for a step still running, which is reported as succeeded.
+/// ended, how; `None` for a step still running, reported as succeeded with what
+/// such a step returns.
 fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) -> Value {
     let parse = |text: &str| serde_json::from_str(text).unwrap_or_else(|_| Value::from(text));
     let call = node.call.clone().unwrap_or_default();
@@ -682,12 +697,16 @@ fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) ->
         "capability": call.contract_id,
         "args": parse(&call.args_json),
     });
-    match ended {
+    let running;
+    let ended = match ended {
+        Some(ended) => ended,
         None => {
-            step["status"] = "succeeded".into();
-            step["output"] = STILL_RUNNING.into();
+            running = acted(node);
+            (true, &running)
         }
-        Some((true, leaf)) => {
+    };
+    match ended {
+        (true, leaf) => {
             step["status"] = "succeeded".into();
             // The decision model reads text only, and one image's base64
             // alone exceeds its input limit.
@@ -697,7 +716,7 @@ fn report_step(node: &RtdlNode, ended: Option<(bool, &CapabilityCallResult)>) ->
                 parse(&leaf.output)
             };
         }
-        Some((false, leaf)) => {
+        (false, leaf) => {
             step["status"] = "failed".into();
             step["error"] = if leaf.error.is_empty() {
                 leaf.output.clone()
@@ -3195,6 +3214,28 @@ mod tests {
             .map(|node| node["cap"].as_str().unwrap())
             .collect();
         assert_eq!(caps, ["goal_near", "find", "speak", "place"]);
+    }
+
+    #[test]
+    fn a_step_still_running_is_reported_as_it_returns_once_it_succeeds() {
+        let step = |contract: &str, args: &str| RtdlNode {
+            node_kind: RTDL_DO,
+            call: Some(CapabilityCall {
+                contract_id: contract.into(),
+                args_json: args.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reported = |node: &RtdlNode| super::report_step(node, None);
+        let pick = reported(&step(
+            "robonix/skill/manipulation/pick",
+            r#"{"object":"cup"}"#,
+        ));
+        assert_eq!(pick["status"], "succeeded");
+        assert_eq!(pick["output"], serde_json::json!({"object": "cup"}));
+        let navigate = reported(&step("robonix/service/navigation/navigate", "{}"));
+        assert_eq!(navigate["output"]["state"], "SUCCEEDED");
     }
 
     #[tokio::test]
