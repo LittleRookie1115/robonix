@@ -1737,15 +1737,27 @@ pub async fn run_turn(
     // replan without limit; this bounds every path by the same cap.
     let mut requests = 0usize;
     let mut output_retries = 0usize;
-    let mut reply_shape = ReplyShape::RtdlEnvelope;
     let speculate = task_speculates(task);
+    // The round's own reply writes the situations its tree's success could show
+    // before the tree, and no reply is prepared while a tree runs: Segue's
+    // fast-slow planning without overlap, for measuring that overlap.
+    let inline_next = speculate && task_switch(task, "inline_next", false);
+    let envelope_shape = if inline_next {
+        ReplyShape::RtdlEnvelopeNext
+    } else {
+        ReplyShape::RtdlEnvelope
+    };
+    let mut reply_shape = envelope_shape;
     // Segue's planning context and its guidance on folding reads into trees, each
     // switchable so their share of the speedup can be measured.
     let state_view = task_switch(task, "state_view", true);
-    let protocol_prompt = rtdl_protocol(
+    let mut protocol_prompt = rtdl_protocol(
         task_switch(task, "fold_reads", true),
         task_switch(task, "reconfirm", false),
     );
+    if inline_next {
+        protocol_prompt.push_str(&speculation::inline_next_guidance());
+    }
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
@@ -2521,7 +2533,13 @@ pub async fn run_turn(
             }
         };
         output_retries = 0;
-        reply_shape = ReplyShape::RtdlEnvelope;
+        reply_shape = envelope_shape;
+        // The situations an `inline_next` reply wrote for its tree's success; a
+        // prepared reply used for this round has none.
+        let next = (inline_next && !replayed)
+            .then(|| serde_json::from_str::<serde_json::Value>(parser.text()).ok())
+            .flatten()
+            .map(|reply| reply["next"].clone());
         if live.plan.nodes.is_empty()
             && forest.revision.load(Ordering::Acquire) != planning_revision
         {
@@ -2737,6 +2755,16 @@ pub async fn run_turn(
             // covers the tree's success; otherwise the other outcomes are asked for now.
             let adopted = ahead.and_then(|ahead: Speculation| ahead.adopt(&graph, seen));
             speculation = match adopted {
+                _ if inline_next => next.as_ref().and_then(|next| {
+                    Speculation::inline(
+                        &graph,
+                        task,
+                        seen,
+                        next,
+                        state["objects"].clone(),
+                        dispatched,
+                    )
+                }),
                 Some(adopted) if adopted.awaits_success() => Some(adopted),
                 adopted => {
                     let mut context = history.clone();

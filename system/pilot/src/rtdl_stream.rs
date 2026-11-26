@@ -441,7 +441,8 @@ impl RtdlIncrementalParser {
         };
         for key in fields.keys() {
             ensure!(
-                ["content", "rtdl", "rtdl_description"].contains(&key.as_str())
+                // `next`, a task's `inline_next` situations, is read by Pilot once the reply ends.
+                ["content", "rtdl", "rtdl_description", "next"].contains(&key.as_str())
                     || tasks::REPLY_FIELDS.contains(&key.as_str()),
                 "unknown response field `{key}`"
             );
@@ -1367,6 +1368,20 @@ mod tests {
             .unwrap();
         assert!(!p.committed());
         assert!(p.finish().is_err());
+    }
+
+    /// `next` before `rtdl` holds replies with trees of their own, which are not dispatched.
+    #[test]
+    fn next_situations_before_the_tree_are_left_to_pilot() {
+        let mut p = parser();
+        p.push(
+            r#"{"content":"","message_updates":[],"rtdl_parent_task_id":"T1","rtdl_description":"d","next":[{"when":"found","reply":{"content":"","rtdl":{"op":"do","description":"later","cap":"run","args":{}}}}],"rtdl":{"op":"do","description":"now","cap":"run","args":{}},"task_updates":[]}"#,
+        )
+        .unwrap();
+        let (envelope, _) = p.finish().unwrap();
+        assert_eq!(envelope.rtdl["description"], "now");
+        assert_eq!(p.plan.nodes.len(), 1);
+        assert_eq!(p.plan.nodes[0].description, "now");
     }
 
     /// Reject malformed completed fields before any capability can be admitted.

@@ -397,6 +397,39 @@ const CHOOSE_IN_REPLY: &str = "Where the next step acts on an object that Scene'
      Pilot puts in the id of the listed object the decision model finds fits, among those in the \
      rooms the command names if it names any, and does not use the reply if none does. ";
 
+/// What a task's `inline_next` asks of the round's own reply: the situations its
+/// tree's success could show, each with its reply, written before the tree, as
+/// the success reply prepared while a tree runs is asked for (see [`hypothesis`]).
+pub(crate) fn inline_next_guidance() -> String {
+    format!(
+        "Before `rtdl`, give `next`: what you would do once this tree has succeeded, so that \
+         Pilot need not ask you again then. List one or two situations that its steps' outputs \
+         could show and that call for different next moves, the likeliest first. When the tree \
+         runs long enough for its outputs to vary, first the bold one: what the outputs most \
+         likely show, with a reply that carries the task as far from there as one tree can; then \
+         the careful one: the outputs show otherwise, or too little to act on, with a reply that \
+         still moves the task forward without relying on them: acting on an object the \
+         environment state already lists that fits the task and is in the place the command \
+         names, if it names one and there is such an object; else looking again in that place \
+         from another viewpoint; else, if the command names no place, searching the next likely \
+         place. Neither reply may give the task up or report that it cannot be done. Reporting \
+         the task done is the bold course when this tree's success completes it. If the next \
+         move is the same whatever the outputs show, give one situation with `when` empty. \
+         Each situation is {{\"when\": ..., \"reply\": ...}}: `when` says in one sentence what \
+         the outputs would show, resting only on what they say as text, never on what an image \
+         shows; `reply` is the complete reply you would give once those outputs are reported, in \
+         this reply's form without `next`. In a reply, refer to an output of one of this tree's \
+         steps as {{\"var\": \"<that step's bind>\", \"path\": [\"<field>\"]}}, using the \
+         `bind` you give the step in `rtdl`, and decide with `if`. Beyond what a situation's \
+         `when` says, do not assume any output value, and do not state one in its reply's \
+         `content`. Write each node's description in a few words and each reply's `content` in \
+         one sentence. {NAMED_PLACES}{CHOOSE_IN_REPLY}A fast decision model picks the situation \
+         the real outputs show, and Pilot uses its reply instead of asking you; if none clearly \
+         matches, you are asked as usual. Give `next` empty if this reply dispatches no tree or \
+         what follows needs to see the outputs first.\n"
+    )
+}
+
 const CHOOSE: &str = "The robot is about to act on the object that looking_for describes, for \
                       the task. Which listed object is it? If none of them plainly is, pick the \
                       last option.";
@@ -1289,6 +1322,87 @@ impl Speculation {
             dispatched,
             short,
             decide_early: context["decide_early"].as_bool().unwrap_or(true),
+            early: None,
+            succeeded: HashMap::new(),
+            early_taken: false,
+            early_off: false,
+        })
+    }
+
+    /// The situations a round's own reply wrote in `next` for the success of
+    /// the tree it dispatched (a task's `inline_next`), held as that success's
+    /// prepared reply. Nothing is asked while the tree runs: they were written
+    /// before it started, so no planning overlaps its execution. Settled as a
+    /// prepared reply is, by the rules and the decision model, once it ends.
+    pub(crate) fn inline(
+        plan: &Plan,
+        task: &Task,
+        messages_seen: usize,
+        next: &Value,
+        objects: Value,
+        dispatched: Option<Instant>,
+    ) -> Option<Self> {
+        // Only a decision model reading the real results can choose between situations.
+        DECISION_MODEL.as_ref()?;
+        let situations = inline_situations(plan, next)?;
+        let context: Value = serde_json::from_str(&task.context_json).unwrap_or_default();
+        let tau =
+            |key: &str, default: f64| context.get(key).and_then(Value::as_f64).unwrap_or(default);
+        let (tau_choice, tau_done) = (tau("tau_choice", TAU_CHOICE), tau("tau_done", TAU_DONE));
+        let tau_success = tau("tau_success", tau_choice);
+        let listed = context["read_only"].as_array();
+        let contracts = listed.into_iter().flatten().filter_map(Value::as_str);
+        let reads: Arc<HashSet<String>> =
+            Arc::new(contracts.map(crate::discovery::llm_name).collect());
+        info!(
+            "[pilot/segue] {}",
+            json!({
+                "event": "start",
+                "plan_id": plan.plan_id,
+                "inline": true,
+                "branches": ["succeeded"],
+                "situations": situations.len(),
+                "decision_model": DECISION_MODEL.as_ref().map(|m| &m.model),
+                "tau_choice": tau_choice,
+                "tau_success": tau_success,
+                "tau_done": tau_done,
+            })
+        );
+        let text = json!({"situations": situations}).to_string();
+        Some(Self {
+            plan_id: plan.plan_id.clone(),
+            steps: steps_in_order(plan),
+            nodes: plan.nodes.clone(),
+            branches: vec![Branch {
+                outcome: Outcome::Succeeded,
+                reply: tokio::spawn(std::future::ready(Ok(Prepared {
+                    text,
+                    next: Vec::new(),
+                    read: None,
+                }))),
+                next: None,
+                objects: Arc::new(objects),
+            }],
+            messages_seen,
+            ended: None,
+            outputs: HashMap::new(),
+            report: Vec::new(),
+            task: task.text.clone(),
+            tau_choice,
+            tau_success,
+            tau_done,
+            started: Instant::now(),
+            ahead: Vec::new(),
+            renames: Vec::new(),
+            reads,
+            read_set: context["read_set"].as_bool().unwrap_or(true),
+            stop: None,
+            go: None,
+            expected: None,
+            dispatched: dispatched.unwrap_or_else(Instant::now),
+            short: false,
+            // Deciding while the tree runs would overlap planning with it.
+            decide_early: false,
             early: None,
             succeeded: HashMap::new(),
             early_taken: false,
@@ -2497,6 +2611,54 @@ fn resolved(tree: &Value, outputs: &HashMap<String, String>) -> Value {
     let mut tree = tree.clone();
     resolve(&mut tree, outputs, &bound);
     tree
+}
+
+/// The situations in `next`, with each reply naming the outputs of `plan`'s
+/// steps by op_id where it names them by bind, as Pilot fills in a prepared
+/// reply's references; `None` if there are none.
+fn inline_situations(plan: &Plan, next: &Value) -> Option<Vec<Value>> {
+    let situations = next
+        .as_array()
+        .filter(|situations| !situations.is_empty())?;
+    let binds: HashMap<&str, &str> = plan
+        .nodes
+        .iter()
+        .filter(|node| node.node_kind == RTDL_DO && !node.bind.is_empty())
+        .map(|node| (node.bind.as_str(), node.op_id.as_str()))
+        .collect();
+    let renamed = situations.iter().cloned().map(|mut situation| {
+        by_op_id(&mut situation["reply"], &binds);
+        situation
+    });
+    Some(renamed.collect())
+}
+
+/// Rename `{"var": "<bind>"}` references in `reply` to the op_id of the step of
+/// the tree before it that `binds` gives that bind, unless the reply's own tree
+/// binds the name too, where it means that step.
+fn by_op_id(reply: &mut Value, binds: &HashMap<&str, &str>) {
+    fn rename(value: &mut Value, binds: &HashMap<&str, &str>, own: &HashSet<String>) {
+        match value {
+            Value::Object(fields) if crate::expression::is_reference(fields) => {
+                let op_id = fields
+                    .get("var")
+                    .and_then(Value::as_str)
+                    .filter(|name| !own.contains(*name))
+                    .and_then(|name| binds.get(name));
+                if let Some(op_id) = op_id {
+                    fields.insert("var".into(), json!(op_id));
+                }
+            }
+            Value::Object(fields) => fields.values_mut().for_each(|v| rename(v, binds, own)),
+            Value::Array(items) => items.iter_mut().for_each(|v| rename(v, binds, own)),
+            _ => {}
+        }
+    }
+    let own: HashSet<String> = do_nodes(&reply["rtdl"])
+        .iter()
+        .filter_map(|node| node["bind"].as_str().map(String::from))
+        .collect();
+    rename(reply, binds, &own);
 }
 
 /// The ids of the objects the finished steps in `outputs` returned: every
@@ -4717,5 +4879,72 @@ mod tests {
                 .unwrap(),
             (reply, None)
         );
+    }
+
+    /// A sequence of a `find` bound as `found` and a `say`, for `inline_next`.
+    fn found_then_say() -> (Plan, crate::pb::pilot::Task) {
+        let step = |index: u32, bind: &str| RtdlNode {
+            node_kind: RTDL_DO,
+            op_id: format!("p-{index}"),
+            bind: bind.into(),
+            call: Some(CapabilityCall {
+                contract_id: "robonix/system/scene/find".into(),
+                args_json: "{}".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let root = RtdlNode {
+            node_kind: RTDL_SEQUENCE,
+            children: vec![1, 2],
+            ..Default::default()
+        };
+        let plan = Plan {
+            plan_id: "p".into(),
+            nodes: vec![root, step(1, "found"), step(2, "")],
+            ..Default::default()
+        };
+        let task = crate::pb::pilot::Task {
+            text: "bring the cup".into(),
+            context_json: r#"{"speculate": true, "inline_next": true}"#.into(),
+            ..Default::default()
+        };
+        (plan, task)
+    }
+
+    #[test]
+    fn inline_situations_name_the_tree_outputs_by_op_id() {
+        use serde_json::json;
+        let (plan, _) = found_then_say();
+        let reference = |name: &str| json!({"var": name, "path": ["objects"]});
+        let next = json!([
+            {"when": "", "reply": {"content": "", "rtdl": {"op": "do", "description": "pick",
+                "cap": "pick", "args": {"object": reference("found")}}}},
+            // A reply that binds `found` itself means its own step by it.
+            {"when": "again", "reply": {"content": "", "rtdl": {"op": "sequence", "children": [
+                {"op": "do", "description": "look", "cap": "find", "args": {}, "bind": "found"},
+                {"op": "do", "description": "pick", "cap": "pick",
+                 "args": {"object": reference("found")}}]}}},
+        ]);
+        let situations = super::inline_situations(&plan, &next).unwrap();
+        assert_eq!(
+            situations[0]["reply"]["rtdl"]["args"]["object"],
+            reference("p-1")
+        );
+        assert_eq!(
+            situations[1]["reply"]["rtdl"]["children"][1]["args"]["object"],
+            reference("found")
+        );
+    }
+
+    #[test]
+    fn inline_next_prepares_nothing_without_situations_or_a_decision_model() {
+        let (plan, task) = found_then_say();
+        for next in [serde_json::json!([]), serde_json::Value::Null] {
+            assert!(super::inline_situations(&plan, &next).is_none());
+        }
+        // The tests run with no decision model, which alone can pick a situation.
+        let next = serde_json::json!([{"when": "", "reply": {"content": ""}}]);
+        assert!(Speculation::inline(&plan, &task, 1, &next, Default::default(), None).is_none());
     }
 }

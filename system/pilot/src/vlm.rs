@@ -397,6 +397,10 @@ pub enum ReplyShape {
     /// One to three situations an outcome could show, each with the RTDL
     /// envelope prepared for it (see `speculation`).
     Situations,
+    /// The RTDL envelope with `next` before `rtdl`: the situations the tree's
+    /// success could show, each with its reply, written in the same request
+    /// (a task's `inline_next`, see `speculation`).
+    RtdlEnvelopeNext,
 }
 
 /// The RTDL envelope as a JSON schema.
@@ -537,6 +541,43 @@ fn situations_schema() -> Value {
     })
 }
 
+/// The RTDL envelope with `next`, the situations its tree's success could show
+/// (see [`situations_schema`]), placed before `rtdl` so that the robot waits
+/// for them as for the tree: they are written before its first step goes out.
+fn rtdl_envelope_next_schema() -> Value {
+    let mut schema = rtdl_envelope_schema();
+    let mut reply = rtdl_envelope_schema();
+    if let Some(reply) = reply.as_object_mut() {
+        reply.remove("$defs");
+    }
+    let next = serde_json::json!({
+        "type": "array",
+        "maxItems": 3,
+        "items": {
+            "type": "object",
+            "properties": {"when": {"type": "string"}, "reply": reply},
+            "required": ["when", "reply"],
+        },
+    });
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        let rest: Vec<(String, Value)> = std::mem::take(properties).into_iter().collect();
+        for (key, value) in rest {
+            if key == "rtdl" {
+                properties.insert("next".into(), next.clone());
+            }
+            properties.insert(key, value);
+        }
+    }
+    if let Some(required) = schema["required"].as_array_mut() {
+        let at = required
+            .iter()
+            .position(|key| key == "rtdl")
+            .unwrap_or(required.len());
+        required.insert(at, "next".into());
+    }
+    schema
+}
+
 /// Claude caches a prompt only up to an explicit `cache_control` breakpoint.
 /// Mark the system prompt and the two newest messages: the newest is the
 /// per-round context, which is not kept in history, so the one before it is
@@ -594,6 +635,14 @@ fn response_format_for(shape: ReplyShape) -> Option<ResponseFormat> {
                 description: None,
                 name: "situations".to_string(),
                 schema: Some(situations_schema()),
+                strict: Some(false),
+            },
+        }),
+        ReplyShape::RtdlEnvelopeNext => Some(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                description: None,
+                name: "rtdl_envelope_next".to_string(),
+                schema: Some(rtdl_envelope_next_schema()),
                 strict: Some(false),
             },
         }),
@@ -1098,6 +1147,39 @@ mod tests {
         // mention JSON, so the compaction prompt, which asks for prose, must
         // not carry it.
         assert!(response_format_for(ReplyShape::Text).is_none());
+    }
+
+    #[test]
+    fn next_situations_come_before_the_tree_they_follow() {
+        let Some(ResponseFormat::JsonSchema { json_schema }) =
+            response_format_for(ReplyShape::RtdlEnvelopeNext)
+        else {
+            panic!("an inline_next reply must carry a schema");
+        };
+        let schema = json_schema.schema.expect("schema body");
+        let keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let at = |key: &str| keys.iter().position(|k| *k == key).unwrap();
+        // Written before the tree, so its first step waits for them.
+        assert_eq!(at("next"), at("rtdl") - 1);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("next"))
+        );
+        // Each situation's reply is an envelope whose nodes resolve at the root.
+        let reply = &schema["properties"]["next"]["items"]["properties"]["reply"];
+        assert!(reply.get("$defs").is_none());
+        assert!(reply["properties"].get("next").is_none());
+        assert_eq!(
+            schema["$defs"]["node"]["properties"]["op"]["enum"][0],
+            "sequence"
+        );
     }
 
     #[test]
