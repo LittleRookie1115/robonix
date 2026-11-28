@@ -2116,9 +2116,7 @@ pub async fn run_turn(
             && forest.kill_pending.is_empty()
         {
             let scene = state_context::SceneProviders::among(&cap_list);
-            memory_reply = memory
-                .reply(&state, tasks.messages.len(), executor, scene.as_ref())
-                .await;
+            memory_reply = memory.reply(&state, tasks, executor, scene.as_ref()).await;
         }
         if requests == 0
             && memory_reply.is_none()

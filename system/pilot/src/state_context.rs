@@ -194,6 +194,9 @@ pub async fn collect(
     state["places"] = places;
     // Where each object is, which the prompt has no use for but a watch does.
     state["poses"] = everything["state"]["objects"].clone();
+    // Which room each point of interest is in, which task memory follows when a
+    // command names another place.
+    state["rooms_of"] = rooms_of(&regions);
     (environment, map, state)
 }
 
@@ -290,6 +293,49 @@ fn rounded(value: &Value) -> Value {
             .into(),
         other => other.clone(),
     }
+}
+
+/// Each point of interest's room, by lower-case name: the region whose polygon
+/// holds its point, from what `list_regions` returned.
+fn rooms_of(listed: &Value) -> Value {
+    let regions = listed["state"]["regions"].as_array().into_iter().flatten();
+    let points = |region: &Value| -> Vec<(f64, f64)> {
+        let xy: Vec<f64> = region["points_xy"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_f64)
+            .collect();
+        xy.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y)).collect()
+    };
+    let (rooms, pois): (Vec<&Value>, Vec<&Value>) = regions.partition(|r| r["kind"] == "region");
+    let mut out = serde_json::Map::new();
+    for poi in pois {
+        let (Some(name), Some(&at)) = (poi["name"].as_str(), points(poi).first()) else {
+            continue;
+        };
+        let room = rooms
+            .iter()
+            .find(|room| inside(at, &points(room)))
+            .and_then(|room| room["name"].as_str());
+        if let Some(room) = room {
+            out.insert(name.to_lowercase(), room.to_lowercase().into());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Whether `point` is inside the polygon `corners` (even-odd rule).
+fn inside(point: (f64, f64), corners: &[(f64, f64)]) -> bool {
+    let (x, y) = point;
+    let mut inside = false;
+    for (i, &(xi, yi)) in corners.iter().enumerate() {
+        let (xj, yj) = corners[(i + corners.len() - 1) % corners.len()];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// What `list_regions` returned, cut to what choosing a destination needs,
@@ -428,7 +474,7 @@ fn lifecycle_name(state: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{by_region, lifecycle_name, named, rounded};
+    use super::{by_region, lifecycle_name, named, rooms_of, rounded};
     use robonix_atlas::pb::LifecycleState;
     use serde_json::json;
     use std::collections::HashMap;
@@ -437,6 +483,21 @@ mod tests {
     fn lifecycle_labels_are_stable() {
         assert_eq!(lifecycle_name(LifecycleState::StateActive as i32), "active");
         assert_eq!(lifecycle_name(LifecycleState::StateError as i32), "error");
+    }
+
+    #[test]
+    fn each_point_of_interest_is_in_the_room_whose_polygon_holds_it() {
+        let listed = json!({"state": {"regions": [
+            {"id": "r1", "kind": "region", "name": "Kitchen", "points_xy": [0.0, 0.0, 4.0, 0.0, 4.0, 4.0, 0.0, 4.0]},
+            {"id": "r2", "kind": "region", "name": "bedroom", "points_xy": [4.0, 0.0, 8.0, 0.0, 8.0, 4.0, 4.0, 4.0]},
+            {"id": "p1", "kind": "poi", "name": "Dinner table", "points_xy": [1.0, 1.0]},
+            {"id": "p2", "kind": "poi", "name": "bedside table", "points_xy": [6.0, 3.0]},
+            {"id": "p3", "kind": "poi", "name": "porch", "points_xy": [9.0, 9.0]},
+        ]}});
+        assert_eq!(
+            rooms_of(&listed),
+            json!({"dinner table": "kitchen", "bedside table": "bedroom"})
+        );
     }
 
     #[test]

@@ -18,8 +18,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+mod clauses;
+use clauses::Clause;
+
 /// A point on the map.
 type Point = (f64, f64);
+/// Spans of a kept command and what a new one has in their place.
+type Spans = Vec<(String, String)>;
 
 /// At most this many spans may differ between a kept command and a new one.
 const MAX_SPANS: usize = 3;
@@ -109,6 +114,9 @@ enum Mode {
     /// Any kept run's next reply where its trees so far ran the same steps as
     /// this run's and ended as they did, failures included.
     Programs,
+    /// As [`Mode::Programs`], and where no kept run serves the whole command,
+    /// the steps a kept run made for a clause serve that clause of this one.
+    Clauses,
 }
 
 impl Mode {
@@ -116,6 +124,7 @@ impl Mode {
         match self {
             Self::Paths => "paths",
             Self::Programs => "programs",
+            Self::Clauses => "clauses",
         }
     }
 }
@@ -179,6 +188,34 @@ struct Aligned {
     spans: Vec<(String, String)>,
 }
 
+/// What a served tree is made from.
+struct Source<'a> {
+    /// The kept run.
+    episode: &'a Episode,
+    /// The kept tree it comes from, an index into the run's segments.
+    segment: usize,
+    /// The reply to bind: the kept tree's, or a tree of its steps for one clause.
+    reply: Value,
+    /// The spans to put in.
+    spans: Vec<(String, String)>,
+    /// Whether it is the kept tree whole, which may name earlier kept steps.
+    whole: bool,
+}
+
+/// A kept run's steps for one clause of its command, which can serve that
+/// clause of another command.
+#[derive(Clone, Debug)]
+struct Program {
+    /// The kept run, an index into `TaskMemory::kept`.
+    episode: usize,
+    /// The clause of its command, an index; the number of its clauses for its return.
+    clause: usize,
+    /// Its steps, tree by tree: each tree's index in the run and the top-level
+    /// steps of it that served the clause. Each part is served as a tree of its
+    /// own, the next only if the last ended as it did in the kept run.
+    parts: Vec<(usize, Vec<usize>)>,
+}
+
 /// A task's memory while its turn runs.
 pub(crate) struct TaskMemory {
     /// Which memory the task uses.
@@ -200,13 +237,34 @@ pub(crate) struct TaskMemory {
     /// The object picked this turn for a kept label (its id and label), so
     /// that every tree takes the same one.
     picks: HashMap<String, (String, String)>,
-    /// The kept runs' Scene object ids bound this turn to this run's, so that
-    /// every tree binds them alike and no two become one.
+    /// The kept runs' Scene object ids bound this turn to this run's (keyed by
+    /// the kept run and the id), so that every tree binds them alike and no two
+    /// of one kept run become one.
     bound: HashMap<String, String>,
+    /// Every kept run, for their clauses ([`Mode::Clauses`]; else none).
+    kept: Vec<Episode>,
+    /// The kept runs' steps for their clauses, which can serve clauses of this command.
+    programs: Vec<Program>,
     /// Whether a reply was served and not dispatched yet.
     serving: bool,
+    /// Whether the reply served last was a kept run's whole tree.
+    served_whole: bool,
     /// Why memory stopped serving this run, once it has.
     stopped: Option<String>,
+    /// Why memory stopped serving whole kept runs, where it may still serve clauses.
+    whole_stopped: Option<String>,
+    /// The clauses of this command memory refused this turn, logged once each.
+    refused: HashSet<usize>,
+    /// The programs served this turn, not served again.
+    tried: HashSet<usize>,
+    /// The clauses a program was served for this turn: another is not, for
+    /// what the first left undone is the planner's.
+    served_clauses: HashSet<usize>,
+    /// The program being served part by part: its index, its next part, the
+    /// clause of this command it serves, and its spans.
+    in_clause: Option<(usize, usize, usize, Spans)>,
+    /// The clause of this command the reply served last serves, until Scene's check passes it.
+    serving_clause: Option<usize>,
     /// Where this run's robot was when the task began, if the state view knew.
     began_at: Option<Point>,
 }
@@ -227,6 +285,7 @@ impl TaskMemory {
         let mode = match context["task_memory"].as_str()? {
             "paths" => Mode::Paths,
             "programs" => Mode::Programs,
+            "clauses" => Mode::Clauses,
             _ => return None,
         };
         let store = load(&path(mode)).unwrap_or_else(|why| {
@@ -234,6 +293,12 @@ impl TaskMemory {
             Store::default()
         });
         let kept = store.episodes.len();
+        let all = if mode == Mode::Clauses {
+            store.episodes.clone()
+        } else {
+            Vec::new()
+        };
+        let programs = programs(&all);
         let mut aligned: Vec<(usize, Aligned)> = store
             .episodes
             .into_iter()
@@ -249,6 +314,7 @@ impl TaskMemory {
             "what": "lookup", "mode": mode.label(), "kept": kept,
             "aligned": aligned.iter().map(|a| json!({"spans": a.spans, "segments": a.episode.segments.len()}))
                 .collect::<Vec<_>>(),
+            "clause_programs": programs.len(),
         }));
         Some(Self {
             mode,
@@ -267,8 +333,17 @@ impl TaskMemory {
             outputs: HashMap::new(),
             picks: HashMap::new(),
             bound: HashMap::new(),
+            kept: all,
+            programs,
             serving: false,
+            served_whole: false,
             stopped: None,
+            whole_stopped: None,
+            refused: HashSet::new(),
+            tried: HashSet::new(),
+            served_clauses: HashSet::new(),
+            in_clause: None,
+            serving_clause: None,
             began_at: None,
         })
     }
@@ -282,6 +357,18 @@ impl TaskMemory {
         if self.stopped.is_none() {
             log(json!({"what": "stop", "tree": self.run.len(), "why": why}));
             self.stopped = Some(why);
+        }
+    }
+
+    /// Memory serves no more whole kept runs this turn; with [`Mode::Clauses`]
+    /// it may still serve clauses.
+    fn stop_whole(&mut self, why: String) {
+        if self.mode != Mode::Clauses {
+            return self.stop(why);
+        }
+        if self.whole_stopped.is_none() {
+            log(json!({"what": "stop", "tree": self.run.len(), "why": why, "clauses_go_on": true}));
+            self.whole_stopped = Some(why);
         }
     }
 
@@ -320,50 +407,70 @@ impl TaskMemory {
                 let best = self.aligned.first().filter(|a| clean && goes_on(a));
                 best.map(|_| vec![0]).unwrap_or_default()
             }
-            Mode::Programs => (0..self.aligned.len())
+            Mode::Programs | Mode::Clauses => (0..self.aligned.len())
                 .filter(|&at| goes_on(&self.aligned[at]))
                 .collect(),
         }
     }
 
-    /// Whether memory may serve the round after the tree just dispatched, so
-    /// that no reply need be prepared for its success.
+    /// Whether memory may serve the round after the tree just dispatched if it
+    /// succeeds, so that no reply need be prepared for its success.
     pub(crate) fn expects_more(&self) -> bool {
-        if self.stopped.is_some() || !self.run.last().is_some_and(|s| s.reused) {
+        let whole = self.stopped.is_none() && self.whole_stopped.is_none();
+        if !whole || !self.run.last().is_some_and(|s| s.reused) {
             return false;
         }
         let k = self.run.len();
         self.candidates().first().is_some_and(|&at| {
             let episode = &self.aligned[at].episode;
+            // The kept run went on after a tree that ended well, as this one is asked to.
+            let well = episode.segments[k - 1]
+                .signature
+                .iter()
+                .all(|step| step == "ok" || step == "empty");
             let next = serde_json::from_str(&episode.segments[k].reply);
-            next.is_ok_and(|next| stale(episode, k, &next).is_empty())
+            well && next.is_ok_and(|next| stale(episode, k, &next).is_empty())
         })
     }
 
     /// The reply memory serves for the next tree, if it can, with a note for
     /// the planner where Scene's check cut it ([`premises_hold`]). `None`
-    /// leaves the round to the planner, and memory serves no later round of
-    /// the turn. `messages` is how many user messages the session has now.
+    /// leaves the round to the planner; none while the task is closed. `tasks`
+    /// are the session's tasks now.
     pub(crate) async fn reply(
         &mut self,
         state: &Value,
-        messages: usize,
+        tasks: &TaskTable,
         executor: &ExecutorConn,
         scene: Option<&SceneProviders>,
     ) -> Option<(String, Option<String>)> {
-        let reply = self.next(state, messages).await?;
+        // A served reply may have closed the task: the rest is the planner's to say.
+        if !tasks.is_open(&self.task_id) {
+            return None;
+        }
+        let reply = self.next(state, tasks.messages.len()).await?;
         match premises_hold(reply, executor, scene).await {
-            Ok(checked) => Some(checked),
+            Ok(checked) => {
+                self.served_clauses.extend(self.serving_clause.take());
+                Some(checked)
+            }
             Err(why) => {
+                self.serving_clause = None;
+                self.in_clause = None;
                 self.serving = false;
-                self.stop(why);
+                if self.served_whole {
+                    self.stop_whole(why);
+                } else {
+                    log(json!({"what": "refuse", "tree": self.run.len(), "why": why}));
+                }
                 None
             }
         }
     }
 
-    /// The next tree of the best kept run that fits this one, bound to this
-    /// run, before Scene's check.
+    /// The next tree memory serves, bound to this run, before Scene's check: a
+    /// whole kept run's next tree, else ([`Mode::Clauses`]) the steps a kept run
+    /// made for the clause this run is at.
     async fn next(&mut self, state: &Value, messages: usize) -> Option<Value> {
         if std::mem::take(&mut self.serving) {
             // Its replay failed or its round was cut short: served again, it would be again.
@@ -372,21 +479,45 @@ impl TaskMemory {
         if messages != self.messages {
             self.stop("a new message came".into());
         }
-        if self.stopped.is_some() || self.aligned.is_empty() {
+        if self.stopped.is_some() {
             return None;
         }
-        let k = self.run.len();
-        if k == 0 {
-            self.began_at = robot_at(state);
+        if self.run.is_empty() || self.began_at.is_none() {
+            // Where the state view does not know the robot's pose, a task begins
+            // at the instruction point.
+            let point = places_listed(&state["places"])
+                .get("instruction point")
+                .copied();
+            self.began_at = self.began_at.or(robot_at(state)).or(point);
         }
-        if let Some(last) = self.run.last() {
-            if !last.reused {
-                self.stop(format!("tree {} was the planner's", k - 1));
-                return None;
+        if self
+            .run
+            .last()
+            .is_some_and(|last| last.signature.is_empty())
+        {
+            return None;
+        }
+        if self.whole_stopped.is_none() && !self.aligned.is_empty() {
+            if let Some(reply) = self.next_whole(state).await {
+                return Some(reply);
             }
-            if last.signature.is_empty() {
-                return None;
-            }
+        } else if self.whole_stopped.is_none() {
+            self.stop_whole("no kept run of this command".into());
+        }
+        if self.mode == Mode::Clauses && self.stopped.is_none() {
+            return self.next_clause(state).await;
+        }
+        None
+    }
+
+    /// The next tree of the best kept run that fits this one.
+    async fn next_whole(&mut self, state: &Value) -> Option<Value> {
+        let k = self.run.len();
+        if let Some(last) = self.run.last()
+            && !last.reused
+        {
+            self.stop_whole(format!("tree {} was the planner's", k - 1));
+            return None;
         }
         let Some(&at) = self.candidates().first() else {
             let ended_here = self
@@ -396,90 +527,305 @@ impl TaskMemory {
             let why = match self.mode {
                 _ if ended_here => "the kept run ended here",
                 Mode::Paths => "the kept run does not go on this way",
-                Mode::Programs => "no kept run went on from here",
+                Mode::Programs | Mode::Clauses => "no kept run went on from here",
             };
-            self.stop(why.into());
+            self.stop_whole(why.into());
             return None;
         };
         let aligned = self.aligned[at].clone();
-        match self.instantiate(&aligned, state).await {
+        let kept = serde_json::from_str(&aligned.episode.segments[k].reply).unwrap_or_default();
+        let source = Source {
+            episode: &aligned.episode,
+            segment: k,
+            reply: kept,
+            spans: aligned.spans.clone(),
+            whole: true,
+        };
+        match self.instantiate(&source, state).await {
             Ok((reply, bound)) => {
                 log(json!({
                     "what": "serve", "tree": k, "aligned": at, "spans": aligned.spans,
                     "bound": bound, "steps": aligned.episode.segments[k].op_ids.len(),
                 }));
                 self.serving = true;
+                self.served_whole = true;
                 Some(reply)
             }
             Err(why) => {
-                self.stop(format!("tree {k}: {why}"));
+                self.stop_whole(format!("tree {k}: {why}"));
                 None
             }
         }
     }
 
-    /// `aligned`'s next tree for this run, with the bindings made, for the
-    /// record; or why it cannot serve. Spans go into its text; goals and place
-    /// ids follow renamed places ([`goals`], [`place_ids`]); Scene objects are
-    /// bound to this run's ([`TaskMemory::objects`]); a reference to a kept step
-    /// names this run's step in its place; task ids become this task's.
+    /// The steps a kept run made for the first clause this run has not done
+    /// (the return once every clause is), as a tree of their own: the next part
+    /// of the program being served if its last part ended, and heard, as it did
+    /// in the kept run; else the best program not served yet, from its first
+    /// part this run has not already done.
+    async fn next_clause(&mut self, state: &Value) -> Option<Value> {
+        let clauses = clauses::split(&self.command);
+        if clauses.is_empty() {
+            return None;
+        }
+        if let Some((p, part, at, spans)) = self.in_clause.take() {
+            let program = self.programs[p].clone();
+            let (s, steps) = &program.parts[part - 1];
+            let kept = &self.kept[program.episode].segments[*s];
+            let last = self.run.last()?;
+            let heard = |names: &[String], spans: &[(String, String)]| {
+                let mut heard: Vec<String> = names
+                    .iter()
+                    .map(|name| replace_spans(name, spans).to_lowercase())
+                    .collect();
+                heard.sort();
+                heard
+            };
+            let same = last.signature == part_signature(kept, steps)
+                && heard(&kept.heard, &spans) == heard(&last.heard, &[]);
+            if last.reused && same {
+                if let Some(reply) = self.serve_part(&clauses, p, part, at, spans, state).await {
+                    return Some(reply);
+                }
+            } else {
+                log(json!({"what": "stop", "tree": self.run.len(), "program": p,
+                    "why": "the part served last did not end as in the kept run"}));
+            }
+        }
+        let mut places: HashMap<String, Point> =
+            self.run.iter().flat_map(|s| s.places.clone()).collect();
+        places.extend(places_listed(&state["places"]));
+        let done = clauses::done(&clauses, &self.run, &places, self.began_at);
+        let at = done.iter().position(|d| !d)?;
+        if self.served_clauses.contains(&at) {
+            return None;
+        }
+        // What this run already did for the clause, which a program need not do again.
+        let owned = clauses::owners(&clauses, &self.run, &places, self.began_at);
+        let did: Vec<&str> = owned
+            .iter()
+            .filter(|o| o.clause == at && o.step.ok)
+            .map(|o| o.step.kind.as_str())
+            .collect();
+        let ending = clauses.get(at).map(Clause::ends_with);
+        let mut tried = Vec::new();
+        for (p, spans) in self.programs_for(&clauses, at) {
+            if !self.tried.insert(p) {
+                continue;
+            }
+            let program = &self.programs[p];
+            let kept = &self.kept[program.episode];
+            let first = program.parts.iter().position(|(s, steps)| {
+                let kinds = clauses::acting_kinds(&kept.segments[*s], steps);
+                kinds.iter().any(|k| Some(k.as_str()) == ending)
+                    || !kinds.iter().all(|k| did.contains(&k.as_str()))
+            });
+            let Some(first) = first else {
+                continue;
+            };
+            match self.serve_part(&clauses, p, first, at, spans, state).await {
+                Some(reply) => return Some(reply),
+                None => tried.push(p),
+            }
+        }
+        if self.refused.insert(at) {
+            log(json!({"what": "refuse", "tree": self.run.len(), "clause": at, "programs": tried}));
+        }
+        None
+    }
+
+    /// Part `part` of program `p` bound to this run as a tree, if it can serve.
+    async fn serve_part(
+        &mut self,
+        clauses: &[Clause],
+        p: usize,
+        part: usize,
+        at: usize,
+        spans: Vec<(String, String)>,
+        state: &Value,
+    ) -> Option<Value> {
+        let program = self.programs[p].clone();
+        let episode = self.kept[program.episode].clone();
+        let (segment, steps) = &program.parts[part];
+        let kept: Value = serde_json::from_str(&episode.segments[*segment].reply).ok()?;
+        let top = clauses::top_level(&kept["rtdl"]);
+        let children: Vec<Value> = steps.iter().map(|&c| top[c].clone()).collect();
+        let reply = json!({
+            "content": "",
+            "rtdl": {"op": "sequence", "children": children},
+            "task_updates": [],
+        });
+        let source = Source {
+            episode: &episode,
+            segment: *segment,
+            reply,
+            spans: spans.clone(),
+            whole: false,
+        };
+        match self.instantiate(&source, state).await {
+            Ok((mut reply, bound)) => {
+                // What it says is this command's clause, not the kept one's.
+                let text = clauses.get(at).map_or("going back", |c| c.text.as_str());
+                reply["content"] = json!(format!("Next: {text}."));
+                reply["rtdl_description"] = json!(text);
+                reply["rtdl"]["description"] = json!(text);
+                log(json!({
+                    "what": "serve", "tree": self.run.len(), "program": p, "part": part,
+                    "clause": at, "text": text, "kept_run": program.episode,
+                    "kept_clause": program.clause, "spans": spans, "bound": bound,
+                    "steps": steps.len(),
+                }));
+                if part + 1 < program.parts.len() {
+                    self.in_clause = Some((p, part + 1, at, spans));
+                }
+                self.serving_clause = Some(at);
+                self.serving = true;
+                self.served_whole = false;
+                Some(reply)
+            }
+            Err(why) => {
+                log(
+                    json!({"what": "refuse", "tree": self.run.len(), "program": p, "part": part, "why": why}),
+                );
+                None
+            }
+        }
+    }
+
+    /// The kept programs that may serve clause `at` of this command (the
+    /// return for `clauses.len()`), with the spans to put in, best first: fewer
+    /// spans, then newer. The spans are those of every clause of the kept
+    /// command that aligns, at the same distance, with one of this command
+    /// around `at`: a step may name what an earlier clause did ("it").
+    fn programs_for(&self, clauses: &[Clause], at: usize) -> Vec<(usize, Vec<(String, String)>)> {
+        let mut out: Vec<(usize, usize, usize, Spans)> = Vec::new();
+        for (p, program) in self.programs.iter().enumerate() {
+            let kept = clauses::split(&self.kept[program.episode].command);
+            let ret = program.clause == kept.len();
+            if ret != (at == clauses.len()) {
+                continue;
+            }
+            let episode = &self.kept[program.episode];
+            let mut own = Vec::new();
+            if !ret {
+                match clauses::align_clause(&kept[program.clause], &clauses[at]) {
+                    Some(spans) if handled(episode, &spans) => own = spans,
+                    _ => continue,
+                }
+            }
+            // Clauses before it, back while they align; but not against what the
+            // clause served keeps or renames otherwise, nor two renamings of a word.
+            let mut context: Spans = Vec::new();
+            let (mut i, mut j) = (program.clause.min(kept.len()), at.min(clauses.len()));
+            while i > 0 && j > 0 {
+                (i, j) = (i - 1, j - 1);
+                match clauses::align_clause(&kept[i], &clauses[j]) {
+                    Some(more) => context.extend(more),
+                    None => break,
+                }
+            }
+            let served = kept.get(program.clause).map_or("", |c| c.text.as_str());
+            let clashes: Vec<String> = context
+                .iter()
+                .filter(|(old, new)| context.iter().any(|(o, n)| o == old && n != new))
+                .map(|(old, _)| old.clone())
+                .collect();
+            context.retain(|(old, new)| {
+                let kept_here =
+                    contains_word(served, old) && !own.contains(&(old.clone(), new.clone()));
+                !clashes.contains(old) && !kept_here
+            });
+            let mut spans = own.clone();
+            spans.extend(context);
+            spans.sort();
+            spans.dedup();
+            out.push((own.len(), usize::MAX - program.episode, p, spans));
+        }
+        out.sort_by_key(|(n, newer, ..)| (*n, *newer));
+        out.into_iter().map(|(_, _, p, s)| (p, s)).collect()
+    }
+
+    /// `source`'s tree for this run, with the bindings made, for the record; or
+    /// why it cannot serve. Spans go into its text, with the rooms of renamed
+    /// places ([`with_rooms`]); goals and place ids follow renamed places
+    /// ([`goals`], [`place_ids`]); Scene objects are bound to this run's
+    /// ([`TaskMemory::objects`]); a reference to a kept step names this run's
+    /// step in its place; task ids become this task's.
     async fn instantiate(
         &mut self,
-        aligned: &Aligned,
+        source: &Source<'_>,
         state: &Value,
     ) -> Result<(Value, Value), String> {
-        let k = self.run.len();
-        let (episode, spans) = (&aligned.episode, &aligned.spans);
-        let kept: Value = serde_json::from_str(&episode.segments[k].reply)
-            .map_err(|e| format!("kept reply unreadable: {e}"))?;
-        let stale = stale(episode, k, &kept);
+        let (episode, kept) = (source.episode, &source.reply);
+        let stale = stale(episode, source.segment, kept);
         if !stale.is_empty() {
             return Err(format!(
                 "says what the kept run found out then: {}",
                 stale.join(", ")
             ));
         }
+        let (spans, rooms) = with_rooms(&source.spans, state, &episode.command, &self.command);
+        // What the command names, without the scene its text first sets.
+        let said = clauses::command_line(&self.command).to_string();
         let mut reply = kept.clone();
-        put_in(&mut reply, spans);
+        put_in(&mut reply, &spans);
+        if !source.whole {
+            own_names(episode, &reply["rtdl"], &spans, &said)?;
+        }
         let mut bound = serde_json::Map::new();
-        let places = Places::of(episode, state, spans);
+        let places = Places::of(episode, state, &spans, rooms);
         let start = (episode.segments[0].robot.or(self.began_at), self.began_at);
-        let moves = goals(
-            &places,
-            &reply["rtdl"],
-            spans,
-            &self.command,
-            start,
-            &mut bound,
-        )?;
+        let moves = goals(&places, &reply["rtdl"], &spans, &said, start, &mut bound)?;
         if places.changed
             && let Some(region) = regions(&reply["rtdl"])
                 .into_iter()
-                .find(|region| !contains_word(&self.command, region))
+                .find(|region| !places.named(&said, region))
         {
             return Err(format!(
                 "searches the {region}, which this command does not name"
             ));
         }
-        let mut ids = place_ids(&places, &reply["rtdl"], spans, &self.command, &mut bound)?;
+        let mut ids = place_ids(&places, &reply["rtdl"], &spans, &said, &mut bound)?;
         let (objects, relabel) = self
-            .objects(aligned, &kept, &places, state, &mut bound)
+            .objects(source, &spans, &places, state, &mut bound)
             .await?;
         ids.extend(objects);
-        let ops: HashMap<String, String> = episode
-            .segments
-            .iter()
-            .zip(&self.run)
-            .flat_map(|(kept, now)| kept.op_ids.iter().cloned().zip(now.op_ids.iter().cloned()))
-            .collect();
+        let ops: HashMap<String, String> = if source.whole {
+            let kept_trees = episode.segments.iter().zip(&self.run);
+            kept_trees
+                .flat_map(|(kept, now)| kept.op_ids.iter().cloned().zip(now.op_ids.iter().cloned()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let binds: HashSet<String> = crate::speculation::do_nodes(&reply["rtdl"])
             .iter()
             .filter_map(|node| node["bind"].as_str().map(String::from))
             .collect();
         rewrite(&mut reply["rtdl"], &ids, &ops, &moves, &binds)?;
+        let picked = relabel.as_ref().map(|(_, now)| now.clone());
         if let Some((chosen, now)) = relabel {
             put_in(&mut reply, &[(chosen.clone(), now.clone())]);
             bound.insert(chosen, json!(now));
+        }
+        if !source.whole {
+            // A kept clause's object is this command's only where the command
+            // names it or the decision model picked it: the kept planner may have
+            // chosen it for a kind this command does not ask for.
+            let mut now = labels_listed(&state["objects"]);
+            for output in self.outputs.values() {
+                now.extend(labels_listed(
+                    &serde_json::from_str(output).unwrap_or_default(),
+                ));
+            }
+            let foreign = labels_named(&reply, &now).into_iter().find(|label| {
+                label != "person" && !contains_word(&said, label) && picked.as_ref() != Some(label)
+            });
+            if let Some(label) = foreign {
+                return Err(format!(
+                    "acts on the {label}, which this command does not name"
+                ));
+            }
         }
         // Only the updates the kept planner made to the task its tree served.
         let kept_task = &kept["rtdl_parent_task_id"];
@@ -503,14 +849,14 @@ impl TaskMemory {
     /// and the picked object's to put in. No two kept ids become one.
     async fn objects(
         &mut self,
-        aligned: &Aligned,
-        kept: &Value,
+        source: &Source<'_>,
+        spans: &[(String, String)],
         places: &Places<'_>,
         state: &Value,
         bound: &mut serde_json::Map<String, Value>,
     ) -> Result<(HashMap<String, String>, Option<(String, String)>), String> {
-        let (episode, spans) = (&aligned.episode, &aligned.spans);
-        let labels = &episode.segments[self.run.len()].labels;
+        let (episode, kept) = (source.episode, &source.reply);
+        let labels = &episode.segments[source.segment].labels;
         let listed = labels_listed(&state["objects"]);
         let found_now: HashMap<String, String> = self
             .outputs
@@ -559,12 +905,15 @@ impl TaskMemory {
             }
         };
         let person_changed = spans.iter().any(|(old, _)| names_person(old));
+        // Ids are bound per kept run: two kept runs may know one object by two ids.
+        let run_key = format!("{}|{}|", episode.when, episode.command);
         let mut ids = HashMap::new();
         for id in ids_in(&kept["rtdl"]) {
             if ids.contains_key(&id) {
                 continue;
             }
-            let now = match self.bound.get(&id) {
+            let key = format!("{run_key}{id}");
+            let now = match self.bound.get(&key) {
                 Some(now) => now.clone(),
                 None => {
                     let label = norm_label(
@@ -584,10 +933,12 @@ impl TaskMemory {
                         }
                         _ => bind_label(&renamed, &found_now, &state["objects"])?,
                     };
-                    if let Some((other, _)) = self.bound.iter().find(|(_, n)| **n == now) {
+                    let mine = self.bound.iter().filter(|(k, _)| k.starts_with(&run_key));
+                    if let Some((other, _)) = mine.into_iter().find(|(_, n)| **n == now) {
+                        let other = other.trim_start_matches(&run_key);
                         return Err(format!("{id} and {other} would both be {now}"));
                     }
-                    self.bound.insert(id.clone(), now.clone());
+                    self.bound.insert(key, now.clone());
                     now
                 }
             };
@@ -744,6 +1095,202 @@ impl TaskMemory {
     }
 }
 
+/// Each kept run's steps for each clause of its command (and its return): the
+/// top-level steps that served the clause, tree by tree, each part naming no
+/// step outside it, every step of it ended well (a find may have found
+/// nothing). A clause that shares a top-level step with another has none: its
+/// steps there would be served without the others they came with.
+fn programs(episodes: &[Episode]) -> Vec<Program> {
+    let mut out = Vec::new();
+    for (e, episode) in episodes.iter().enumerate() {
+        let clauses = clauses::split(&episode.command);
+        let places: HashMap<String, Point> = episode
+            .segments
+            .iter()
+            .flat_map(|s| s.places.clone())
+            .collect();
+        let start = episode.segments[0]
+            .robot
+            .or_else(|| places.get("instruction point").copied());
+        let owned = clauses::owners(&clauses, &episode.segments, &places, start);
+        for clause in 0..=clauses.len() {
+            let mut at: Vec<(usize, usize)> = owned
+                .iter()
+                .filter(|o| o.clause == clause)
+                .map(|o| (o.segment, o.child))
+                .collect();
+            at.dedup();
+            let shared = at.iter().any(|&(s, c)| {
+                owned
+                    .iter()
+                    .any(|o| o.segment == s && o.child == c && o.clause != clause)
+            });
+            if shared {
+                continue;
+            }
+            let mut parts: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (s, c) in at {
+                match parts.last_mut() {
+                    Some((last, steps)) if *last == s => steps.push(c),
+                    _ => parts.push((s, vec![c])),
+                }
+            }
+            if !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|(s, steps)| serves_alone(&episode.segments[*s], steps))
+            {
+                out.push(Program {
+                    episode: e,
+                    clause,
+                    parts,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// How top-level steps `steps` of tree `segment` ended, step by step.
+fn part_signature(segment: &Segment, steps: &[usize]) -> Vec<String> {
+    let Ok(reply) = serde_json::from_str::<Value>(&segment.reply) else {
+        return Vec::new();
+    };
+    let mut at = 0;
+    let mut out = Vec::new();
+    for (c, child) in clauses::top_level(&reply["rtdl"]).into_iter().enumerate() {
+        let n = crate::speculation::do_nodes(child).len();
+        if steps.contains(&c) {
+            out.extend(segment.signature.iter().skip(at).take(n).cloned());
+        }
+        at += n;
+    }
+    out
+}
+
+/// Whether top-level steps `steps` of kept tree `segment` ended well and name
+/// no step outside them.
+fn serves_alone(segment: &Segment, steps: &[usize]) -> bool {
+    let Ok(reply) = serde_json::from_str::<Value>(&segment.reply) else {
+        return false;
+    };
+    let top = clauses::top_level(&reply["rtdl"]);
+    let mut at = 0;
+    let mut binds = HashSet::new();
+    let mut names = Vec::new();
+    for (c, child) in top.into_iter().enumerate() {
+        let dos = crate::speculation::do_nodes(child);
+        if steps.contains(&c) {
+            let ended = segment.signature[at.min(segment.signature.len())..]
+                .iter()
+                .take(dos.len());
+            if ended.clone().count() < dos.len()
+                || ended.into_iter().any(|e| e != "ok" && e != "empty")
+            {
+                return false;
+            }
+            binds.extend(
+                dos.iter()
+                    .filter_map(|n| n["bind"].as_str().map(String::from)),
+            );
+            names.extend(nodes(child).into_iter().filter_map(|v| {
+                let fields = v.as_object()?;
+                crate::expression::is_reference(fields)
+                    .then(|| fields.get("var")?.as_str().map(String::from))?
+            }));
+        }
+        at += dos.len();
+    }
+    names.iter().all(|name| binds.contains(name))
+}
+
+/// `spans` with, for each place they rename, the room it stands in (`rooms_of`
+/// in the state view) renamed to the room the new place stands in: a kept
+/// planner searched the room a table stands in. Not where the command names
+/// the old room, nor where another place the kept or this command names, and
+/// spans keep, stands in it, nor where two renamed places' rooms disagree.
+/// Also the rooms put in this way, which a served tree may name though the
+/// command does not.
+fn with_rooms(
+    spans: &[(String, String)],
+    state: &Value,
+    kept: &str,
+    command: &str,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut out = spans.to_vec();
+    let Some(room_of) = state["rooms_of"].as_object() else {
+        return (out, Vec::new());
+    };
+    let (kept, command) = (clauses::command_line(kept), clauses::command_line(command));
+    let named = |place: &str| contains_word(kept, place) || contains_word(command, place);
+    let mut moved: Vec<(String, String)> = Vec::new();
+    for (place, room) in room_of {
+        let renamed = replace_spans(place, spans).to_lowercase();
+        let (Some(room), Some(new)) =
+            (room.as_str(), room_of.get(&renamed).and_then(Value::as_str))
+        else {
+            continue;
+        };
+        if renamed != *place && new != room {
+            moved.push((room.to_string(), new.to_string()));
+        }
+    }
+    let mut rooms = Vec::new();
+    for (room, new) in &moved {
+        let clash = moved.iter().any(|(r, n)| r == room && n != new);
+        let stays = room_of.iter().any(|(place, r)| {
+            r.as_str() == Some(room) && replace_spans(place, spans) == *place && named(place)
+        });
+        let taken = out.iter().any(|(old, _)| old.eq_ignore_ascii_case(room));
+        if !clash && !stays && !taken && !contains_word(command, room) {
+            out.push((room.clone(), new.clone()));
+            rooms.push(new.clone());
+        }
+    }
+    (out, rooms)
+}
+
+/// Why a tree of kept steps for one clause cannot serve: it names an entity
+/// of the kept command that the spans do not rename and this command does not
+/// name (what "it" was, a room the kept command went to).
+fn own_names(
+    episode: &Episode,
+    tree: &Value,
+    spans: &[(String, String)],
+    command: &str,
+) -> Result<(), String> {
+    let mut text = Vec::new();
+    world_text(tree, &mut text);
+    let text = text.join(" ");
+    for name in clauses::split(&episode.command)
+        .iter()
+        .flat_map(Clause::names)
+    {
+        let kept = replace_spans(name, spans) == *name;
+        if kept && contains_word(&text, name) && !contains_word(command, name) {
+            return Err(format!("names the {name} of the kept command"));
+        }
+    }
+    Ok(())
+}
+
+/// The string values of `value` its steps act on: [`put_in`]'s, without the
+/// planner's descriptions of them.
+fn world_text<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) if !text.starts_with("scene.") => out.push(text),
+        Value::Object(fields) if !crate::expression::is_reference(fields) => {
+            for (key, value) in fields {
+                if !STRUCTURE.contains(&key.as_str()) && key != "description" {
+                    world_text(value, out);
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| world_text(v, out)),
+        _ => {}
+    }
+}
+
 fn path(mode: Mode) -> PathBuf {
     crate::transcript::sessions_root().join(format!("task_memory-{}.json", mode.label()))
 }
@@ -892,23 +1439,76 @@ struct Places<'a> {
     /// stands in) that renaming cannot change: only what the command names may
     /// stay.
     changed: bool,
+    /// Rooms the spans put in for renamed places' rooms ([`with_rooms`]), which
+    /// may stay though the command does not name them.
+    rooms: Vec<String>,
+    /// The goals the kept run's trees drove to, for a place this round has no goal for yet.
+    kept_goals: Vec<Value>,
+    /// Each point of interest's room (`rooms_of` in the state view).
+    room_of: HashMap<String, String>,
 }
 
 impl<'a> Places<'a> {
-    fn of(episode: &Episode, state: &'a Value, spans: &[(String, String)]) -> Self {
+    fn of(
+        episode: &Episode,
+        state: &'a Value,
+        spans: &[(String, String)],
+        rooms: Vec<String>,
+    ) -> Self {
         let mut goals: HashMap<String, Point> = episode
             .segments
             .iter()
             .flat_map(|s| s.places.clone())
             .collect();
         goals.extend(places_listed(&state["places"]));
+        let kept_goals = episode
+            .segments
+            .iter()
+            .filter_map(|s| serde_json::from_str::<Value>(&s.reply).ok())
+            .flat_map(|reply| literal_goals(&reply["rtdl"]))
+            .collect();
+        let room_of = state["rooms_of"].as_object().into_iter().flatten();
+        let room_of = room_of
+            .filter_map(|(place, room)| Some((place.clone(), room.as_str()?.to_string())))
+            .collect();
         let mut places = Self {
             goals,
             listed: &state["places"],
             changed: false,
+            rooms,
+            kept_goals,
+            room_of,
         };
         places.changed = spans.iter().any(|(old, _)| places.hold(old));
         places
+    }
+
+    /// Whether a served tree may name the place `name`: the command names it,
+    /// or it is the room of a place the command names or of a renamed one.
+    fn named(&self, command: &str, name: &str) -> bool {
+        let in_named = self
+            .room_of
+            .iter()
+            .any(|(place, room)| room.eq_ignore_ascii_case(name) && contains_word(command, place));
+        contains_word(command, name)
+            || in_named
+            || self.rooms.iter().any(|r| r.eq_ignore_ascii_case(name))
+    }
+
+    /// The goal for the place `name`: this round's, else one a kept tree drove
+    /// to at that place (on the same map), which a first round may need.
+    fn goal_for(&self, name: &str) -> Option<&Value> {
+        let listed = self
+            .listed_with("name", Some(name))
+            .map(|place| &place["goal"]);
+        listed
+            .into_iter()
+            .find(|goal| position(goal).is_some())
+            .or_else(|| {
+                let at = *self.goals.get(&name.to_lowercase())?;
+                let mut kept = self.kept_goals.iter();
+                kept.find(|goal| position(goal).is_some_and(|g| distance(g, at) <= SAME_GOAL_M))
+            })
     }
 
     /// Whether `word` is a place's name or a word of one.
@@ -969,9 +1569,7 @@ fn goals(
         });
         if let Some((name, new)) = renamed {
             let to = places
-                .listed_with("name", Some(&new))
-                .map(|place| &place["goal"])
-                .find(|goal| position(goal).is_some())
+                .goal_for(&new)
                 .ok_or_else(|| format!("no goal for {new} in the state view"))?;
             bound.insert(name, json!(new));
             moves.push((at, to.clone()));
@@ -989,7 +1587,7 @@ fn goals(
                 "goes to ({:.2}, {:.2}), which is no place on the map",
                 at.0, at.1
             ));
-        } else if places.changed && !near.iter().any(|name| contains_word(command, name)) {
+        } else if places.changed && !near.iter().any(|name| places.named(command, name)) {
             return Err(format!(
                 "goes to the {}, which this command does not name",
                 near[0]
@@ -1030,7 +1628,7 @@ fn place_ids(
                 .ok_or_else(|| format!("no {new} in the state view"))?;
             bound.insert(id.to_string(), json!(now));
             ids.insert(id.to_string(), now.to_string());
-        } else if places.changed && !contains_word(command, name) {
+        } else if places.changed && !places.named(command, name) {
             return Err(format!(
                 "acts at the {name}, which this command does not name"
             ));
@@ -1625,10 +2223,34 @@ mod tests {
             outputs: HashMap::new(),
             picks: HashMap::new(),
             bound: HashMap::new(),
+            kept: Vec::new(),
+            programs: Vec::new(),
             serving: false,
+            served_whole: false,
             stopped: None,
+            whole_stopped: None,
+            refused: HashSet::new(),
+            tried: HashSet::new(),
+            served_clauses: HashSet::new(),
+            in_clause: None,
+            serving_clause: None,
             began_at: None,
         }
+    }
+
+    /// The next tree of the memory's one kept run for this run, bound as
+    /// `next_whole` binds it.
+    async fn bind(memory: &mut TaskMemory, state: &Value) -> Result<(Value, Value), String> {
+        let aligned = memory.aligned[0].clone();
+        let k = memory.run.len();
+        let source = Source {
+            episode: &aligned.episode,
+            segment: k,
+            reply: serde_json::from_str(&aligned.episode.segments[k].reply).unwrap(),
+            spans: aligned.spans.clone(),
+            whole: true,
+        };
+        memory.instantiate(&source, state).await
     }
 
     fn goal(x: f64, y: f64) -> Value {
@@ -1748,8 +2370,7 @@ mod tests {
             "Grasp a yellow bell pepper from the bedside table and place it on the dinner table",
             vec![segment],
         );
-        let aligned = memory.aligned[0].clone();
-        let (reply, _) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (reply, _) = bind(&mut memory, &state).await.unwrap();
         assert_eq!(at(&reply, 0)["goal"]["pose"]["position"]["x"], 5.0);
         assert_eq!(at(&reply, 2)["goal"]["pose"]["position"]["x"], 1.0);
         assert_eq!(at(&reply, 1)["object"], "yellow_bell_pepper");
@@ -1814,8 +2435,7 @@ mod tests {
             "places": [{"name": "Living room", "goal": goal(-3.0, -2.0)}],
         });
         let mut memory = delivering("Find a sponge in the bedroom and bring it to the living room");
-        let aligned = memory.aligned[0].clone();
-        let (reply, bound) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (reply, bound) = bind(&mut memory, &state).await.unwrap();
         // The sponge this run found, not the kept one or one merely listed.
         assert_eq!(at(&reply, 0)["object_id"], "scene.object.0099");
         assert_eq!(bound["scene.object.0048"], "scene.object.0099");
@@ -1828,12 +2448,11 @@ mod tests {
         assert_eq!(reply["message_updates"], json!([]));
         // A reference to a step this run did not run refuses the reply.
         memory.run[0].op_ids = vec![];
-        let refused = memory.instantiate(&aligned, &state).await;
+        let refused = bind(&mut memory, &state).await;
         assert!(refused.unwrap_err().contains("did not run"));
         // A place the state view has no goal for refuses it too.
         let mut memory = delivering("Find a sponge in the bedroom and bring it to the garage");
-        let aligned = memory.aligned[0].clone();
-        assert!(memory.instantiate(&aligned, &state).await.is_err());
+        assert!(bind(&mut memory, &state).await.is_err());
     }
 
     /// A kept tree that drives to the kitchen's goal and searches the kitchen,
@@ -1864,8 +2483,7 @@ mod tests {
             "Locate a cup in the living room then take it and give it to me",
             vec![kitchen_search()],
         );
-        let aligned = memory.aligned[0].clone();
-        let (reply, _) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (reply, _) = bind(&mut memory, &state).await.unwrap();
         assert_eq!(at(&reply, 0)["goal"]["pose"]["position"]["x"], -3.0);
         assert_eq!(at(&reply, 1)["region"], "living room");
     }
@@ -1880,14 +2498,12 @@ mod tests {
         let kept = "Grasp a cup from the dinner table and place it on the bedside table";
         let swapped = "Grasp a cup from the bedside table and place it on the dinner table";
         let mut memory = memory(kept, swapped, vec![kitchen_search()]);
-        let aligned = memory.aligned[0].clone();
-        let err = memory.instantiate(&aligned, &state).await.unwrap_err();
+        let err = bind(&mut memory, &state).await.unwrap_err();
         assert!(err.contains("does not name"), "{err}");
         // Another object only: the kitchen the kept planner worked out still holds.
         let bowl = "Grasp a bowl from the dinner table and place it on the bedside table";
         let mut memory = super::tests::memory(kept, bowl, vec![kitchen_search()]);
-        let aligned = memory.aligned[0].clone();
-        assert!(memory.instantiate(&aligned, &state).await.is_ok());
+        assert!(bind(&mut memory, &state).await.is_ok());
     }
 
     #[tokio::test]
@@ -1906,16 +2522,14 @@ mod tests {
             "scene": {"state": {"pose_known": true, "x": 2.0, "y": -1.0}}});
         let mut memory = memory(command, command, vec![segment.clone()]);
         memory.began_at = robot_at(&state);
-        let aligned = memory.aligned[0].clone();
-        let (reply, _) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (reply, _) = bind(&mut memory, &state).await.unwrap();
         // The way back goes to where this run began.
         assert_eq!(at(&reply, 1)["goal"]["pose"]["position"]["x"], 2.0);
         assert_eq!(at(&reply, 0)["goal"]["pose"]["position"]["x"], 3.0);
         // A goal at no place was worked out from where someone then stood.
         let state = json!({"objects": {}, "places": []});
         let mut memory = super::tests::memory(command, command, vec![segment]);
-        let aligned = memory.aligned[0].clone();
-        let err = memory.instantiate(&aligned, &state).await.unwrap_err();
+        let err = bind(&mut memory, &state).await.unwrap_err();
         assert!(err.contains("no place"), "{err}");
     }
 
@@ -1947,8 +2561,7 @@ mod tests {
         memory
             .picks
             .insert("coke".into(), ("scene.object.7".into(), "apple".into()));
-        let aligned = memory.aligned[0].clone();
-        let (reply, _) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (reply, _) = bind(&mut memory, &state).await.unwrap();
         assert_eq!(at(&reply, 0)["object_id"], "scene.object.7");
         assert_eq!(at(&reply, 0)["object"], "apple");
         assert_eq!(at(&reply, 1)["target_id"], "scene.object.8");
@@ -1961,8 +2574,7 @@ mod tests {
             "Put a fruit on the dinner table",
             vec![two],
         );
-        let aligned = memory.aligned[0].clone();
-        let err = memory.instantiate(&aligned, &state).await.unwrap_err();
+        let err = bind(&mut memory, &state).await.unwrap_err();
         assert!(err.contains("cannot tell"), "{err}");
     }
 
@@ -2035,8 +2647,7 @@ mod tests {
         let command = "Find a sponge in the bedroom and bring it to the kitchen";
         let mut memory = delivering(command);
         memory.outputs.clear();
-        let aligned = memory.aligned[0].clone();
-        let err = memory.instantiate(&aligned, &state).await.unwrap_err();
+        let err = bind(&mut memory, &state).await.unwrap_err();
         assert!(err.contains("no sponge"), "{err}");
     }
 
@@ -2199,29 +2810,24 @@ mod tests {
         // The same command: the people the kept run met, where Scene still lists them.
         let command = "Meet Paris in the kitchen";
         let mut memory = memory(command, command, vec![segment.clone()]);
-        let aligned = memory.aligned[0].clone();
-        let (served, _) = memory.instantiate(&aligned, &state).await.unwrap();
+        let (served, _) = bind(&mut memory, &state).await.unwrap();
         assert_eq!(at(&served, 0)["region_id"], "scene.poi.k");
         assert_eq!(at(&served, 2)["object_id"], "scene.object.6");
         // Another person in another room: the bedroom's id, and which of two
         // people Robin is cannot be told.
         let mut memory = super::tests::memory(command, "Meet Robin in the bedroom", vec![segment]);
-        let aligned = memory.aligned[0].clone();
-        let err = memory.instantiate(&aligned, &state).await.unwrap_err();
+        let err = bind(&mut memory, &state).await.unwrap_err();
         assert!(err.contains("people"), "{err}");
-        let mut ids = HashMap::new();
-        let places = Places::of(&aligned.episode, &state, &aligned.spans);
-        ids.extend(
-            place_ids(
-                &places,
-                &reply["rtdl"],
-                &aligned.spans,
-                "Meet Robin in the bedroom",
-                &mut serde_json::Map::new(),
-            )
-            .unwrap(),
+        let aligned = memory.aligned[0].clone();
+        let places = Places::of(&aligned.episode, &state, &aligned.spans, Vec::new());
+        let ids = place_ids(
+            &places,
+            &reply["rtdl"],
+            &aligned.spans,
+            "Meet Robin in the bedroom",
+            &mut serde_json::Map::new(),
         );
-        assert_eq!(ids["scene.poi.k"], "scene.poi.b");
+        assert_eq!(ids.unwrap()["scene.poi.k"], "scene.poi.b");
     }
 
     #[test]
@@ -2274,6 +2880,218 @@ mod tests {
             ..Default::default()
         });
         assert!(!memory.expects_more());
+    }
+
+    #[tokio::test]
+    async fn the_rooms_of_traded_places_trade_too() {
+        // The kept planner looked for the peach in the kitchen, where the dinner
+        // table stands; with the tables traded it looks in the bedroom.
+        let kept_goal = |x: f64, y: f64| json!({"header": {"frame_id": "map"}, "pose": {"position": {"x": x, "y": y}, "orientation": {"w": 1.0}}});
+        let first = json!({"rtdl": {"op": "sequence", "children": [
+            {"op": "do", "cap": "navigate", "args": {"goal": kept_goal(1.0, 1.0)}},
+            {"op": "do", "cap": "find", "args": {"label": "peach", "region": "kitchen", "anchor": "dinner table"}},
+        ]}});
+        let second = json!({"rtdl": {"op": "sequence", "children": [
+            {"op": "do", "cap": "navigate", "args": {"goal": kept_goal(5.0, 5.0)}},
+            {"op": "do", "cap": "place", "args": {"target": "bedside table"}},
+        ]}});
+        let places = HashMap::from([
+            ("dinner table".to_string(), (1.0, 1.0)),
+            ("bedside table".to_string(), (5.0, 5.0)),
+        ]);
+        let tree = |reply: &Value| Segment {
+            reply: reply.to_string(),
+            places: places.clone(),
+            ..Default::default()
+        };
+        // A first round: no goal has come in for either table yet.
+        let state = json!({"objects": {}, "places": [{"name": "dinner table"}, {"name": "bedside table"}],
+            "rooms_of": {"dinner table": "kitchen", "bedside table": "bedroom"}});
+        let mut memory = memory(
+            "Grasp a peach from the dinner table and place it on the bedside table",
+            "Grasp a peach from the bedside table and place it on the dinner table",
+            vec![tree(&first), tree(&second)],
+        );
+        let (served, _) = bind(&mut memory, &state).await.unwrap();
+        assert_eq!(at(&served, 1)["region"], "bedroom");
+        assert_eq!(at(&served, 1)["anchor"], "bedside table");
+        // The bedside table's goal as the kept run drove to it, orientation and all.
+        assert_eq!(at(&served, 0)["goal"], kept_goal(5.0, 5.0));
+    }
+
+    /// A clause memory over one kept run of "Find a cup in the kitchen then
+    /// take it and throw it in the trash".
+    fn clause_memory(command: &str) -> TaskMemory {
+        let goal = |x: f64, y: f64| json!({"pose": {"position": {"x": x, "y": y}}});
+        let tree =
+            |children: Value| json!({"rtdl": {"op": "sequence", "children": children}}).to_string();
+        let places = HashMap::from([
+            ("kitchen".to_string(), (1.0, 1.0)),
+            ("kitchen trash bin".to_string(), (2.0, 2.0)),
+        ]);
+        let segments = vec![
+            Segment {
+                reply: tree(json!([
+                    {"op": "do", "cap": "navigate", "args": {"goal": goal(1.0, 1.0)}},
+                    {"op": "do", "cap": "find", "args": {"label": "cup", "region": "kitchen"}},
+                ])),
+                contracts: vec!["x/navigate".into(), "x/find".into()],
+                signature: vec!["ok".into(), "ok".into()],
+                places: places.clone(),
+                robot: Some((0.0, 0.0)),
+                ..Default::default()
+            },
+            Segment {
+                reply: tree(json!([
+                    {"op": "do", "cap": "goal_near", "args": {"object_id": "scene.object.1"}, "bind": "g"},
+                    {"op": "do", "cap": "navigate", "args": {"goal": {"var": "g", "path": ["goal"]}}},
+                    {"op": "do", "cap": "pick", "args": {"object": "cup"}},
+                    {"op": "do", "cap": "navigate", "args": {"goal": goal(2.0, 2.0)}},
+                    {"op": "do", "cap": "place", "args": {"target": "kitchen trash bin"}},
+                    {"op": "do", "cap": "navigate", "args": {"goal": goal(0.0, 0.0)}},
+                ])),
+                contracts: [
+                    "x/goal_near",
+                    "x/navigate",
+                    "x/pick",
+                    "x/navigate",
+                    "x/place",
+                    "x/navigate",
+                ]
+                .map(String::from)
+                .into(),
+                signature: vec!["ok".into(); 6],
+                labels: HashMap::from([("scene.object.1".into(), "cup".into())]),
+                places,
+                ..Default::default()
+            },
+        ];
+        let kept = vec![Episode {
+            command: "Find a cup in the kitchen then take it and throw it in the trash".into(),
+            segments,
+            when: 0.0,
+        }];
+        let mut memory = memory(command, command, Vec::new());
+        memory.mode = Mode::Clauses;
+        memory.aligned.clear();
+        memory.programs = programs(&kept);
+        memory.kept = kept;
+        memory
+    }
+
+    #[tokio::test]
+    async fn a_clause_of_another_command_serves_with_what_its_clauses_name() {
+        let command = "Find a bowl in the living room then take it and give it to me";
+        let mut memory = clause_memory(command);
+        let state = json!({"objects": {"living room": [{"id": "scene.object.9", "label": "bowl"}]},
+            "places": [{"name": "living room", "goal": goal(-3.0, -2.0)}]});
+        let first = memory.next(&state, 1).await.unwrap();
+        assert_eq!(at(&first, 0)["goal"]["pose"]["position"]["x"], -3.0);
+        assert_eq!(at(&first, 1)["label"], "bowl");
+        assert_eq!(at(&first, 1)["region"], "living room");
+        let mut first_plan = plan("p1", "cd34-1", "x/navigate");
+        first_plan.nodes.push(RtdlNode {
+            node_kind: RTDL_DO,
+            op_id: "cd34-2".into(),
+            call: Some(CapabilityCall {
+                contract_id: "x/find".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        memory.dispatched(&first_plan, &first.to_string(), &state);
+        let found = json!({"objects": [{"id": "scene.object.9", "label": "bowl"}]}).to_string();
+        let mut results = succeeded("{}");
+        results.extend(succeeded(&found).into_iter().map(|mut r| {
+            r.node_index = 1;
+            r
+        }));
+        memory.ended("p1", &results);
+        // "take it": the kept take, "it" the bowl the first clause named.
+        let second = memory.next(&state, 1).await.unwrap();
+        assert_eq!(at(&second, 0)["object_id"], "scene.object.9");
+        assert_eq!(at(&second, 2)["object"], "bowl");
+        assert_eq!(second["rtdl"]["children"].as_array().unwrap().len(), 3);
+        // Handing it to the operator no kept run did.
+        let mut take = plan("p2", "cd34-3", "x/goal_near");
+        for (op, contract) in [("cd34-4", "x/navigate"), ("cd34-5", "x/pick")] {
+            take.nodes.push(RtdlNode {
+                node_kind: RTDL_DO,
+                op_id: op.into(),
+                call: Some(CapabilityCall {
+                    contract_id: contract.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        memory.dispatched(&take, &second.to_string(), &state);
+        let ok = (0..3)
+            .flat_map(|i| {
+                succeeded("{}").into_iter().map(move |mut r| {
+                    r.node_index = i;
+                    r
+                })
+            })
+            .collect::<Vec<_>>();
+        memory.ended("p2", &ok);
+        assert!(memory.next(&state, 1).await.is_none());
+    }
+
+    #[test]
+    fn a_room_stays_where_a_place_the_command_keeps_stands_in_it() {
+        let state = json!({"rooms_of": {"dinner table": "kitchen", "cooking table": "kitchen",
+            "bedside table": "bedroom"}});
+        let kept = "Grasp a peach from the dinner table and place it on the cooking table";
+        let new = "Grasp a peach from the dinner table and place it on the bedside table";
+        let spans = align(kept, new).unwrap();
+        let (with, rooms) = with_rooms(&spans, &state, kept, new);
+        assert_eq!(with, spans);
+        assert!(rooms.is_empty());
+        // Traded tables trade their rooms.
+        let traded = "Grasp a peach from the bedside table and place it on the dinner table";
+        let kept = "Grasp a peach from the dinner table and place it on the bedside table";
+        let (with, _) = with_rooms(&align(kept, traded).unwrap(), &state, kept, traded);
+        assert!(with.contains(&("kitchen".to_string(), "bedroom".to_string())));
+        assert!(with.contains(&("bedroom".to_string(), "kitchen".to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_clause_says_this_commands_words_and_acts_only_on_its_objects() {
+        let command = "Find a bowl in the living room then take it and give it to me";
+        let mut memory = clause_memory(command);
+        let state = json!({"objects": {"living room": [{"id": "scene.object.9", "label": "bowl"}]},
+            "places": [{"name": "living room", "goal": goal(-3.0, -2.0)}]});
+        let first = memory.next(&state, 1).await.unwrap();
+        assert_eq!(first["content"], "Next: Find a bowl in the living room.");
+        // "take it" with nothing that says what "it" is: the kept cup is not this command's.
+        let mut memory = clause_memory("Go to the living room then take it and give it to me");
+        let tree = |c: &str| {
+            json!({"rtdl": {"op": "sequence", "children": [
+            {"op": "do", "cap": "navigate", "args": {"goal": goal(-3.0, -2.0)}}]}, "content": c})
+            .to_string()
+        };
+        let mut plan = plan("p0", "cd34-0", "x/navigate");
+        plan.plan_id = "p0".into();
+        memory.dispatched(&plan, &tree(""), &state);
+        memory.ended("p0", &succeeded("{}"));
+        assert!(memory.next(&state, 1).await.is_none());
+    }
+
+    #[test]
+    fn a_clause_naming_what_another_kept_clause_named_is_not_reused() {
+        let episode = Episode {
+            command: "Find a cup in the kitchen then take it".into(),
+            segments: Vec::new(),
+            when: 0.0,
+        };
+        let tree = json!({"op": "do", "cap": "pick", "args": {"object": "cup"}});
+        let command = "Go to the kitchen then take it";
+        assert!(own_names(&episode, &tree, &[], command).is_err());
+        let spans = spans(&[("cup", "bowl")]);
+        let mut renamed = tree.clone();
+        put_in(&mut renamed, &spans);
+        assert!(own_names(&episode, &renamed, &spans, command).is_ok());
     }
 
     #[test]
