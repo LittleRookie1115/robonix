@@ -1661,6 +1661,7 @@ const SAME_ACTION: &[(&[&str], &str)] = &[
     (&["bring"], "give"),
     (&["deliver"], "give"),
     (&["navigate"], "go"),
+    (&["put"], "place"),
     (&["tell"], "say"),
     (&["an"], "a"),
 ];
@@ -2294,6 +2295,13 @@ mod tests {
                 "Take a milk from the cabinet and give it to me"
             ),
             Some(spans(&[("red bull", "milk")]))
+        );
+        assert_eq!(
+            align(
+                "Find a mangosteen in the kitchen then grasp it and put it on the tv stand",
+                "Find a mangosteen in the kitchen then grasp it and place it on the shelf"
+            ),
+            Some(spans(&[("tv stand", "shelf")]))
         );
         assert_eq!(
             align(

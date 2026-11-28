@@ -27,7 +27,6 @@ const ACTIONS: &[(&str, Action)] = &[
     ("take", Action::Take),
     ("pick", Action::Take),
     ("give", Action::Give),
-    ("put", Action::Put),
     ("place", Action::Put),
     ("throw", Action::Put),
     ("meet", Action::Meet),
