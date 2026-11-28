@@ -38,6 +38,7 @@ mod soma_context;
 mod speculation;
 mod state_context;
 mod stream_execution;
+mod task_memory;
 mod tasks;
 mod transcript;
 mod vlm;

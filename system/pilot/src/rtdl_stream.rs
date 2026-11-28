@@ -882,6 +882,17 @@ pub(crate) fn next_op_id() -> String {
     )
 }
 
+/// Whether `name` has the shape [`next_op_id`] gives, a run tag of four hex
+/// digits and a number.
+pub(crate) fn is_op_id(name: &str) -> bool {
+    name.split_once('-').is_some_and(|(tag, number)| {
+        tag.len() == 4
+            && tag.chars().all(|c| c.is_ascii_hexdigit())
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

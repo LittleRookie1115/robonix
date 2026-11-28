@@ -328,15 +328,25 @@ fn task_switch(task: &Task, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Let a speculation, the opening move and the trees' watches see how a tree
-/// goes and ends.
+/// Let a speculation, the opening move, the trees' watches and task memory see
+/// how a tree goes and ends.
 fn observe(
     speculation: &mut Option<Speculation>,
     opening: &mut Option<crate::opening::Opening>,
     watches: &mut Vec<Watch>,
+    memory: &mut Option<crate::task_memory::TaskMemory>,
     event: &TreeInterrupt,
     read_set: bool,
 ) {
+    if let (
+        Some(memory),
+        TreeInterrupt::Completion {
+            plan_id, results, ..
+        },
+    ) = (memory.as_mut(), event)
+    {
+        memory.ended(plan_id, results);
+    }
     match event {
         TreeInterrupt::NodeState {
             plan_id,
@@ -1761,6 +1771,8 @@ pub async fn run_turn(
     let protocol_prompt = protocol_prompt.as_str();
     // Replies prepared for the round that the one running tree's report starts.
     let mut speculation: Option<Speculation> = None;
+    // The replies of finished tasks this command can reuse (`task_memory`).
+    let mut task_memory = crate::task_memory::TaskMemory::of(&task.context_json, &task.text, tasks);
     let mut early_views = EarlyViews::default();
     // The capabilities the last round found, which a state view read early queries.
     let mut last_caps: Vec<(String, atlas_pb::Capability)> = Vec::new();
@@ -1798,6 +1810,7 @@ pub async fn run_turn(
                 &mut speculation,
                 &mut opening,
                 &mut watches,
+                &mut task_memory,
                 &event,
                 read_set,
             );
@@ -1866,7 +1879,7 @@ pub async fn run_turn(
                 ev = forest.interrupt_rx.recv() => {
                     // The session holds a sender, so the channel never closes.
                     if let Some(event) = ev {
-                        observe(&mut speculation, &mut opening, &mut watches, &event, read_set);
+                        observe(&mut speculation, &mut opening, &mut watches, &mut task_memory, &event, read_set);
                         speculation.iter_mut().for_each(|spec| spec.decide_early(&turn_steps));
                         should_plan |= handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
@@ -1919,7 +1932,7 @@ pub async fn run_turn(
                         break;
                     }
                     Some(event) = forest.interrupt_rx.recv() => {
-                        observe(&mut speculation, &mut opening, &mut watches, &event, read_set);
+                        observe(&mut speculation, &mut opening, &mut watches, &mut task_memory, &event, read_set);
                         handle_interrupt(event, forest, history, tasks, round, &session_id, tx).await;
                     }
                     _ = &mut settle => break,
@@ -2095,7 +2108,20 @@ pub async fn run_turn(
                 tau,
             )
         };
+        // A kept run's next reply stands in for this round's request, checked
+        // step by step against Scene.
+        let mut memory_reply: Option<(String, Option<String>)> = None;
+        if let Some(memory) = task_memory.as_mut()
+            && forest.trees.is_empty()
+            && forest.kill_pending.is_empty()
+        {
+            let scene = state_context::SceneProviders::among(&cap_list);
+            memory_reply = memory
+                .reply(&state, tasks.messages.len(), executor, scene.as_ref())
+                .await;
+        }
         if requests == 0
+            && memory_reply.is_none()
             && speculate
             && task_switch(task, "opening", true)
             && speculation::decision_model()
@@ -2167,7 +2193,9 @@ pub async fn run_turn(
                 .iter()
                 .filter(|step| step.get("stopped_by").is_none());
             turn_steps.extend(report.cloned());
-            let branch = if compacted {
+            let branch = if memory_reply.is_some() {
+                Err("task memory used")
+            } else if compacted {
                 Err("history compacted")
             } else if !(catalog_update.is_empty()
                 && soma_body_update.is_empty()
@@ -2250,6 +2278,14 @@ pub async fn run_turn(
                 }
                 Err(reason) => spec.discard(&reason),
             }
+        }
+        if let Some((reply, note)) = memory_reply.take() {
+            let outputs = task_memory
+                .as_ref()
+                .map(|m| m.outputs().clone())
+                .unwrap_or_default();
+            prepared = Some((reply, outputs));
+            cut_note = note;
         }
         // This round waits for its own request: the robot may head for where
         // the next step goes meanwhile.
@@ -2742,6 +2778,13 @@ pub async fn run_turn(
         if speculate && state_view && plan_open && !is_control_only(&graph) {
             watches.push(state_watch(&graph, &state, &watch_reads, &taken));
         }
+        // A tree that ended while its reply streamed still reports through its driver.
+        if let Some(memory) = task_memory.as_mut()
+            && !graph.nodes.is_empty()
+            && !is_control_only(&graph)
+        {
+            memory.dispatched(&graph, parser.text(), &state);
+        }
         // Only while one tree runs is its report sure to start the next round.
         if speculate
             && !should_plan
@@ -2789,10 +2832,15 @@ pub async fn run_turn(
                         state["objects"].clone(),
                         adopted,
                         dispatched,
+                        task_memory.as_ref().is_some_and(|m| m.expects_more()),
                     )
                 }
             };
         }
+    }
+
+    if let Some(memory) = task_memory.take() {
+        memory.finish(tasks);
     }
 
     // ── 8. Mark turn complete ─────────────────────────────────────────────────

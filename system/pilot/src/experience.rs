@@ -65,7 +65,7 @@ fn stopped(output: &str) -> Option<(f64, f64)> {
     Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
 }
 
-fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
 

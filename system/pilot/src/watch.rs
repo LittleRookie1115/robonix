@@ -51,7 +51,7 @@ pub(crate) fn goal_key(goal: &Value) -> Option<String> {
 }
 
 /// The map position of a navigation goal, a PoseStamped.
-fn position(goal: &Value) -> Option<(f64, f64)> {
+pub(crate) fn position(goal: &Value) -> Option<(f64, f64)> {
     let at = &goal["pose"]["position"];
     Some((at["x"].as_f64()?, at["y"].as_f64()?))
 }

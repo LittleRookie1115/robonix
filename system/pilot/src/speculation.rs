@@ -350,7 +350,7 @@ const NEEDS_RESULTS: &str = "NEEDS_RESULTS";
 /// error rate, on the Segue offline calibration set plus the questions it was
 /// asked in the M3 runs and their counterfactuals. A task sets its own with
 /// `tau_choice` / `tau_done` in `context_json`.
-const TAU_CHOICE: f64 = 0.9411;
+pub(crate) const TAU_CHOICE: f64 = 0.9411;
 const TAU_DONE: f64 = 0.834;
 
 /// The questions, worded as in the calibration set the thresholds come from.
@@ -970,7 +970,9 @@ impl Speculation {
     /// the state `prefix` shows. `ahead` holds what was prepared for this tree
     /// before it was dispatched: its outcomes are not asked for again, and it is
     /// all there is if the tree is expected to end before a prepared reply
-    /// could answer sooner than the next round's request.
+    /// could answer sooner than the next round's request. With `memory_follows`,
+    /// a kept run's next reply covers the tree's success and only its other
+    /// outcomes are asked for.
     #[allow(clippy::too_many_arguments)] // Each is a different part of the round it is started from.
     pub(crate) fn start(
         vlm: &VlmClient,
@@ -983,6 +985,7 @@ impl Speculation {
         objects: Value,
         ahead: Option<Self>,
         dispatched: Option<Instant>,
+        memory_follows: bool,
     ) -> Option<Self> {
         // A streamed tree's first step went out before its reply ended.
         let dispatched = dispatched.unwrap_or_else(Instant::now);
@@ -1140,7 +1143,9 @@ impl Speculation {
                 )
                 .collect(),
         };
-        outcomes.retain(|(outcome, _)| !prepared(outcome));
+        outcomes.retain(|(outcome, _)| {
+            !prepared(outcome) && !(memory_follows && *outcome == Outcome::Succeeded)
+        });
         // A budget caps a task's prepared requests; the adaptive policy spends
         // past its best request only what the trees still expected leave over.
         let cap = context["prepared_budget"]
@@ -2014,7 +2019,7 @@ async fn pick_reply(
 /// For each of `wanted`, what a `{"choose": ...}` in a reply asks for, the id
 /// of the object in `objects`, Scene's current list by region, that the
 /// decision model picks; otherwise why the reply cannot be used.
-async fn choose_objects(
+pub(crate) async fn choose_objects(
     plan_id: &str,
     task: &str,
     tau: f64,
@@ -3070,7 +3075,7 @@ fn prepare(
 }
 
 /// The `do` nodes of a reply's RTDL tree, in the order its steps are numbered.
-fn do_nodes(node: &Value) -> Vec<&Value> {
+pub(crate) fn do_nodes(node: &Value) -> Vec<&Value> {
     if node["op"] == "do" {
         return vec![node];
     }
